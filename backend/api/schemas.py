@@ -547,6 +547,13 @@ class GeneratePrdFromSummaryRequest(BaseModel):
     history: list[ConversationTurn] = Field(
         default_factory=list, description="对话历史（可选），仅用于理解摘要里没写全的措辞"
     )
+    review: bool = Field(
+        default=False,
+        description=(
+            "是否启用**双智能体**：Writer 写初稿 → Reviewer 审核 → 有问题自动重写（上限 1 次）。"
+            "开启后调用数由 1 次变为 2~3 次、耗时约翻倍，且审核期间没有流式输出"
+        ),
+    )
 
     @field_validator("summary")
     @classmethod

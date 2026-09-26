@@ -92,6 +92,15 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 8192
     llm_timeout: float = 120.0
 
+    # ---------- 审核智能体（双智能体里的 Reviewer，可选）----------
+    # 默认**留空 = 与写手同一个模型**（同一套 API/Key、同一个 model），只有提示词不同。
+    # 配上就换成另一个模型：同厂换 model 名即可（Key 不用多配一份），也可以换 provider。
+    # 这是「同一套 API、两个角色」的开关 —— 见 Settings.review_llm_settings。
+    review_llm_provider: LlmProvider | None = Field(
+        default=None, validation_alias="PRD_REVIEW_LLM_PROVIDER"
+    )
+    review_llm_model: str | None = Field(default=None, validation_alias="PRD_REVIEW_LLM_MODEL")
+
     anthropic_api_key: SecretStr | None = None
     openai_api_key: SecretStr | None = None
     deepseek_api_key: SecretStr | None = None
@@ -158,6 +167,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "llm_model",
+        "review_llm_model",
         "anthropic_api_key",
         "openai_api_key",
         "deepseek_api_key",
@@ -203,6 +213,33 @@ class Settings(BaseSettings):
     def llm_configured(self) -> bool:
         """当前 provider 是否具备调用条件（只检查配置，不检查连通性）。"""
         return self.active_llm_api_key is not None
+
+    @property
+    def review_llm_settings(self) -> Settings:
+        """审核智能体用的配置（**默认与写手完全一致**）。
+
+        只有显式配了 `PRD_REVIEW_LLM_PROVIDER` / `PRD_REVIEW_LLM_MODEL` 才分叉，
+        所以"同一套 API、两个角色"是默认形态；想降低自查偏差时只改环境变量。
+
+        ⚠️ 只配 model、不配 provider 时，模型名可能属于别的厂商
+        （例如 provider 还是 deepseek 却写了 `claude-...`）。这种错配交给
+        `build_chat_model` 报错，这里**不复制一份厂商白名单**（两份必然漂移）。
+        """
+        updates: dict[str, object] = {}
+        if self.review_llm_provider is not None:
+            updates["llm_provider"] = self.review_llm_provider
+        if self.review_llm_model is not None:
+            updates["llm_model"] = self.review_llm_model
+        return self if not updates else self.model_copy(update=updates)
+
+    @property
+    def review_llm_active_model(self) -> str:
+        """审核实际用的模型名（没单独配就是写手那个）。"""
+        if self.review_llm_model is not None:
+            return self.review_llm_model
+        if self.review_llm_provider is not None:
+            return FALLBACK_MODELS[self.review_llm_provider]
+        return self.active_llm_model
 
     @property
     def is_local(self) -> bool:

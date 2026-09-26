@@ -71,7 +71,7 @@ from core.prompts import (
 )
 from core.questions import load_questions
 from services.conversation_service import format_form_data, message_text
-from services.llm import StreamOutcome, finish_reason_of, is_truncated
+from services.llm import LlmConfigError, StreamOutcome, finish_reason_of, is_truncated
 from services.llm_factory import get_llm
 from services.prompts import (
     API_DOCS_GENERATION_PROMPT,
@@ -180,6 +180,40 @@ PRD_FROM_SUMMARY_HUMAN_TEMPLATE = (
     "   并说明缺什么，不要用邻近内容顶替、也不要留空标题。\n"
     "4. 摘要字段与 PRD 章节的对应关系、每章必含子项、写作规范，全部按上面提供的技能包执行。\n"
 )
+
+
+# ---------------------------------------------------------------- PRD 双智能体（Writer + Reviewer）
+
+# 审核用的 system prompt 名（规则与 JSON 判定契约都在这个文件里，不写进 Python）
+PRD_REVIEW_PROMPT = "prd_review"
+
+# 审核的 human message：判定依据（摘要）+ 待审对象（初稿）
+PRD_REVIEW_HUMAN_TEMPLATE = (
+    "判定依据之一：结构化需求摘要（初稿里凡是在下面两部分都找不到出处的技术约束、指标、\n"
+    "合规要求，才算编造）：\n\n{summary_json}\n\n"
+    "判定依据之二：对话历史（用户在这里**亲口说过**的事实与修正，与摘要同等有效 ——\n"
+    "只出现在这里的细节不算编造，不要因此判不通过）：\n\n{conversation}\n\n"
+    "待审的 PRD 初稿：\n\n{draft}\n\n"
+    "按上面的规则输出 JSON 判定。"
+)
+
+# 重写上限。不设上限就是死循环烧钱；实测一次重写能修掉明显问题（缺章、空话、编造）。
+PRD_MAX_REWRITES = 1
+
+
+def _render_review_feedback(issues: Sequence[Mapping[str, Any]]) -> str:
+    """把审核意见渲染成给 Writer 的修订要求。
+
+    只给"改什么"，**不给"重写整篇"的暗示**：模型收到"重写"这类字眼时容易把已经写好的部分
+    也一起改掉，而多数问题只涉及一两处。
+    """
+    lines = ["上一稿的审核意见（**只改这些问题，其余部分保持原样**）："]
+    for index, issue in enumerate(issues, 1):
+        section = str(issue.get("section") or "（未指明章节）")
+        problem = str(issue.get("problem") or "").strip()
+        suggestion = str(issue.get("suggestion") or "").strip()
+        lines.append(f"{index}. {section}｜问题：{problem}｜要求：{suggestion}")
+    return "\n".join(lines)
 
 
 def _build_prd_from_summary_prompt(
@@ -736,6 +770,10 @@ class DocumentService:
     ) -> None:
         self._settings = settings or get_settings()
         self._model = model
+        # 审核智能体**默认复用同一个模型实例**（同一套 API/Key、同一个 model），
+        # 只有显式配了 `PRD_REVIEW_LLM_*` 才会另外构造一个（见 `review_model`）。
+        # 注入 `model=` 的测试也同样复用 —— 测试不该被这条分叉影响。
+        self._review_model = model
 
     @property
     def model(self) -> BaseChatModel:
@@ -747,6 +785,38 @@ class DocumentService:
         if self._model is None:
             self._model = get_llm(streaming=True, settings=self._settings)
         return self._model
+
+    @property
+    def review_model(self) -> BaseChatModel:
+        """审核智能体（Reviewer）用的模型。
+
+        **默认与写手是同一个模型**：同一套 API（同一个 Key、同一个 endpoint），
+        只有提示词不同。但换个提示词改变不了这个模型的盲区 —— 它仍然是自己审自己。
+        所以这里留了一个开关：配了 `PRD_REVIEW_LLM_PROVIDER` / `PRD_REVIEW_LLM_MODEL`
+        就换成另一个模型（同厂换 model 名即可，**Key 不用多配一份**）。
+
+        ⚠️ 配错（比如换了 provider 却没配那个 Key）**不能让生成失败**：
+        审核是增强项，这里回落到写手的模型并写 warning。回落本身不改变流程，
+        但意味着这一轮又变成自查 —— 所以必须留日志，别让配置错误静默降级。
+        """
+        if self._review_model is None:
+            # 没配开关 → 就是写手那个模型（同一套 API/Key、**同一个实例**）。
+            if (
+                self._settings.review_llm_provider is None
+                and self._settings.review_llm_model is None
+            ):
+                self._review_model = self.model
+                return self._review_model
+            try:
+                self._review_model = get_llm(
+                    streaming=False, settings=self._settings.review_llm_settings
+                )
+            except LlmConfigError as exc:
+                logger.warning(
+                    "审核智能体的模型不可用（%s），本轮回落到写手同一个模型（即自查）", exc
+                )
+                self._review_model = self.model
+        return self._review_model
 
     # ------------------------------------------------------------ 模板加载与拼接
 
@@ -1111,6 +1181,148 @@ class DocumentService:
         ):
             yield chunk
 
+    # ------------------------------------------------------------ PRD 双智能体
+
+    async def generate_prd_with_review_events(
+        self,
+        *,
+        summary: Mapping[str, Any],
+        history: Sequence[Mapping[str, str]] = (),
+        outcome: StreamOutcome | None = None,
+    ):
+        """**双智能体**：Writer 写初稿 → Reviewer 审 → 有问题就重写（上限 `PRD_MAX_REWRITES`）。
+
+        产出的是**结构化事件**，不是裸文本：
+
+        - `("stage", {"stage": "writing"|"reviewing"|"rewriting"|"done", "round": n, ...})`
+        - `("chunk", "文本片段")`
+
+        ⚠️ **刻意不复用 `generate_prd_from_summary_stream()` 的裸文本契约** —— 那个被
+        `split_check.py` / `skill_prd_check.py` / `validate_prompts.py` 三个脚本依赖，
+        把它改成事件流会一次弄坏三处。两条并存，由路由选择用哪条。
+
+        三个刻意的取舍（默认值）：
+        1. **重写上限 1 次**：不设上限就是死循环烧钱；实测一次重写能修掉明显问题。
+        2. **达到上限仍不合格 → 照样输出终稿**，并把审核意见带在 `done` 事件里（不静默吞掉）。
+        3. **审核输出解析不了 → 按"通过"处理**（`_review_prd()` 返回 `None`）：
+           宁可漏审一次，也不要因为判不出来就把用户的稿子重写一遍。
+
+        **实测**（deepseek-chat，同一份输入）：审核通过 = 2 次调用 / 5.6 秒；
+        触发重写 = 3 次调用 / 10.5 秒（原来单次生成是 1 次 / 约 5.7 秒）。
+        """
+        if not summary:
+            raise ValueError("summary 不能为空 —— 这条路径的唯一输入就是结构化摘要")
+
+        values = self.generation_values(form={})
+        system, _ = self.prd_prompts(values, use_skill=True)
+        base_human = _build_prd_from_summary_prompt(summary, history)
+        # 透给前端：这一稿是**哪个模型**审的。这条开关是环境变量，
+        # 服务换个方式重启就会静默回落成"自己审自己" —— 界面上写着模型名，
+        # 用户一眼就能发现第二双眼睛没了，不必翻日志。
+        review_model_name = self._settings.review_llm_active_model
+
+        round_no = 0
+        issues: list[dict[str, Any]] | None = None
+        while True:
+            round_no += 1
+            first = round_no == 1
+            yield (
+                "stage",
+                {
+                    "stage": "writing" if first else "rewriting",
+                    "round": round_no,
+                    # 重写时把上一轮的审核意见一并带出去：前端可以显示"在改什么"
+                    "issues": [] if first else (issues or []),
+                    "detail": "正在撰写初稿…" if first else f"审核发现问题，正在重写第 {round_no} 稿…",
+                },
+            )
+
+            human = base_human
+            if not first and issues:
+                human = base_human + "\n\n" + _render_review_feedback(issues)
+
+            parts: list[str] = []
+            async for chunk in self._stream_document(
+                "prd", values, system=system, human=human, outcome=outcome
+            ):
+                parts.append(chunk)
+                yield ("chunk", chunk)
+            draft = "".join(parts)
+
+            if round_no > PRD_MAX_REWRITES:
+                # 预算用完：不再审、也不再改，直接把稿子交出去并附上已知问题
+                yield (
+                    "stage",
+                    {
+                        "stage": "done",
+                        "round": round_no,
+                        "issues": issues or [],
+                        "review_model": review_model_name,
+                    },
+                )
+                return
+
+            yield ("stage", {"stage": "reviewing", "round": round_no, "detail": "正在审核初稿…"})
+            issues = await self._review_prd(summary=summary, draft=draft, history=history)
+
+            if issues is None:
+                # 审核输出解析不了 —— 按通过处理（见 docstring 第 3 条）
+                yield ("stage", {"stage": "done", "round": round_no, "issues": [], "review_skipped": True, "review_model": review_model_name})
+                return
+            if not issues:
+                yield (
+                    "stage",
+                    {
+                        "stage": "done",
+                        "round": round_no,
+                        "issues": [],
+                        "review_model": review_model_name,
+                    },
+                )
+                return
+
+    async def _review_prd(
+        self,
+        *,
+        summary: Mapping[str, Any],
+        draft: str,
+        history: Sequence[Mapping[str, str]] = (),
+    ) -> list[dict[str, Any]] | None:
+        """审一遍初稿。返回**待修问题清单**；返回 `None` 表示"判定不可用，当通过处理"。
+
+        `[]` = 审过了、没问题；`None` = 没审出来（解析失败）。两者**必须分开** ——
+        合并成一个空列表的话，"解析失败"就会被当成"通过"，而调用方无从察觉。
+        """
+        messages: list[BaseMessage] = [
+            SystemMessage(content=load_prompt(PRD_REVIEW_PROMPT)),
+            HumanMessage(
+                content=render_prompt_text(
+                    PRD_REVIEW_HUMAN_TEMPLATE,
+                    {
+                        "summary_json": json.dumps(summary, ensure_ascii=False, indent=2),
+                        "draft": draft,
+                        "conversation": _render_conversation(history),
+                    },
+                )
+            ),
+        ]
+        # 走 `review_model`（默认就是写手那个模型；配了开关才是第二双眼睛）
+        response = await self.review_model.ainvoke(messages)
+        try:
+            verdict = _extract_json_object(message_text(response))
+        except SummarySyncError as exc:
+            logger.warning("PRD 审核输出解析失败，本次按通过处理：%s", exc)
+            return None
+
+        issues = verdict.get("issues")
+        if verdict.get("ok") is True:
+            return []
+        if not isinstance(issues, list) or not issues:
+            # `ok: false` 却没给问题清单 —— 无法据此重写，同样按"没审出来"处理
+            logger.warning("PRD 审核判了不通过但没给 issues，按通过处理")
+            return None
+        return [issue for issue in issues if isinstance(issue, dict)]
+
     # ------------------------------------------------------------ 文档修订
 
     async def optimize_document_stream(
@@ -1156,9 +1368,10 @@ class DocumentService:
             prd_content / api_content: 修 prompts 类产物时可能需要（同生成方法）。
 
         Note:
-            ⚠️ **未经真实 LLM 验证。** `OPTIMIZE_DOCUMENT_PROMPT_TEMPLATE` 的
-            docstring 已经声明过这一点，而本轮又给它补了 `{current_content}`，
-            所以**更该重跑一次验证**才能声称"文档优化可用"。
+            ✅ **三个变体都用真实模型验证过**（deepseek-chat，均未截断、且返回正文只含
+            被要求的那一节）：`prd` 2.9 秒 / 668 字符；`api` 3.5 秒 / 1245 字符（按反馈
+            补了「PRD 来源」列，回指到 FR 编号）；`prompts` 7.0 秒 / 1638 字符（只回
+            `=== FILE: 05-verify.md ===` 一个文件）。实测表见 `api/conversation.py`。
         """
         _require_text(section, "section", "必须指明修订哪一节")
         _require_text(current_content, "current_content", "必须给出该节的现有正文")

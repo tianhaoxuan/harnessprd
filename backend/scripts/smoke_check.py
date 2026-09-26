@@ -75,7 +75,7 @@ def _outcome_wiring_report() -> str | None:
         if endpoint is None:
             continue
         source = inspect.getsource(endpoint)
-        if "_make_sse_generator" not in source:
+        if "_make_sse_generator" not in source and "_make_stage_sse_generator" not in source:
             continue
         checked += 1
         path = getattr(route, "path", "?")
@@ -83,7 +83,7 @@ def _outcome_wiring_report() -> str | None:
             return f"{path} 没有创建 StreamOutcome"
         if "outcome=outcome" not in source:
             return f"{path} 没有把 outcome 传给服务层"
-        if "_make_sse_generator(stream, outcome)" not in source:
+        if all(s not in source for s in ("_make_sse_generator(stream, outcome)", "_make_stage_sse_generator(events, outcome)")):
             return f"{path} 没有把 outcome 交给 _make_sse_generator"
 
     # 7 = 对话 2 条 + 文档 5 条（PRD、从摘要生成 PRD、接口文档、套件、单节修订）；

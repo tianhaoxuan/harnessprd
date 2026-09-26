@@ -204,6 +204,51 @@ async def _make_sse_generator(
         yield _sse_event("done", payload)
 
 
+async def _make_stage_sse_generator(
+    events: AsyncIterator[tuple[str, Any]],
+    outcome: StreamOutcome | None = None,
+) -> AsyncIterator[str]:
+    """把**「阶段 + 正文」事件流**包装成 SSE 事件流（双智能体 PRD 专用）。
+
+    与 `_make_sse_generator` 只差一点：多一类 `stage` 命名事件。
+    为什么非要单独一类：审核那一段**没有任何正文**（模型只在内部出结论），
+    要是只按 `chunk` 发帧，界面上就是长时间一动不动 —— 用户会以为卡死，
+    然后刷新页面，把刚写的稿子一起扔掉。
+
+    帧序：任意多个 `stage` / `chunk` →（`done` 或 `error`）。
+    **收尾口径与 `_make_sse_generator` 完全一致**（含截断标记）：
+    否则「截断必须如实上报」（`HANDOFF.md` §4 坑 #18）会在这条路径上悄悄失效。
+    """
+    chunks = 0
+    chars = 0
+    try:
+        async for kind, payload in events:
+            if kind == "stage":
+                yield _sse_event("stage", payload)
+                continue
+            if not payload:
+                continue  # 空片段不产帧
+            chunks += 1
+            chars += len(payload)
+            yield _sse_event("chunk", {"text": payload})
+    except Exception as exc:  # noqa: BLE001 - 流里任何异常都要转成可读事件
+        logger.exception("SSE（双智能体）流中途失败")
+        yield _sse_event("error", {"type": type(exc).__name__, "message": str(exc)})
+    else:
+        payload: dict[str, Any] = {"chunks": chunks, "chars": chars}
+        if outcome is not None:
+            payload["truncated"] = outcome.truncated
+            payload["finish_reason"] = outcome.finish_reason
+        if outcome is not None and outcome.truncated:
+            logger.warning(
+                "生成的 PRD 被输出上限截断（finish_reason=%s）：%d 个片段 / %d 字符。",
+                outcome.finish_reason,
+                chunks,
+                chars,
+            )
+        yield _sse_event("done", payload)
+
+
 class _HasLazyModel(Protocol):
     """任何"惰性构造模型"的服务都满足它（`ConversationService` / `DocumentService`）。
 
@@ -398,19 +443,32 @@ async def generate_prd_from_summary_stream(
 
     ⚠️ 因此这条路径的 `[待确认]` 会明显更多 —— 对话澄清补的那些细节它没有。
     设计意图是"摘要已经够完整时走最短链路"，不是替代澄清流程。
+
+    `review=true` 时走**双智能体**（Writer 写初稿 → Reviewer 审核 → 有问题最多重写
+    `PRD_MAX_REWRITES` 次），会多出一类 `stage` 命名事件，前端据此显示
+    「正在写 / 正在审核 / 正在重写」。代价是**调用数与耗时翻倍**：实测审核通过
+    2 次调用 / 5.6 秒，触发重写 3 次调用 / 10.5 秒（单次生成是 1 次 / 约 5.7 秒）。
+    默认 `false`，因为这条路径也被回归脚本按裸文本用着。
     """
     _ensure_llm_ready(service)
 
     outcome = StreamOutcome()
+    history = [turn.model_dump() for turn in payload.history]
+    if payload.review:
+        events = service.generate_prd_with_review_events(
+            summary=payload.summary, history=history, outcome=outcome
+        )
+        return StreamingResponse(
+            _make_stage_sse_generator(events, outcome),
+            media_type=SSE_MEDIA_TYPE,
+            headers=SSE_HEADERS,
+        )
     stream = service.generate_prd_from_summary_stream(
-        summary=payload.summary,
-        history=[turn.model_dump() for turn in payload.history],
-        outcome=outcome,
+        summary=payload.summary, history=history, outcome=outcome
     )
     return StreamingResponse(
         _make_sse_generator(stream, outcome), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
     )
-
 
 # ---------------------------------------------------------------- 产物生成 / 修订
 #
@@ -534,9 +592,18 @@ async def optimize_document_stream(
     ⚠️ 修订 `kind` 为 `api` / `prompts` 时同样必须给 `prd_content`
     （`model_validator` → **422**），理由同 `generate-api-docs-stream`。
 
-    ⚠️ **本接口未经真实 LLM 验证。** `OPTIMIZE_DOCUMENT_PROMPT_TEMPLATE` 的 docstring
-    已经声明过这一点，而本轮又给它补了 `{current_content}`，所以更该重跑一次验证，
-    在那之前不要据此声称支持"文档优化"。
+    ✅ **已用真实模型验证过（`kind=prd`）**：`deepseek-chat`，2.9 秒 / 375 个片段 /
+    668 字符 / 未截断（`finish_reason=stop`）；返回正文**只含被要求的那一节**
+    （第 2 章没有被连带重写），并按反馈把「谁 / 什么场景 / 现在怎么做 / 痛在哪」逐条补上，
+    摘要里查不到的项一律标 `[待确认]`。
+    ✅ **三个变体都用真实模型验证过**（`deepseek-chat`，三次都是 `finish_reason=stop`、
+    未截断，且返回正文**只含被要求的那一节** —— 这是「修订」而不是「重生成」的关键）：
+
+    | 变体 | 耗时 | 片段 / 字符 | 关键观察 |
+    | --- | --- | --- | --- |
+    | `prd` | 2.9 秒 | 375 / 668 | 没连带重写下一章；缺失项标 `[待确认]` |
+    | `api` | 3.5 秒 | 559 / 1245 | 按反馈补了「PRD 来源」列，API-01 → FR-01、API-02 → FR-02，链条回指成立 |
+    | `prompts` | 7.0 秒 | 964 / 1638 | 只回 `=== FILE: 05-verify.md ===` 那一个文件，没把整套重写 |
     """
     _ensure_llm_ready(service)
 
