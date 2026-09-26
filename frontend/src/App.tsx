@@ -8,7 +8,11 @@ import DocumentReview, {
   type DocumentAction,
   type OptimizeRequest,
 } from './components/DocumentReview'
-import FormStep, { type FormValues, validateForm } from './components/FormStep'
+// ⚠️ 这里只借 `FormStep` 的类型与校验函数：**第一步的界面已经换成 `StructuredForm`**
+// （结构化录入）。`FormStep`（20 题逐题渲染）仍保留在仓库里，想切回去把下面这行换成
+// 默认导入、并把 `<StructuredForm .../>` 换回 `<FormStep .../>` 即可。
+import { type FormValues, validateForm } from './components/FormStep'
+import StructuredForm, { type StructuredSubmit } from './components/StructuredForm'
 import MessageList from './components/MessageList'
 import StepProgress from './components/StepProgress'
 import {
@@ -30,7 +34,6 @@ import {
   clearLocal,
   readFormDraft,
   readLocal,
-  sessionKey,
   SESSION_KIND,
   writeFormDraft,
   writeLocal,
@@ -216,9 +219,6 @@ export interface LoadedSession {
    */
   interrupted: DocKind | null
 }
-
-/** 会话键。**在 storage.ts 里按 `harnessprd:{env}:{schema}:{kind}` 约定算出来**，不是硬编码。 */
-export const SESSION_KEY = sessionKey()
 
 /** 保存整份会话。存储不可用时静默失败（`writeLocal` 的行为）—— 它只是缓存，不是权威。 */
 export function saveSession(data: SessionData): void {
@@ -427,40 +427,9 @@ const MAX_ROUNDS = 4
 const CHAT_TRUNCATED_NOTICE =
   '模型这一轮的回复撞上了单次输出上限，内容是断的（解析不出下一轮要问什么）。可以直接重试；若反复出现，把表单里最长的两项写短一些。'
 
-/**
- * 把分片结果拼成整份文档。
- *
- * 两件事：
- * 1. **空片直接跳过** —— 一片什么都没产出（模型拒答 / 只回了空白）不该在文档中段留下空行。
- * 2. **保守去掉重复的文档标题**：计划里的 `spec` 已经要求"不要重复文档标题"，但模型不一定听话。
- *    判据刻意收得很窄 —— 只有"这一片的**首个非空行**是 H1、且与已经拼好的**首个非空行**
- *    逐字相同"才丢掉它。宁可偶尔留下一行重复标题，也不要误删正文里一个正常的 `#` 标题。
- *
- * ⚠️ 这里**不做** Markdown 结构修复（补表格、补代码围栏）。分片边界落在哪由模型决定，
- * 想靠一个前端函数把它修好是不现实的；真正的保证是让每一片自己写完整（计划的 `spec` 负责）。
- */
-export function stitchParts(pieces: string[]): string {
-  const kept: string[] = []
-  let firstHeading: string | null = null
-
-  for (const piece of pieces) {
-    let text = piece.trim()
-    if (!text) continue
-    const lines = text.split('\n')
-    const firstIndex = lines.findIndex((line) => line.trim().length > 0)
-    const firstLine = firstIndex >= 0 ? lines[firstIndex].trim() : ''
-    if (firstLine.startsWith('# ')) {
-      if (firstHeading === null) firstHeading = firstLine
-      else if (firstLine === firstHeading) {
-        lines.splice(firstIndex, 1)
-        text = lines.join('\n').trim()
-        if (!text) continue
-      }
-    }
-    kept.push(text)
-  }
-  return kept.join('\n\n')
-}
+// `stitchParts` 已挪到 `services/stitch.ts`：AppV2 的分步流程也要用它，
+// 而让 V2 反向 import 本文件会把整个旧界面拖进打包结果。
+import { stitchParts } from './services/stitch'
 
 /** 本地会话 id。服务端 `/sessions` 还是 501，所以先自己生成 —— 它同时是本地存储的分片键。 */
 function newConversationId(): string {
@@ -561,6 +530,13 @@ export default function App() {
   const [load, setLoad] = useState<LoadState>({ status: 'loading' })
   const [values, setValues] = useState<FormValues>({})
   const [submitted, setSubmitted] = useState<FormValues | null>(null)
+  /**
+   * 结构化表单里"20 题装不下"的那部分内容（页面结构、关键交互、范围、LLM 说明、可用性）。
+   *
+   * 它在**生成**时并进 `known_info`；对话阶段（`start-stream`）拿不到它 ——
+   * 那个接口只收 `form`，没有 `known_info` 字段。缺的细节正好由澄清阶段追问补齐。
+   */
+  const [structuredExtras, setStructuredExtras] = useState('')
   const [restoredDraft, setRestoredDraft] = useState(false)
   /** 草稿恢复完成前**禁止**写回，否则初始的空对象会把已存的草稿冲掉。 */
   const [hydrated, setHydrated] = useState(false)
@@ -875,15 +851,10 @@ export default function App() {
     [],
   )
 
-  const handleFieldChange = useCallback((id: string, value: string) => {
-    setValues((prev) => ({ ...prev, [id]: value }))
-    setSubmitted(null)
-  }, [])
-
   /**
    * 提交表单 → 起首轮对话（S0 开场复盘）。
    *
-   * 校验在这里**再做一遍**：`FormStep` 提交前已经拦过一道，但本函数将来也会被
+   * 校验在这里**再做一遍**：`StructuredForm` 提交前已经拦过一道，但本函数将来也会被
    * 「重试开场」之类的入口调用，不能假设调用方一定校验过。两处共用 `validateForm`，
    * 规则只有一份，不会漂移。
    */
@@ -981,6 +952,27 @@ export default function App() {
       void handleStartConversation(formValues, load.config)
     },
     [load, handleStartConversation],
+  )
+
+  /**
+   * 结构化表单提交。
+   *
+   * 走的是**同一条** `handleSubmit`（内含 `validateForm` 再校验一次 + 推进到对话步），
+   * 所以后面的澄清、生成、审核与选 20 题表单时完全一致 —— 这也是把它并进 V1 而不是
+   * 另写一套向导的原因。
+   *
+   * 多出来的一件事：`extras`（20 题里没有对应题目的那部分结构化内容：页面结构、关键交互、
+   * 范围、LLM 说明、可用性）。它在生成时**并进 `known_info`**，因为 `start-stream` 只收
+   * `form`，没有 `known_info` 字段 —— 对话阶段看不到它，但它会在生成 PRD 时补上。
+   */
+  const handleStructuredSubmit = useCallback(
+    ({ form, extras }: StructuredSubmit) => {
+      setStructuredExtras(extras)
+      // 同步一份到 `values`：草稿与"恢复上次会话"的逻辑都挂着它
+      setValues(form)
+      handleSubmit(form)
+    },
+    [handleSubmit],
   )
 
   /** 「重试开场」：表单没变，重发一次首轮。 */
@@ -1169,7 +1161,9 @@ export default function App() {
       setStreamingDoc('')
       setViewState(DOC_META[kind].generating)
 
-      const knownInfo = buildKnownInfo(messages)
+      // 结构化表单里"20 题装不下"的那部分（页面结构、关键交互、范围、LLM 说明、可用性）
+      // 排在最前面：它是用户**明确填过**的内容，比从对话里抠出来的更硬。
+      const knownInfo = [structuredExtras, buildKnownInfo(messages)].filter(Boolean).join('\n\n')
       const context = {
         form: submitted ?? {},
         // ⚠️ 空串**不要传**：后端对"不传"填「（尚无）」，传空串则会把提示词里那一格
@@ -1304,7 +1298,9 @@ export default function App() {
       setDocFailure(null)
       setStreamingDoc('')
 
-      const knownInfo = buildKnownInfo(messages)
+      // 结构化表单里"20 题装不下"的那部分（页面结构、关键交互、范围、LLM 说明、可用性）
+      // 排在最前面：它是用户**明确填过**的内容，比从对话里抠出来的更硬。
+      const knownInfo = [structuredExtras, buildKnownInfo(messages)].filter(Boolean).join('\n\n')
       const context = {
         form: submitted ?? {},
         ...(knownInfo ? { known_info: knownInfo } : {}),
@@ -1746,13 +1742,7 @@ export default function App() {
             )}
           </div>
 
-          <FormStep
-            questions={load.config}
-            values={values}
-            onFieldChange={handleFieldChange}
-            onSubmit={handleSubmit}
-            submitting={sending}
-          />
+          <StructuredForm onSubmit={handleStructuredSubmit} submitting={sending} />
         </>
       )}
 

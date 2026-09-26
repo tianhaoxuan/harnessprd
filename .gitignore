@@ -1,8 +1,22 @@
 # ---------- 环境与密钥 ----------
+# ⚠️ 只写 `.env` 和 `.env.local` 是不够的：实测 `backend/.env.production`、
+# `.env.staging`、`.env.backup` **一个都不会被忽略**（`*.env` 只匹配"以 .env 结尾"的名字，
+# 而 `.env.production` 的结尾是 `.production`）。生产环境的 .env 往往就在这几个名字里，
+# 所以这里用 `.env.*` 一把兜住，再用 `!` 把模板单独放回来。
 .env
-.env.local
+.env.*
 *.env
 !.env.example
+
+# 私钥与证书：任何一份泄漏都等于凭据泄漏
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.pem
+*.key
+*.pfx
+*.p12
 
 # ---------- Python ----------
 __pycache__/
