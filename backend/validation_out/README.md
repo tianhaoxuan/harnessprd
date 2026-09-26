@@ -7,7 +7,7 @@
 
 | 文件 | 生成器 | 说明 |
 | --- | --- | --- |
-| `clarify_S0.txt` / `S1` / `S2` / `S4` | `scripts/validate_prompts.py` | 澄清阶段四个阶段。**S3、S5 没有分支，从未跑过**（见 `HANDOFF.md` §4 坑 #12） |
+| `clarify_S0.txt` / `S1` / `S2` / `S4` | `scripts/validate_prompts.py` | 澄清阶段四个阶段。**S3、S5 没有分支，从未跑过**（见 `HANDOFF.md` §4 坑 #12）。⚠️ **这四份是在 `clarify_common.md` 加"只做澄清、不写文档正文"（E7）之前跑的** —— 那两句只加约束、没改输出契约，但严格说基线已过期，要当前状态的证据得重跑（`validate_prompts.py`，4 次调用） |
 | `gen_prd.txt` | `scripts/validate_prompts.py` | PRD 第 5–7 章 |
 | `gen_api.txt` | `scripts/validate_prompts.py` | 接口文档第 6 章 |
 | `gen_prompts.txt` | `scripts/validate_prompts.py` | 提示词套件 00-README + 01-project-brief |
