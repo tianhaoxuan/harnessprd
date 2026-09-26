@@ -1,0 +1,24 @@
+# harnessprd backend —— 运行依赖（**后端依赖的唯一来源**，版本以本文件为准）
+#
+# 版本口径：
+#   下限 = 本机已实测跑通的版本（见 docs/技术栈.md「本机实测」列）
+#   上限 = 挡下一个大版本。LangChain 1.x → 2.x 是破坏性变更，必须挡。
+#
+# 安装（推荐 uv，本机 uv 0.12.17）：
+#   uv venv .venv
+#   uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+#
+# 升级后必须先跑：scripts/smoke_check.py → scripts/http_check.py
+# 若动了 LLM 相关依赖，还要跑 scripts/validate_prompts.py 全量（结论是模型相关的）
+
+fastapi>=0.141,<1.0              # 实测 0.141.1
+uvicorn[standard]>=0.53,<1.0     # 实测 0.53.0（standard 附带 httptools/watchfiles/websockets）
+pydantic-settings>=2.15,<3.0     # 实测 2.15.0；用到 NoDecode，故下限 2.15
+langchain-core>=1.6,<2.0         # 实测 1.6.3；业务层只依赖它的 BaseChatModel
+langchain-anthropic>=1.7,<2.0    # 实测 1.7.2
+langchain-openai>=1.6,<2.0       # 实测 1.6.2；DeepSeek 也走这条（OpenAI 兼容协议）
+python-dotenv>=1.2,<2.0          # 实测 1.2.3
+
+# 尚未声明但实现时会用到的（现在是传递依赖，用之前必须显式加进来）：
+#   jsonschema   校验 core/form_submission.schema.json（现由 langchain-core 带入）
+#   tiktoken     统计 token 用量/成本（现由 langchain-openai 带入，对应 F4.13）

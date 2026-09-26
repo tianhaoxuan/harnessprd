@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 基础样式。Tailwind 的三条指令必须在这里引入（v3 工作流），
+   postcss.config.js 里的 tailwindcss 插件会把它们展开成实际样式。 */
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+  }
+}

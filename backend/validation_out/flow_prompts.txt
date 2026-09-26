@@ -1,0 +1,732 @@
+# 群聊周报助手 · 提示词套件
+
+=== FILE: 00-README.md ===
+# 群聊周报助手 · AI 编程提示词套件
+
+## 这是什么
+
+一套给 AI 编程工具（Cursor / Claude Code / Codex）直接使用的提示词。
+按编号顺序执行，每一步产出的代码是下一步的前置。
+
+## 使用方式
+
+1. 先读 `01-project-brief.md`，把它作为整个会话的常驻上下文。
+2. 按编号顺序执行 `02` → `03` → `04-step-*` → `05`。
+3. 每步执行完，用该步的「验收」小节自检，通过后再进入下一步。
+4. 不要跳步。步骤之间存在硬依赖。
+
+## 文件清单
+
+| 文件 | 类别 | 作用 |
+| --- | --- | --- |
+| `01-project-brief.md` | 总控 | 全局上下文与不可协商的约束 |
+| `02-scaffold.md` | 脚手架 | 把空目录变成能跑起来的骨架 |
+| `03-data-layer.md` | 数据层 | 数据模型落成表与迁移 |
+| `04-step-01-auth.md` | 功能实现 | 账号密码注册登录 |
+| `04-step-02-group-chats.md` | 功能实现 | 群聊配置管理 |
+| `04-step-03-aggregations.md` | 功能实现 | 触发群聊消息汇总 |
+| `04-step-04-weekly-reports.md` | 功能实现 | 生成周报草稿 |
+| `04-step-05-report-editing.md` | 功能实现 | 人工修改周报草稿 |
+| `04-step-06-feishu-export.md` | 功能实现 | 导出到飞书 |
+| `05-verify.md` | 验收自检 | 对照验收标准自检并补测试 |
+
+## 覆盖矩阵
+
+| PRD 功能需求 | 优先级 | 覆盖步骤 |
+| --- | --- | --- |
+| FR-01 账号密码注册登录 | P0 | `04-step-01-auth.md` |
+| FR-02 自动汇总指定群聊的消息 | P0 | `04-step-02-group-chats.md`、`04-step-03-aggregations.md` |
+| FR-03 按人 / 项目生成周报草稿 | P0 | `04-step-04-weekly-reports.md` |
+| FR-04 人工修改周报草稿 | P0 | `04-step-05-report-editing.md` |
+| FR-05 导出到飞书 | P0 | `04-step-06-feishu-export.md` |
+| FR-06 长期保存用户数据 | P1 | `03-data-layer.md`（持久化）+ `04-step-04-weekly-reports.md`、`04-step-06-feishu-export.md`（可访问性） |
+
+全部 P0 功能需求均已被至少一步覆盖。
+
+## 依赖关系
+
+```
+01-project-brief
+      ↓
+02-scaffold
+      ↓
+03-data-layer
+      ↓
+04-step-01-auth
+      ↓
+04-step-02-group-chats
+      ↓
+04-step-03-aggregations
+      ↓
+04-step-04-weekly-reports
+      ↓
+04-step-05-report-editing
+      ↓
+04-step-06-feishu-export
+      ↓
+05-verify
+```
+
+依赖为严格线性，无环。
+
+## 未决事项
+
+以下事项在 PRD 与接口文档中标记为 `[待确认]`，本套件按已确认部分生成，未决部分不阻塞开发：
+
+| 编号 | 事项 | 影响 |
+| --- | --- | --- |
+| Q-01 | 产品类型未填写 | 不影响，按 Web 网站实现 |
+| Q-02 | 技术栈偏好未填写 | 本套件按 `01-project-brief.md` 中指定的技术栈执行 |
+| Q-03 | 现有系统与历史数据未填写 | 按全新项目处理 |
+| Q-04 | 页面数量预估未填写 | 不影响接口与数据层 |
+| Q-05 | 第三方服务对接未填写（飞书对接方式待定） | `04-step-06-feishu-export.md` 中飞书调用封装为独立适配层，待确认后替换实现 |
+| Q-06 | 核心数据实体未填写 | 已按接口文档第 4 章实体实现 |
+| Q-07 | 接口风格与鉴权未填写 | 已按接口文档第 2、3 章实现 |
+| Q-08 | 规模与性能预期未填写 | 按 20 人以下团队规模实现，不做额外性能优化 |
+| Q-09 | 安全与合规要求未填写 | 仅实现接口文档第 3 章的鉴权与授权，不做额外合规处理 |
+| Q-10 | 工程约定与代码规范未填写 | 按 `01-project-brief.md` 中的约定执行 |
+| Q-11 | 页面风格偏好未填写 | 按 `01-project-brief.md` 中的视觉约定执行 |
+
+=== FILE: 01-project-brief.md ===
+# 群聊周报助手 · 项目总控
+
+## 项目定位
+
+面向 20 人以下创业团队的技术负责人（兼做项目管理）的 Web 工具。
+把指定群聊在指定时间范围内的消息自动汇总，按人 / 项目生成周报草稿，
+支持人工修改后导出到飞书。
+
+核心价值：把每周约 2 小时的周报撰写时间省下来。
+
+## 技术栈与版本
+
+| 层 | 选型 | 版本 |
+| --- | --- | --- |
+| 语言 | TypeScript | 5.4+ |
+| 运行时 | Node.js | 20 LTS |
+| 后端框架 | Fastify | 4.x |
+| 数据库 | PostgreSQL | 16 |
+| 数据库访问 | `pg` 裸 SQL | 8.x |
+| 前端框架 | React | 18.x |
+| 前端构建 | Vite | 5.x |
+| 测试 | Vitest | 1.x |
+
+## 目录结构
+
+```
+.
+├── src/
+│   ├── server/
+│   │   ├── routes/          # 路由定义，按资源分文件
+│   │   ├── services/        # 业务逻辑
+│   │   ├── repositories/    # SQL 访问层
+│   │   ├── middleware/      # 鉴权、错误处理
+│   │   └── app.ts           # Fastify 实例装配
+│   ├── shared/
+│   │   ├── errors.ts        # 错误码与统一错误体
+│   │   ├── ids.ts           # ID 生成
+│   │   └── time.ts          # 时间与时区处理
+│   └── web/                 # 前端
+├── migrations/              # SQL 迁移文件，按序号命名
+├── tests/
+└── package.json
+```
+
+## 代码规范
+
+- 全部 TypeScript，`strict: true`，禁止 `any`。
+- 字段命名统一 `snake_case`，与接口文档逐字一致。
+- 数据库访问统一用 `pg` 裸 SQL，**禁止引入 ORM**。
+- 每个路由处理函数只做参数校验与调用 service，业务逻辑写在 service。
+- 所有 SQL 必须参数化，禁止字符串拼接。
+- 时间一律以 ISO 8601 UTC 字符串在接口层传递，数据库用 `timestamptz`。
+
+## 视觉与交互约定
+
+- 单页应用，左侧导航 + 右侧内容区。
+- 主色 `#1F6FEB`，中性灰阶，无阴影、无圆角超过 6px。
+- 所有异步操作按钮在请求期间置为 disabled 并显示加载态。
+- 错误提示统一用顶部横幅，文案取自接口返回的 `message` 字段。
+- 空状态必须显式展示文案，不留白屏。
+
+## 数据约定
+
+- 时间：ISO 8601 + UTC，如 `2025-01-13T02:15:00Z`。
+- 汇总时间范围按用户 `timezone` 解释，边界为 `[start_at, end_at)`。
+- 分页：`page` 从 1 起，`page_size` 默认 20、上限 100。
+- 分页响应固定为 `items` / `page` / `page_size` / `total`。
+- 空值返回 `null`，不省略字段。
+- ID 格式：`usr_` / `gcp_` / `agg_` / `rpt_` / `exp_` + 12 位小写字母数字。
+
+## 错误处理约定
+
+- 成功响应不套信封，直接返回资源对象或分页对象。
+- 失败返回统一错误体：
+
+```json
+{
+  "error_code": "AGG001",
+  "message": "时间跨度超过 31 天，请缩小范围",
+  "details": { "field": "end_at", "max_span_days": 31 }
+}
+```
+
+- 状态码分界：`400` 请求不合法；`422` 业务校验不通过；`409` 状态或并发冲突。
+- 错误码全集见接口文档第 5 章，**不得自造错误码**。
+
+## 安全与合规约定
+
+- 除 `POST /api/v1/auth/register` 与 `POST /api/v1/auth/login` 外，所有接口必须校验 `Authorization: Bearer <access_token>`。
+- 令牌缺失或失效返回 `401` + `AUTH004`。
+- 所有资源查询在服务端按当前登录用户强制过滤，**不接受客户端传入 `user_id`**。
+- 跨用户访问返回 `403` + `AUTH005`。
+- 密码只存哈希，任何响应不返回密码字段。
+
+## 硬性禁止事项
+
+- 禁止引入 ORM。
+- 禁止自造错误码、字段名、接口路径。
+- 禁止在成功响应外层加 `data` / `result` 信封。
+- 禁止实现 PRD 第 5 章「本期明确不做」中的任何功能。
+- 禁止跳过鉴权中间件。
+
+## 术语表
+
+| 术语 | 定义 |
+| --- | --- |
+| 群聊 | 团队日常沟通所在的聊天群 |
+| 汇总结果 | 指定群聊在指定时间范围内的消息汇总 |
+| 周报草稿 | 基于汇总结果按人 / 项目生成的、可人工修改的周报内容 |
+| 导出 | 将周报输出到飞书，使其可在飞书中打开 |
+| 技术负责人 | 20 人以下创业团队中兼做项目管理的技术负责人 |
+
+=== FILE: 02-scaffold.md ===
+# 脚手架
+
+## 目标
+
+在空目录中建立可启动、可连库、可跑测试的项目骨架，`GET /api/v1/health` 返回 200。
+
+## 前置
+
+无。这是第一步。
+
+## 涉及文件
+
+新建：
+
+- `package.json`
+- `tsconfig.json`
+- `vite.config.ts`
+- `.env.example`
+- `src/server/app.ts`
+- `src/server/routes/health.ts`
+- `src/shared/errors.ts`
+- `src/shared/ids.ts`
+- `src/shared/time.ts`
+- `src/web/main.tsx`
+- `src/web/App.tsx`
+- `tests/setup.ts`
+
+## 涉及接口
+
+- `GET /api/v1/health`（本步新增，非业务接口，仅用于启动自检）
+
+## 约束
+
+- 技术栈与版本严格按 `01-project-brief.md`，不得替换。
+- 目录结构严格按 `01-project-brief.md`，不得增删顶层目录。
+- `src/shared/errors.ts` 必须导出接口文档第 5 章的全部错误码常量与统一错误体构造函数。
+- `src/shared/ids.ts` 必须实现 `usr_` / `gcp_` / `agg_` / `rpt_` / `exp_` 五种前缀的 ID 生成。
+- `src/shared/time.ts` 必须实现 `[start_at, end_at)` 区间校验与「跨度不超过 31 天」校验。
+- 本步不建任何业务表，不写任何业务路由。
+
+## 依赖清单
+
+| 包 | 版本 | 用途 |
+| --- | --- | --- |
+| `fastify` | ^4.26.0 | HTTP 服务 |
+| `@fastify/cors` | ^9.0.0 | 跨域 |
+| `pg` | ^8.11.0 | PostgreSQL 访问 |
+| `react` | ^18.2.0 | 前端 |
+| `react-dom` | ^18.2.0 | 前端 |
+| `vite` | ^5.1.0 | 前端构建 |
+| `typescript` | ^5.4.0 | 语言 |
+| `vitest` | ^1.2.0 | 测试 |
+| `tsx` | ^4.7.0 | 开发期运行 TS |
+
+## 配置文件清单
+
+| 文件 | 关键内容 |
+| --- | --- |
+| `tsconfig.json` | `strict: true`、`noImplicitAny: true`、`target: ES2022`、`module: NodeNext` |
+| `vite.config.ts` | 前端根目录 `src/web`，开发代理 `/api` → `http://localhost:3000` |
+| `.env.example` | `DATABASE_URL`、`PORT=3000`、`TOKEN_SECRET`、`FEISHU_APP_ID`、`FEISHU_APP_SECRET` |
+
+## 启动与验证方式
+
+```bash
+npm install
+cp .env.example .env
+npm run dev
+```
+
+```bash
+curl -i http://localhost:3000/api/v1/health
+```
+
+预期：`200`，响应体 `{"status":"ok"}`。
+
+```bash
+npm test
+```
+
+预期：测试通过（本步只有 setup，无用例）。
+
+## 部署与上线
+
+- 单进程 Node 服务，监听 `PORT`。
+- 数据库连接串从 `DATABASE_URL` 读取，不硬编码。
+- 前端构建产物由 `npm run build` 输出到 `dist/web`，由同一进程静态托管。
+- 必须能导出到飞书 —— 该硬约束由 `04-step-06-feishu-export.md` 承载，本步只预留 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 环境变量。
+
+## 暂不实现的部分
+
+- 不建任何业务表。
+- 不实现注册、登录、汇总、生成、编辑、导出。
+- 不实现前端页面路由，`App.tsx` 只渲染一个占位标题。
+
+## 验收
+
+```bash
+curl -s http://localhost:3000/api/v1/health
+```
+
+预期输出：`{"status":"ok"}`。
+
+```bash
+npx tsc --noEmit
+```
+
+预期：无类型错误。
+
+## 本步不做
+
+- 不写业务路由。
+- 不写迁移文件。
+- 不接飞书。
+
+=== FILE: 03-data-layer.md ===
+# 数据层
+
+## 目标
+
+把接口文档第 4 章的全部实体落成 PostgreSQL 表与迁移文件，并保证唯一索引能阻止重复汇总。
+
+## 前置
+
+- `02-scaffold.md` 已完成：`src/shared/ids.ts`、`src/shared/errors.ts`、`src/shared/time.ts` 可用，`pg` 连接池已装配。
+
+## 涉及文件
+
+新建：
+
+- `migrations/001_create_users.sql`
+- `migrations/002_create_group_chats.sql`
+- `migrations/003_create_aggregations.sql`
+- `migrations/004_create_weekly_reports.sql`
+- `migrations/005_create_exports.sql`
+- `src/server/repositories/users.ts`
+- `src/server/repositories/group_chats.ts`
+- `src/server/repositories/aggregations.ts`
+- `src/server/repositories/weekly_reports.ts`
+- `src/server/repositories/exports.ts`
+- `tests/data-layer.test.ts`
+
+## 涉及接口
+
+本步不实现接口，只实现接口文档第 4 章的数据模型。
+
+## 实体与字段
+
+严格按接口文档第 4 章建表，字段名逐字一致：
+
+| 表 | 主键前缀 | 关键字段 |
+| --- | --- | --- |
+| `users` | `usr_` | `id`、`account`（唯一）、`password_hash`、`display_name`、`timezone`、`created_at`、`updated_at` |
+| `group_chats` | `gcp_` | `id`、`user_id`、`name`、`external_chat_id`、`member_count`、`created_at`、`updated_at` |
+| `aggregations` | `agg_` | `id`、`user_id`、`group_chat_id`、`start_at`、`end_at`、`status`、`message_count`、`items`、`failure_reason`、`created_at`、`updated_at` |
+| `weekly_reports` | `rpt_` | `id`、`user_id`、`aggregation_id`（唯一）、`title`、`group_by`、`status`、`sections`、`version`、`is_edited`、`created_at`、`updated_at` |
+| `exports` | `exp_` | `id`、`weekly_report_id`、`user_id`、`target`、`status`、`external_doc_url`、`content_snapshot`、`failure_reason`、`created_at` |
+
+`aggregations.items` 与 `weekly_reports.sections` 用 `jsonb` 存储，默认 `'[]'::jsonb`。
+
+## 实体关系
+
+```
+users 1 ──< group_chats
+users 1 ──< aggregations >── 1 group_chats
+users 1 ──< weekly_reports >── 1 aggregations
+weekly_reports 1 ──< exports
+```
+
+## 枚举全集
+
+| 枚举 | 取值 | 用于 |
+| --- | --- | --- |
+| `aggregations.status` | `pending` / `succeeded` / `failed` | 汇总状态 |
+| `weekly_reports.group_by` | `person` / `project` | 组织维度 |
+| `weekly_reports.status` | `draft` / `exported` | 草稿状态 |
+| `exports.target` | `feishu` | 导出目标，本期固定 |
+| `exports.status` | `pending` / `succeeded` / `failed` | 导出状态 |
+
+全部用 `CHECK` 约束落库，不用 PostgreSQL 原生 enum 类型。
+
+## 级联规则
+
+- `group_chats.user_id` → `users.id`，`ON DELETE CASCADE`。
+- `aggregations.user_id` → `users.id`，`ON DELETE CASCADE`。
+- `aggregations.group_chat_id` → `group_chats.id`，`ON DELETE CASCADE`。
+- `weekly_reports.user_id` → `users.id`，`ON DELETE CASCADE`。
+- `weekly_reports.aggregation_id` → `aggregations.id`，`ON DELETE CASCADE`。
+- `exports.weekly_report_id` → `weekly_reports.id`，`ON DELETE CASCADE`。
+- `exports.user_id` → `users.id`，`ON DELETE CASCADE`。
+
+## 索引
+
+| 表 | 索引 | 类型 |
+| --- | --- | --- |
+| `users` | `account` | 唯一 |
+| `group_chats` | `(user_id, external_chat_id)` | 唯一 |
+| `aggregations` | `(user_id, group_chat_id, start_at, end_at)` | 唯一 |
+| `weekly_reports` | `aggregation_id` | 唯一 |
+| `weekly_reports` | `(user_id, created_at)` | 普通 |
+| `exports` | `(weekly_report_id, created_at)` | 普通 |
+
+`aggregations` 的唯一索引是 AC-09 的落地点：同一用户重复触发同一群聊同一时间范围的汇总时，`INSERT ... ON CONFLICT DO NOTHING` 后回读已有记录。
+
+## 迁移与种子数据
+
+- 迁移文件按 `001`–`005` 顺序执行，每个文件只含一个事务。
+- 不写种子数据。测试数据由 `tests/data-layer.test.ts` 在事务中创建并回滚。
+
+## 验收
+
+```bash
+psql "$DATABASE_URL" -f migrations/001_create_users.sql
+psql "$DATABASE_URL" -f migrations/002_create_group_chats.sql
+psql "$DATABASE_URL" -f migrations/003_create_aggregations.sql
+psql "$DATABASE_URL" -f migrations/004_create_weekly_reports.sql
+psql "$DATABASE_URL" -f migrations/005_create_exports.sql
+```
+
+预期：全部成功，无报错。
+
+```bash
+npm test -- tests/data-layer.test.ts
+```
+
+预期：以下断言全部通过 ——
+
+1. 插入两条 `account` 相同的 `users`，第二条抛唯一约束错误。
+2. 插入两条 `(user_id, external_chat_id)` 相同的 `group_chats`，第二条抛唯一约束错误。
+3. 插入两条 `(user_id, group_chat_id, start_at, end_at)` 相同的 `aggregations`，第二条抛唯一约束错误。
+4. 删除一条 `users`，其名下 `group_chats`、`aggregations`、`weekly_reports`、`exports` 全部被级联删除。
+
+## 本步不做
+
+- 不实现任何 HTTP 路由。
+- 不实现密码哈希逻辑（属于 `04-step-01-auth.md`）。
+- 不实现飞书调用。
+
+=== FILE: 04-step-01-auth.md ===
+# 步骤 01 · 账号密码注册登录
+
+## 目标
+
+实现 `POST /api/v1/auth/register` 与 `POST /api/v1/auth/login`，登录成功签发 `access_token`，未登录访问受保护接口返回 `401` + `AUTH004`。
+
+## 前置
+
+- `02-scaffold.md`：`src/shared/errors.ts` 已导出 `AUTH001`–`AUTH005` 与统一错误体构造函数；`src/shared/ids.ts` 已实现 `usr_` 前缀 ID 生成。
+- `03-data-layer.md`：`users` 表已建，`src/server/repositories/users.ts` 已可用。
+
+## 涉及文件
+
+新建：
+
+- `src/server/routes/auth.ts`
+- `src/server/services/auth.ts`
+- `src/server/middleware/require-auth.ts`
+- `tests/auth.test.ts`
+
+修改：
+
+- `src/server/app.ts`（注册 `auth` 路由与鉴权中间件）
+
+## 涉及接口
+
+- `POST /api/v1/auth/register`
+- `POST /api/v1/auth/login`
+
+## 约束
+
+- 请求体字段：`account`（4–32，仅字母数字下划线）、`password`（8–64）、`display_name`（可选，1–32）、`timezone`（可选，IANA 时区名，缺省 `Asia/Shanghai`）。
+- 注册响应只返回 `id` / `account` / `display_name` / `timezone` / `created_at`，**不返回任何密码字段**。
+- 登录响应返回 `access_token` / `token_type`（固定 `Bearer`）/ `expires_in` / `user`。
+- 账号或密码错误统一返回 `401` + `AUTH002`，**不区分账号不存在与密码错误**。
+- 账号已存在返回 `409` + `AUTH003`。
+- 账号或密码为空返回 `400` + `AUTH001`。
+- 参数类型或格式错误返回 `400` + `COMMON001`。
+- 密码用 bcrypt 哈希后存 `password_hash`，禁止明文。
+- 令牌用 JWT 签发，密钥取自 `TOKEN_SECRET`，有效期 604800 秒。
+- 两个接口均支持 `Idempotency-Key` 请求头，相同 Key 24 小时内返回首次结果。
+- 鉴权中间件挂在除注册、登录外的全部路由上。
+
+## 验收
+
+```bash
+curl -s -X POST http://localhost:3000/api/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"account":"techlead01","password":"Str0ngPassw0rd","display_name":"张工","timezone":"Asia/Shanghai"}'
+```
+
+预期：`200`，响应体含 `id` 且以 `usr_` 开头，**不含** `password` 或 `password_hash`。
+
+```bash
+curl -s -X POST http://localhost:3000/api/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"account":"techlead01","password":"Str0ngPassw0rd"}'
+```
+
+预期：`409`，`error_code` 为 `AUTH003`。
+
+```bash
+curl -s -X POST http://localhost:3000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"account":"techlead01","password":"Str0ngPassw0rd"}'
+```
+
+预期：`200`，响应体含 `access_token`、`token_type` 为 `Bearer`、`expires_in` 为 `604800`。
+
+```bash
+curl -s -X POST http://localhost:3000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"account":"techlead01","password":"wrong-password"}'
+```
+
+预期：`401`，`error_code` 为 `AUTH002`。
+
+```bash
+curl -s http://localhost:3000/api/v1/group-chats
+```
+
+预期：`401`，`error_code` 为 `AUTH004`。
+
+```bash
+npm test -- tests/auth.test.ts
+```
+
+预期：覆盖 AC-01、AC-02、AC-03、AC-04 的用例全部通过。
+
+## 本步不做
+
+- 不实现群聊配置、汇总、生成、编辑、导出。
+- 不实现令牌刷新与登出。
+- 不实现密码找回。
+
+=== FILE: 04-step-02-group-chats.md ===
+# 步骤 02 · 群聊配置管理
+
+## 目标
+
+实现群聊配置的创建与分页查询，服务端按当前登录用户强制过滤。
+
+## 前置
+
+- `04-step-01-auth.md`：`src/server/middleware/require-auth.ts` 已可用，受保护路由可拿到当前用户 `id`。
+- `03-data-layer.md`：`group_chats` 表已建，`src/server/repositories/group_chats.ts` 已可用。
+
+## 涉及文件
+
+新建：
+
+- `src/server/routes/group-chats.ts`
+- `src/server/services/group-chats.ts`
+- `tests/group-chats.test.ts`
+
+修改：
+
+- `src/server/app.ts`（注册 `group-chats` 路由）
+
+## 涉及接口
+
+- `GET /api/v1/group-chats`
+- `POST /api/v1/group-chats`
+
+## 约束
+
+- 两个接口均需登录，角色为技术负责人。
+- 创建请求体：`name`（1–64，必填）、`external_chat_id`（1–128，必填）、`member_count`（≥ 0，可选，缺省 `null`）。
+- 创建响应结构同列表的 `items[]` 元素：`id` / `name` / `external_chat_id` / `member_count` / `created_at`。
+- 同一用户下 `external_chat_id` 唯一，重复创建返回已存在的配置，**不报错**。
+- 列表查询参数：`page`（默认 1）、`page_size`（默认 20，上限 100）。
+- 列表响应固定为 `items` / `page` / `page_size` / `total`。
+- 服务端按当前登录用户强制过滤，**不接受客户端传入 `user_id`**。
+- 创建支持 `Idempotency-Key`，相同 Key 24 小时内返回首次创建结果。
+- 参数校验失败返回 `400` + `COMMON001`。
+
+## 验收
+
+```bash
+TOKEN=<登录拿到的 access_token>
+
+curl -s -X POST http://localhost:3000/api/v1/group-chats \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"产品研发群","external_chat_id":"oc_5f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c","member_count":12}'
+```
+
+预期：`200`，响应体 `id` 以 `gcp_` 开头。
+
+重复执行同一条命令，预期：返回同一个 `id`，不新建记录。
+
+```bash
+curl -s "http://localhost:3000/api/v1/group-chats?page=1&page_size=20" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+预期：`200`，响应体含 `items` / `page` / `page_size` / `total`，`items` 中只含当前用户的群聊。
+
+```bash
+curl -s "http://localhost:3000/api/v1/group-chats?page=1&page_size=200" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+预期：`400`，`error_code` 为 `COMMON001`。
+
+```bash
+npm test -- tests/group-chats.test.ts
+```
+
+预期：覆盖「跨用户不可见」「重复创建返回已有配置」「分页结构正确」的用例全部通过。
+
+## 本步不做
+
+- 不实现群聊配置的修改与删除。
+- 不实现汇总触发（属于 `04-step-03-aggregations.md`）。
+- 不实现从外部平台拉取群聊列表。
+
+=== FILE: 04-step-03-aggregations.md ===
+# 步骤 03 · 触发群聊消息汇总
+
+## 目标
+
+实现 `POST /api/v1/aggregations` 与 `GET /api/v1/aggregations/{aggregation_id}`，时间跨度超 31 天返回 `422` + `AGG001`，重复触发不产生重复记录。
+
+## 前置
+
+- `04-step-02-group-chats.md`：`group_chats` 的创建与查询已可用，`gcp_` ID 可获取。
+- `03-data-layer.md`：`aggregations` 表已建，`(user_id, group_chat_id, start_at, end_at)` 唯一索引已生效。
+
+## 涉及文件
+
+新建：
+
+- `src/server/routes/aggregations.ts`
+- `src/server/services/aggregations.ts`
+- `src/server/services/message-source.ts`（上游消息源适配层）
+- `tests/aggregations.test.ts`
+
+修改：
+
+- `src/server/app.ts`（注册 `aggregations` 路由）
+
+## 涉及接口
+
+- `POST /api/v1/aggregations`
+- `GET /api/v1/aggregations/{aggregation_id}`
+
+## 约束
+
+- 两个接口均需登录，角色为技术负责人。
+- 请求体：`group_chat_id`（必填，必须属于当前用户）、`start_at`（必填，ISO 8601 UTC，含）、`end_at`（必填，ISO 8601 UTC，不含，且晚于 `start_at`）。
+- 响应字段：`id` / `group_chat_id` / `start_at` / `end_at` / `status` / `message_count` / `items` / `failure_reason` / `created_at` / `updated_at`。
+- `items[]` 元素：`message_id` / `sender_name` / `sent_at` / `content` / `project_hint`（无法判定时为 `null`）。
+- 时间跨度上限 31 天，超出返回 `422` + `AGG001`。
+- `start_at` 不早于 `end_at` 返回 `422` + `AGG002`。
+- `group_chat_id` 不存在或不属于当前用户返回 `404` + `AGG003`。
+- 命中 0 条消息返回 `422` + `AGG004`，**不落库为空汇总结果**。
+- 上游消息源不可用返回 `502` + `AGG005`，保留用户已选的群聊与时间范围，允许重试。
+- 时间范围按用户 `timezone` 解释，边界为 `[start_at, end_at)`。
+- 重复触发同一 `group_chat_id` 与同一 `[start_at, end_at)` 时，命中唯一索引并返回已有汇总结果，**不产生重复记录**。
+- 支持 `Idempotency-Key`，相同 Key 24 小时内返回首次结果。
+- 状态流转：`pending` → `succeeded` / `failed`。
+- 跨用户读取返回 `403` + `AUTH005`。
+- `message-source.ts` 是上游消息源的唯一入口，本步用固定桩数据实现，接口签名固定为 `fetchMessages(external_chat_id, start_at, end_at): Promise<Message[]>`。
+
+## 验收
+
+```bash
+TOKEN=<登录拿到的 access_token>
+GCP=<群聊配置 id>
+
+curl -s -X POST http://localhost:3000/api/v1/aggregations \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"group_chat_id\":\"$GCP\",\"start_at\":\"2025-01-06T00:00:00Z\",\"end_at\":\"2025-01-13T00:00:00Z\"}"
+```
+
+预期：`200`，`status` 为 `succeeded`，`id` 以 `agg_` 开头，`items` 非空。
+
+重复执行同一条命令，预期：返回同一个 `id`，`aggregations` 表记录数不增加。
+
+```bash
+curl -s -X POST http://localhost:3000/api/v1/aggregations \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"group_chat_id\":\"$GCP\",\"start_at\":\"2024-12-01T00:00:00Z\",\"end_at\":\"2025-01-13T00:00:00Z\"}"
+```
+
+预期：`422`，`error_code` 为 `AGG001`。
+
+```bash
+curl -s -X POST http://localhost:3000/api/v1/aggregations \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"group_chat_id\":\"$GCP\",\"start_at\":\"2025-01-13T00:00:00Z\",\"end_at\":\"2025-01-06T00:00:00Z\"}"
+```
+
+预期：`422`，`error_code` 为 `AGG002`。
+
+```bash
+curl -s -X POST http://localhost:3000/api/v1/aggregations \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"group_chat_id\":\"$GCP\",\"start_at\":\"2025-01-06T00:00:00Z\",\"end_at\":\"2025-01-06T01:00:00Z\"}"
+```
+
+预期：`422`，`error_code` 为 `AGG004`，且 `aggregations` 表无新增记录。
+
+```bash
+npm test -- tests/aggregations.test.ts
+```
+
+预期：覆盖 AC-05、AC-06、AC-07、AC-08、AC-09 的用例全部通过。
+
+## 本步不做
+
+- 不实现周报草稿生成（属于 `04-step-04-weekly-reports.md`）。
+- 不实现真实上游消息源对接，只用桩数据。
+- 不实现汇总结果的删除与重跑。
+
+=== FILE: 04-step-04-weekly-reports.md ===
+# 步骤 04 · 生成周报草稿
+
+## 目标
+
+实现 `POST /api/v1/weekly-reports` 与 `GET /api/v1/weekly-reports/{weekly_report_id}`，按 `person` / `project` 维度生成草稿，一份汇总结果对应一份草稿。
+
+## 前置
+
+- `04-step-

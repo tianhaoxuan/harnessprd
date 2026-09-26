@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "产品需求表单提交数据",
+  "description": "用户填完表单后提交给后端的数据。对象顶层直接以题目 id 为 key、用户作答为 value。未作答的选填题可以省略该 key（或传空串）。由 scripts/gen_form_schema.py 从 core/questions_config.json 生成，对应表单版本 1.2，请勿手改。",
+  "type": "object",
+  "properties": {
+    "product_name": {
+      "title": "产品名称",
+      "description": "还没定名的话填一个临时代号即可。后续在 PRD 里统一引用这个名字，避免同一产品出现多种叫法。",
+      "type": "string",
+      "maxLength": 50,
+      "minLength": 1
+    },
+    "product_type": {
+      "title": "产品类型",
+      "description": "决定 PRD 核心场景的写法与提示词套件的模块划分方式。与「平台类型」是两个维度：平台类型说的是跑在哪，产品类型说的是它是什么。",
+      "type": "string",
+      "anyOf": [
+        {
+          "enum": [
+            "效率工具（解决单点问题）",
+            "平台 / 中台（连接多方）",
+            "内容与社区",
+            "企业内部管理系统",
+            "电商 / 交易类",
+            "数据与分析类",
+            "还不确定"
+          ]
+        },
+        {
+          "const": ""
+        }
+      ]
+    },
+    "problem": {
+      "title": "要解决的问题",
+      "description": "写下用户当前的痛点和现状，尽量具体到场景。这是 PRD「背景与问题」一章的输入，写得越具体，后面被追问得越少。",
+      "type": "string",
+      "maxLength": 1000,
+      "minLength": 1
+    },
+    "target_users": {
+      "title": "目标用户",
+      "description": "写清楚角色和典型特征。避免填「所有人」——范围越模糊，PRD 的「目标用户与核心场景」越写不实。",
+      "type": "string",
+      "maxLength": 1000,
+      "minLength": 1
+    },
+    "core_features": {
+      "title": "核心功能",
+      "description": "列 3–5 条最重要的，每条一句话即可。只写「做什么」，不用写怎么做，细节留给后面的对话补齐。",
+      "type": "string",
+      "maxLength": 2000,
+      "minLength": 1
+    },
+    "success_metrics": {
+      "title": "成功指标",
+      "description": "PRD 第 2 章「目标与成功指标」要求可量化，这是最容易写空的一章。尽量给数字和期限，例如「上线 3 个月内周活 500」。留空则由 AI 在对话里追问。",
+      "type": "string",
+      "maxLength": 1000
+    },
+    "platform": {
+      "title": "平台类型",
+      "description": "决定接口文档的服务端范围与提示词套件的技术选型。如果要多端并行，先选最主要的一个，其余的在后续对话里补充。",
+      "type": "string",
+      "anyOf": [
+        {
+          "enum": [
+            "Web 网站",
+            "移动 App",
+            "微信小程序",
+            "桌面应用",
+            "浏览器插件",
+            "后端服务 / 开放 API"
+          ]
+        }
+      ]
+    },
+    "need_auth": {
+      "title": "是否需要登录",
+      "description": "决定接口文档要不要写鉴权和用户表，也决定提示词套件里要不要包含登录流程。",
+      "type": "string",
+      "anyOf": [
+        {
+          "enum": [
+            "需要：账号密码注册登录",
+            "需要：仅第三方登录（微信 / GitHub 等）",
+            "不需要：打开即用",
+            "还不确定"
+          ]
+        }
+      ]
+    },
+    "need_database": {
+      "title": "是否需要数据库",
+      "description": "影响接口文档的「数据模型」章节，以及提示词套件里的存储选型。",
+      "type": "string",
+      "anyOf": [
+        {
+          "enum": [
+            "需要：要长期保存用户数据",
+            "需要：只存少量配置或缓存",
+            "不需要：纯前端运行即可",
+            "还不确定"
+          ]
+        }
+      ]
+    },
+    "tech_stack": {
+      "title": "技术栈偏好",
+      "description": "这是提示词套件里「全局约定」的来源。留空则由 AI 按平台类型推荐一套。",
+      "type": "string",
+      "maxLength": 200
+    },
+    "existing_system": {
+      "title": "现有系统与历史数据",
+      "description": "决定 PRD「风险与假设」里的外部依赖、接口文档要不要兼容旧接口，以及提示词套件是「从零新建」还是「增量改造」——后者的步骤写法完全不同，必须说明哪些文件已存在、哪些不要动。",
+      "type": "string",
+      "anyOf": [
+        {
+          "enum": [
+            "全新项目，没有历史包袱",
+            "已有系统，要在这个基础上改造",
+            "已有系统，保留不动，另建新系统并对接",
+            "需要迁移历史数据",
+            "还不确定"
+          ]
+        },
+        {
+          "const": ""
+        }
+      ]
+    },
+    "page_count": {
+      "title": "页面数量预估",
+      "description": "粗估即可，用来判断项目规模、以及提示词套件要拆成几步。",
+      "type": "string",
+      "anyOf": [
+        {
+          "enum": [
+            "1 个单页",
+            "2–3 个",
+            "4–8 个",
+            "8 个以上",
+            "还不确定"
+          ]
+        },
+        {
+          "const": ""
+        }
+      ]
+    },
+    "style_preference": {
+      "title": "页面风格偏好",
+      "description": "只影响视觉与交互约定，不影响功能范围。选项里给了参考产品，方便对齐预期。",
+      "type": "string",
+      "anyOf": [
+        {
+          "enum": [
+            "简洁克制（类似 Linear、Notion）",
+            "专业数据密集（类似后台管理系统）",
+            "活泼有亲和力（类似消费级 App）",
+            "品牌感强，重视觉设计",
+            "跟随我们现有的设计规范",
+            "没有偏好，由 AI 决定"
+          ]
+        },
+        {
+          "const": ""
+        }
+      ]
+    },
+    "integrations": {
+      "title": "第三方服务对接",
+      "description": "写具体服务名。这会生成接口文档的「外部依赖」部分，并作为 PRD「风险与假设」里的外部依赖风险。留空视为不依赖外部服务。",
+      "type": "string",
+      "maxLength": 1000
+    },
+    "core_entities": {
+      "title": "核心数据实体",
+      "description": "用「实体：字段1、字段2」的形式写。这是接口文档「数据模型」章节的直接输入；不填则由 AI 从核心功能反推，通常需要你再改一轮。",
+      "type": "string",
+      "maxLength": 2000
+    },
+    "api_convention": {
+      "title": "接口风格与鉴权",
+      "description": "决定接口文档的组织方式与「通用约定」章节。选项把风格与鉴权配成了常见组合；若你的组合不在其中，先选最接近的，再在后续对话里纠正。",
+      "type": "string",
+      "anyOf": [
+        {
+          "enum": [
+            "RESTful + JWT",
+            "RESTful + Session / Cookie",
+            "RESTful + OAuth 2.0",
+            "GraphQL（鉴权方式在对话中补充）",
+            "gRPC / RPC（以内部服务调用为主）",
+            "按推荐，由 AI 决定"
+          ]
+        },
+        {
+          "const": ""
+        }
+      ]
+    },
+    "scale_expectation": {
+      "title": "规模与性能预期",
+      "description": "填数量级即可，不用精确。用于 PRD「非功能需求」章节，以及接口文档的分页、限流、索引约定。留空则按小规模内部工具假设。",
+      "type": "string",
+      "maxLength": 200
+    },
+    "hard_constraints": {
+      "title": "硬约束",
+      "description": "时间、预算、部署环境（内网 / 私有云 / 公有云）、必须遵守的规范、必须保留的接口。这些会写进 PRD 的「非功能需求」与「风险与假设」，并约束提示词套件的步骤拆分与依赖选择。",
+      "type": "string",
+      "maxLength": 1000
+    },
+    "compliance": {
+      "title": "安全与合规要求",
+      "description": "例如「手机号必须加密存储」「需要操作审计日志」「要过等保二级」「数据不能出境」。PRD 第 5 章「非功能需求」明确包含安全与合规，没有输入时这一节只能写空话。",
+      "type": "string",
+      "maxLength": 1000
+    },
+    "engineering_conventions": {
+      "title": "工程约定与代码规范",
+      "description": "这是提示词套件「全局约定」的核心来源，会作为每一步实现提示词的共同约束。留空则采用通用最佳实践。",
+      "type": "string",
+      "maxLength": 1000
+    }
+  },
+  "required": [
+    "product_name",
+    "problem",
+    "target_users",
+    "core_features",
+    "platform",
+    "need_auth",
+    "need_database"
+  ],
+  "additionalProperties": false,
+  "x-form-version": "1.2",
+  "x-generated-from": "core/questions_config.json"
+}

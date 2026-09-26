@@ -1,0 +1,38 @@
+# 行尾与文本判定。
+#
+# 为什么需要这个文件：开发机是 Windows（默认 CRLF），而部署目标是 Linux
+# （`deploy/preflight.sh` 由 bash 执行、`deploy/nginx.conf` 由 nginx 读）。
+# 一份 CRLF 的 shell 脚本在服务器上会报 `\r: command not found` —— 这类错误
+# 在本地完全看不出来。写死 `eol=lf` 之后，无论谁在什么系统上检出，脚本都是 LF。
+#
+# 现状核对（本轮实测）：`deploy/preflight.sh` 与 `deploy/nginx.conf` **本来就是纯 LF**，
+# 这个文件是防止以后有人用 Windows 工具保存时把它悄悄改成 CRLF。
+
+# 默认：交给 git 判定，并统一成仓库内 LF
+* text=auto eol=lf
+
+# 明确按 Linux 侧消费的文件（少一个都可能在上线时才炸）
+*.sh      text eol=lf
+Dockerfile text eol=lf
+*.conf    text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+
+# 源码与文档：跨平台都按 LF 存，避免整文件级别的"假改动"
+*.py      text eol=lf
+*.ts      text eol=lf
+*.tsx     text eol=lf
+*.js      text eol=lf
+*.mjs     text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+
+# PowerShell 在 Windows 上更习惯 CRLF，保留即可（不影响 bash）
+*.ps1     text eol=crlf
+
+# 二进制：不要做任何行尾转换
+*.png     binary
+*.jpg     binary
+*.ico     binary
+*.woff    binary
+*.woff2   binary

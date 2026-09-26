@@ -1,0 +1,82 @@
+# PRD 生成技能（skill）清单。
+#
+# 字段名是按这类技能包的常见约定写的，没有对接某个具体平台的 schema。
+# 如果你的平台要求固定字段名（例如用 instructions 而不是 entrypoint、或者要 provider/model 之类），
+# 把要求发过来我改。
+#
+# ⚠️ 这份清单**不参与运行时**：后端只读 references/ 下那三份 + instructions.md
+# （见 services/document_service.py 的 SKILL_PRD_ARTIFACTS）。清单写错不会让生成出错，
+# 只会让读到它的人对结构产生错误预期 —— 所以改动结构时仍要同步这里。
+
+name: prd-generator
+version: 0.2.0
+description: >-
+  把已经澄清完的需求（表单作答 + 对话确认的信息），按固定模板写成一份 PRD。
+  判断标准是开发读完能不追问就开工。
+language: zh-CN
+entrypoint: instructions.md
+
+inputs:
+  schema: references/field-schema.json
+  # 8 个字段：5 个必填、3 个可选。缺必填项时**停止生成**，不要替用户编。
+  required:
+    - product_name
+    - product_goal
+    - target_users
+    - platform
+    - mvp_features
+  optional:
+    - v2_features
+    - ui_pages
+    - technical_constraints
+  # 对话侧输入，优先级高于表单：用户明确修正过表单答案时以对话为准
+  context:
+    known_info: 对话中确认的结构化信息（动线、角色权限、边界、接口约定、验收口径）
+    open_questions: 用户跳过、需要后续决策的项，必须落进文档并就地标 [待确认]
+    conflicts: 已发现的矛盾及其解决结论
+  accepts_missing: true   # 可选字段允许留空，但要按 writing-rules 的缺失处理规则走
+
+outputs:
+  - name: prd
+    media_type: text/markdown
+    template: references/prd-template.md
+    structure: 6 章（产品概述 / 功能需求 / 页面设计 / 技术规格 / 非功能需求 / 项目范围），无附录
+    headings: '## N. 章节名（子块用 ###，最多三级）'
+    ids:
+      features: 'FR-01、FR-02……按 MVP 表里的出现顺序连续编号，只给 MVP 功能编号'
+      acceptance: 'AC-01、AC-02……连续编号，「对应功能」列标明它覆盖的 FR-xx'
+
+constraints:
+  rules: references/writing-rules.md
+  max_output_tokens: 8192
+  single_call_sufficient: true
+  verification:
+    - 6 章齐、顺序与标题格式一致，没有模板之外的章节或附加小节
+    - FR-xx 与 AC-xx 各自从 01 起连续、不重号；每条 MVP 功能至少一条 AC，且没有孤儿 AC
+    - 第 2、3、6 章引用的 FR-xx 都真实存在，功能名三处逐字一致
+    - 第 4 章的五个子块都在：认证与权限、数据与存储、前后端技术、部署方式、外部依赖
+    - 第 5 章四类非功能需求都带数字或阈值
+    - 8 个输入字段都有落点；受影响的位置就地标 [待确认]，不新增开放问题章
+
+references:
+  - instructions.md
+  - references/prd-template.md
+  - references/writing-rules.md
+  - references/field-schema.json
+
+metadata:
+  source_project: harnessprd
+  # 结构由使用方指定，不是从项目原提示词派生的。反向关系：项目当前的 PRD 生成走这份技能包，
+  # gen_prd.md（15 章 + 2 附录）只作回退路径保留。
+  supersedes:
+    - backend/core/prompts/gen_prd.md
+  consumed_by:
+    # 这两份文档按 PRD 的内容取数，引用的就是本模板的章节与 FR/AC 编号
+    - backend/core/prompts/gen_api.md
+    - backend/core/prompts/gen_prompts.md
+  measured:
+    # 真实模型跑出来的数（deepseek-chat，见 backend/validation_out/prd_skill.txt）
+    output_chars: 3915
+    output_tokens_approx: 2300
+    truncated: false
+    note: 补齐 FR/AC 与三个子块之后重测；整份 PRD 能一次生成完，不需要分片

@@ -1,0 +1,24 @@
+# 构建上下文排除项（不写这个，`.venv/` 会被整个拷进镜像层 —— 几百 MB，
+# 而且里面的 Windows 可执行文件在 Linux 里毫无用处）。
+#
+# ⚠️ `.env` **必须**在这里：Dockerfile 里那句 `COPY . .` 会把构建上下文里的一切
+# 拷进镜像层，密钥就这么进了镜像历史。运行时的密钥走 `--env-file` / compose 的 `env_file`。
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+.env
+.env.*
+!.env.example
+
+# 验证留档：模型输出，跟运行无关（实测 181 KB + 41 KB —— 排除的理由是"无关"，
+# 不是"太大"。这里之前写成"几十 MB"，是错的）
+validation_out/
+validation_out_deepseek-flash/
+
+# 本地脚本产物
+*.log

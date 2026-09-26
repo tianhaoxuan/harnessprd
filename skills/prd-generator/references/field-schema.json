@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://harnessprd.local/skills/prd-generator/field-schema.json",
+  "title": "PRD 生成器的输入字段",
+  "description": "技能输入契约。5 个必填字段（product_name / product_goal / target_users / platform / mvp_features），3 个可选字段（v2_features / ui_pages / technical_constraints）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "product_name",
+    "product_goal",
+    "target_users",
+    "platform",
+    "mvp_features"
+  ],
+  "properties": {
+    "product_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "产品名称。还没定名时用代号即可，但全文必须统一引用这个名字。"
+    },
+    "product_goal": {
+      "type": "string",
+      "minLength": 1,
+      "description": "要解决的问题与目标。写现状痛点与期望结果，尽量具体到场景；这是 PRD 第 1 章「产品概述」的核心问题部分，也是全文的目标口径。"
+    },
+    "target_users": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      ],
+      "description": "目标用户。单个角色写字符串，多个角色写字符串数组。避免写「所有人」：范围越模糊，PRD 的目标用户与场景越写不实。"
+    },
+    "platform": {
+      "type": "string",
+      "minLength": 1,
+      "description": "平台形态，例如「Web 网站」「移动 App」「微信小程序」「桌面应用」「浏览器插件」「后端服务 / 开放 API」。决定 PRD 非功能需求里的端与兼容性要求。"
+    },
+    "mvp_features": {
+      "type": "array",
+      "minItems": 1,
+      "description": "首版必须具备的功能。元素可以是字符串，也可以是带 name 的对象（对象形式可多给描述与优先级）。至少要有一项。",
+      "items": {
+        "anyOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "功能名，一句话说清做什么。"
+              },
+              "description": {
+                "type": "string",
+                "description": "补充说明：输入、输出、边界条件。"
+              },
+              "priority": {
+                "enum": [
+                  "P0",
+                  "P1",
+                  "P2"
+                ],
+                "description": "优先级。不给时按 P0 处理。"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "v2_features": {
+      "type": "array",
+      "description": "后续版本的功能，可选。会写进 PRD 第 6 章项目范围的「不在范围内」，不会进第 2 章的 MVP 功能表格。",
+      "items": {
+        "anyOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": {
+                "type": "string"
+              },
+              "priority": {
+                "enum": [
+                  "P0",
+                  "P1",
+                  "P2"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    "ui_pages": {
+      "type": "array",
+      "description": "页面清单，可选。给得出就写，写不出时由生成方按功能反推（写进 PRD 第 3 章「页面设计」，并在该章开头注明是反推结果）。",
+      "items": {
+        "anyOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "页面名，例如「周报草稿编辑页」。"
+              },
+              "purpose": {
+                "type": "string",
+                "description": "这页解决什么，一句话。"
+              },
+              "path": {
+                "type": "string",
+                "description": "路由路径，例如 /reports/:id/edit。"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "technical_constraints": {
+      "type": "object",
+      "description": "技术约束，可选。下面列出的是常见键，也可以放别的键（这个对象是开放的）。这些内容会写进 PRD 第 4 章「技术规格」与第 5 章「非功能需求」：stack 与 deployment 进第 4 章，performance 与 compliance 进第 5 章，integrations 进第 4 章的外部依赖子块。注意：这个对象是全书唯一允许写技术选型的地方，但没给的信息不要补 —— 生成方按平台形态给建议时要标注「建议，待确认」。",
+      "additionalProperties": true,
+      "properties": {
+        "stack": {
+          "type": "string",
+          "description": "技术栈要求或偏好。留空则由生成方按平台形态给建议。"
+        },
+        "deployment": {
+          "type": "string",
+          "description": "部署环境约束，例如内网、私有云、公有云、必须容器化。"
+        },
+        "performance": {
+          "type": "string",
+          "description": "规模与性能预期，例如「约 100 人使用，峰值每秒 10 次请求」。填数量级即可。"
+        },
+        "compliance": {
+          "type": "string",
+          "description": "安全与合规硬要求，例如「手机号加密存储」「需要操作审计日志」「数据不能出境」。"
+        },
+        "integrations": {
+          "type": "string",
+          "description": "必须对接的外部服务，写具体服务名。写进 PRD 第 4 章的外部依赖子块（下游接口文档的「外部依赖」章按它写）。留空时第 4 章写「无外部依赖」，不要替项目补上常见的第三方服务。"
+        }
+      }
+    }
+  },
+  "x-source-mapping": {
+    "note": "这份 schema 的字段来自使用方给定的结构，与 harnessprd 项目自己那 20 题表单不是同一套。若要把两边接起来，按下面的对应关系映射；不需要接就可以删掉这一段。",
+    "product_name": "product_name",
+    "product_goal": "problem（问题现状）+ success_metrics（目标口径）",
+    "target_users": "target_users",
+    "platform": "platform",
+    "mvp_features": "core_features 中优先级为 P0 的部分",
+    "v2_features": "core_features 中的 P1 / P2，或对话里确认的后续规划",
+    "ui_pages": "page_count（数量）配合对话里确认的页面清单",
+    "technical_constraints": "tech_stack + hard_constraints + scale_expectation + compliance"
+  }
+}

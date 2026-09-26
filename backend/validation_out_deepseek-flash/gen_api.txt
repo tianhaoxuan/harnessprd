@@ -1,0 +1,26 @@
+## 第 6 章 接口清单
+
+第 7 章共 6 条功能需求（FR-01 ~ FR-06），全部需要服务端接口，无遗漏、无多余。生成任务（FR-02 / FR-03）在 `POST /api/v1/weekly-reports` 触发后异步执行，前端通过 `GET /api/v1/weekly-reports/{report_id}` 轮询生成状态，不单独设任务接口。
+
+**接口清单**
+
+| 方法 | 路径 | 用途 | PRD 来源 |
+| --- | --- | --- | --- |
+| GET | `/api/v1/auth/oauth/{provider}/authorize` | 获取第三方登录授权跳转地址，`provider` 取 `wecom` / `github` | FR-06 |
+| POST | `/api/v1/auth/oauth/{provider}/callback` | 用授权码换取 JWT，建立登录会话 | FR-06 |
+| GET | `/api/v1/auth/me` | 获取当前登录用户、角色与所属团队 | FR-06 |
+| GET | `/api/v1/wecom/groups` | 获取当前用户已授权范围内的企业微信群列表 | FR-01 |
+| GET | `/api/v1/wecom/groups/{group_id}/messages` | 拉取指定群在时间范围内的消息，过滤无效消息后按发言人归集 | FR-01 |
+| POST | `/api/v1/weekly-reports` | 触发生成周报草稿，按 `group_by` 取 `person`（按人）或 `project`（按项目） | FR-02、FR-03 |
+| GET | `/api/v1/weekly-reports` | 按角色可见范围分页查询周报列表 | FR-06 |
+| GET | `/api/v1/weekly-reports/{report_id}` | 查询周报详情，含草稿正文与生成状态 | FR-04、FR-06 |
+| PATCH | `/api/v1/weekly-reports/{report_id}` | 修改周报草稿正文并保存 | FR-04 |
+| POST | `/api/v1/weekly-reports/{report_id}/export` | 生成可粘贴到飞书群的导出正文 | FR-05 |
+
+**无接口功能**
+
+| FR-xx | 功能名 | 为什么不需要接口 |
+| --- | --- | --- |
+| — | — | 本次无此类功能：FR-01 ~ FR-06 均已归入接口清单 |
+
+互斥校验：每条 `FR-xx` 仅出现在接口清单中。FR-05 的「复制到剪贴板」是前端本地行为，作用于 `POST /api/v1/weekly-reports/{report_id}/export` 返回的正文，因该功能整体需要服务端接口，FR-05 整条归入接口清单。

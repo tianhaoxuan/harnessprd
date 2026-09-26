@@ -1,0 +1,21 @@
+## 第 6 章 接口清单
+
+### 接口清单
+
+| 方法 | 路径 | 用途 | 对应 FR |
+| --- | --- | --- | --- |
+| POST | `/api/v1/auth/oauth/{provider}/callback` | 第三方登录回调，换取登录态 | FR-05 |
+| GET | `/api/v1/wecom/groups` | 列出当前用户有权限访问的企业微信群 | FR-01 |
+| POST | `/api/v1/message-summaries` | 按群与时间范围汇总消息，产出周报素材 | FR-01 |
+| GET | `/api/v1/message-summaries/{summary_id}` | 查询汇总结果 | FR-01 |
+| POST | `/api/v1/weekly-reports` | 基于汇总素材生成按人分组的周报草稿 | FR-02 |
+| GET | `/api/v1/weekly-reports` | 分页查询历史周报列表 | FR-06 |
+| GET | `/api/v1/weekly-reports/{report_id}` | 查询单份周报详情 | FR-06 |
+| PATCH | `/api/v1/weekly-reports/{report_id}` | 人工修改周报草稿 | FR-03 |
+| POST | `/api/v1/weekly-reports/{report_id}/export` | 导出周报，返回可复制内容 | FR-04 |
+
+### 无接口功能
+
+| FR | 功能名 | 为什么不需要接口 |
+| --- | --- | --- |
+| FR-07 | 角色可见性控制 | 纯服务端鉴权判定，由各接口的鉴权与数据过滤逻辑承载，不对外暴露独立端点 |

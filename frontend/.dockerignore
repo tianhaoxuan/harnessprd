@@ -1,0 +1,12 @@
+# 构建上下文排除项。
+# `node_modules/` 必须排除：本机装的是 Windows 版依赖（含平台相关二进制），
+# 拷进 Linux 镜像既没用又会让 `pnpm install` 的硬链接结构出错。
+# `dist/` 也排除：镜像里是**重新构建**的产物，不是本机那份。
+
+node_modules/
+dist/
+dist-ssr/
+.vite/
+
+*.log
+.DS_Store

@@ -1,0 +1,737 @@
+## 第 1 章 文档信息
+
+| 项目 | 内容 |
+| --- | --- |
+| 产品名称 | 群聊周报助手 |
+| 文档版本 | v1.0 |
+| 生成时间 | 本次生成 |
+| 文档状态 | 待评审 |
+| 接口风格 | REST，版本前缀 `/api/v1/` |
+| 字段命名 | `snake_case` |
+| 上游文档 | 《群聊周报助手 PRD》v1.0 |
+
+## 第 2 章 通用约定
+
+**基础**
+
+- 所有接口以 `/api/v1/` 为前缀，请求与响应体均为 `application/json; charset=utf-8`。
+- 字段命名统一 `snake_case`，全文不混用 `camelCase`。
+- 成功响应**不套信封**，直接返回资源对象或分页对象；失败返回统一错误体（见第 5 章）。
+- 空值返回 `null`，**不省略字段**。
+
+**分页**
+
+- 查询参数 `page`（从 1 起，默认 1）+ `page_size`（默认 20，上限 100）。
+- 分页响应结构固定为 `items` / `page` / `page_size` / `total`。
+
+**时间**
+
+- 一律 ISO 8601 + UTC，如 `2025-01-13T02:15:00Z`。
+- 汇总时间范围按用户所在时区解释，起止边界**包含起始时刻、不包含结束时刻**（`[start_at, end_at)`）。
+
+**幂等**
+
+- 写操作（POST / PUT / PATCH / DELETE）支持 `Idempotency-Key` 请求头。
+- 相同 Key 在 24 小时内返回首次执行结果，不重复执行。
+
+**状态码分界**
+
+- `400`：请求本身不合法（缺字段、类型错误、格式错误）。
+- `422`：请求合法但业务校验不通过（如时间跨度超 31 天、汇总结果为空）。
+- `409`：状态冲突或并发冲突。
+
+**文件上传 / 下载**
+
+本产品无附件、头像、导入导出文件的服务端交互，导出到飞书由服务端调用飞书开放接口完成，**不涉及 `multipart/form-data`**，本节不适用。
+
+**实时接口**
+
+PRD 第 8 章无实时要求，汇总与生成均为请求-响应式，**不涉及 SSE / WebSocket**，本节不适用。
+
+**入站回调（Webhook）**
+
+本产品不接收第三方入站回调，飞书为出站调用，本节不适用。
+
+## 第 3 章 鉴权与授权
+
+**鉴权方式**
+
+- 账号密码注册登录，登录成功后签发访问令牌（`access_token`）。
+- 除注册与登录接口外，所有接口需携带请求头 `Authorization: Bearer <access_token>`。
+- 令牌缺失或失效返回 `401`，前端跳转登录页（对应 AC-04）。
+
+**角色**
+
+本期仅一个角色：**技术负责人**。无管理员、无协作角色。
+
+**授权规则**
+
+| 资源 | 规则 |
+| --- | --- |
+| 群聊配置 | 仅创建者可读写，跨用户访问返回 `403` |
+| 汇总结果 | 仅所属用户可读写，跨用户访问返回 `403` |
+| 周报草稿 | 仅所属用户可读写，跨用户访问返回 `403`（对应 AC-22） |
+| 导出记录 | 仅所属用户可读，跨用户访问返回 `403` |
+
+所有列表接口在服务端按当前登录用户强制过滤，不接受客户端传入的 `user_id`。
+
+## 第 4 章 数据模型
+
+### 4.1 用户 `users`
+
+| 字段 | 类型 | 必填 | 唯一 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `id` | string | 是 | 是 | 无 | 主键，格式 `usr_` + 12 位小写字母数字 |
+| `account` | string | 是 | 是 | 无 | 登录账号，长度 4–32，仅字母数字下划线 |
+| `password_hash` | string | 是 | 否 | 无 | 密码哈希，不返回给客户端 |
+| `display_name` | string | 否 | 否 | `null` | 展示名 |
+| `timezone` | string | 是 | 否 | `Asia/Shanghai` | IANA 时区名，用于解释汇总时间范围 |
+| `created_at` | string | 是 | 否 | 无 | ISO 8601 UTC |
+| `updated_at` | string | 是 | 否 | 无 | ISO 8601 UTC |
+
+索引：`account` 唯一索引。
+
+### 4.2 群聊配置 `group_chats`
+
+| 字段 | 类型 | 必填 | 唯一 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `id` | string | 是 | 是 | 无 | 主键，格式 `gcp_` + 12 位小写字母数字 |
+| `user_id` | string | 是 | 否 | 无 | 外键 → `users.id` |
+| `name` | string | 是 | 否 | 无 | 群聊名称，长度 1–64 |
+| `external_chat_id` | string | 是 | 否 | 无 | 群聊在外部平台中的标识 |
+| `member_count` | integer | 否 | 否 | `null` | 群成员数 |
+| `created_at` | string | 是 | 否 | 无 | ISO 8601 UTC |
+| `updated_at` | string | 是 | 否 | 无 | ISO 8601 UTC |
+
+索引：`(user_id, external_chat_id)` 唯一索引。
+
+### 4.3 汇总结果 `aggregations`
+
+| 字段 | 类型 | 必填 | 唯一 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `id` | string | 是 | 是 | 无 | 主键，格式 `agg_` + 12 位小写字母数字 |
+| `user_id` | string | 是 | 否 | 无 | 外键 → `users.id` |
+| `group_chat_id` | string | 是 | 否 | 无 | 外键 → `group_chats.id` |
+| `start_at` | string | 是 | 否 | 无 | 时间范围起点（含），ISO 8601 UTC |
+| `end_at` | string | 是 | 否 | 无 | 时间范围终点（不含），ISO 8601 UTC |
+| `status` | string | 是 | 否 | `pending` | 枚举见附 A |
+| `message_count` | integer | 是 | 否 | `0` | 命中的消息条数 |
+| `items` | array | 是 | 否 | `[]` | 汇总条目数组，元素结构见 4.3.1 |
+| `failure_reason` | string | 否 | 否 | `null` | `status = failed` 时的失败原因 |
+| `created_at` | string | 是 | 否 | 无 | ISO 8601 UTC |
+| `updated_at` | string | 是 | 否 | 无 | ISO 8601 UTC |
+
+索引：`(user_id, group_chat_id, start_at, end_at)` 唯一索引 —— 保证同一用户重复触发同一群聊同一时间范围的汇总不产生重复结果（对应 AC-09）。
+
+#### 4.3.1 汇总条目 `aggregations.items[]`
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `message_id` | string | 是 | 消息标识 |
+| `sender_name` | string | 是 | 发送人展示名 |
+| `sent_at` | string | 是 | 消息发送时间，ISO 8601 UTC |
+| `content` | string | 是 | 消息正文 |
+| `project_hint` | string | 否 | 项目归属线索，无法判定时为 `null` |
+
+### 4.4 周报草稿 `weekly_reports`
+
+| 字段 | 类型 | 必填 | 唯一 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `id` | string | 是 | 是 | 无 | 主键，格式 `rpt_` + 12 位小写字母数字 |
+| `user_id` | string | 是 | 否 | 无 | 外键 → `users.id` |
+| `aggregation_id` | string | 是 | 是 | 无 | 外键 → `aggregations.id`，一份汇总结果对应一份草稿 |
+| `title` | string | 是 | 否 | 无 | 周报标题，长度 1–128 |
+| `group_by` | string | 是 | 否 | 无 | 组织维度，枚举见附 A |
+| `status` | string | 是 | 否 | `draft` | 枚举见附 A |
+| `sections` | array | 是 | 否 | `[]` | 分组内容数组，元素结构见 4.4.1 |
+| `version` | integer | 是 | 否 | `1` | 乐观锁版本号，每次保存 +1 |
+| `is_edited` | boolean | 是 | 否 | `false` | 是否被人工编辑过 |
+| `created_at` | string | 是 | 否 | 无 | ISO 8601 UTC |
+| `updated_at` | string | 是 | 否 | 无 | ISO 8601 UTC |
+
+索引：`aggregation_id` 唯一索引；`(user_id, created_at)` 普通索引。
+
+#### 4.4.1 草稿分组 `weekly_reports.sections[]`
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `key` | string | 是 | 分组标识，按人时为成员名，按项目时为项目名 |
+| `entries` | array | 是 | 条目数组，元素为 `{ "entry_id": string, "content": string }` |
+
+### 4.5 导出记录 `exports`
+
+| 字段 | 类型 | 必填 | 唯一 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `id` | string | 是 | 是 | 无 | 主键，格式 `exp_` + 12 位小写字母数字 |
+| `weekly_report_id` | string | 是 | 否 | 无 | 外键 → `weekly_reports.id` |
+| `user_id` | string | 是 | 否 | 无 | 外键 → `users.id` |
+| `target` | string | 是 | 否 | `feishu` | 导出目标，本期固定 `feishu` |
+| `status` | string | 是 | 否 | `pending` | 枚举见附 A |
+| `external_doc_url` | string | 否 | 否 | `null` | 飞书文档地址，成功时返回 |
+| `content_snapshot` | object | 是 | 否 | 无 | 导出时刻的周报内容快照，导出后不随草稿编辑变化（对应 AC-23） |
+| `failure_reason` | string | 否 | 否 | `null` | `status = failed` 时的失败原因 |
+| `created_at` | string | 是 | 否 | 无 | ISO 8601 UTC |
+
+索引：`(weekly_report_id, created_at)` 普通索引。
+
+## 第 5 章 错误码表
+
+| 错误码 | HTTP | 含义 | 触发场景 |
+| --- | --- | --- | --- |
+| `AUTH001` | 400 | 账号或密码为空 | 注册 / 登录请求缺字段 |
+| `AUTH002` | 401 | 账号或密码错误 | 登录校验失败 |
+| `AUTH003` | 409 | 账号已被占用 | 注册时账号已存在 |
+| `AUTH004` | 401 | 未登录或令牌失效 | 缺少或无效的 `Authorization` 头 |
+| `AUTH005` | 403 | 无权访问该资源 | 跨用户访问他人资源 |
+| `AGG001` | 422 | 时间跨度超过 31 天 | 汇总时间范围超限 |
+| `AGG002` | 422 | 时间范围非法 | `start_at` 不早于 `end_at` |
+| `AGG003` | 404 | 群聊配置不存在 | 指定的 `group_chat_id` 不存在 |
+| `AGG004` | 422 | 时间范围内无消息 | 汇总命中 0 条消息 |
+| `AGG005` | 502 | 汇总失败 | 上游消息源不可用 |
+| `RPT001` | 404 | 周报草稿不存在 | 指定的 `weekly_report_id` 不存在 |
+| `RPT002` | 422 | 汇总结果为空，无法生成草稿 | 对空汇总结果触发生成 |
+| `RPT003` | 409 | 草稿已被编辑，覆盖需确认 | 重新生成时未带确认标记 |
+| `RPT004` | 409 | 草稿版本冲突 | 保存时 `version` 落后于服务端 |
+| `RPT005` | 422 | 草稿内容为空 | 清空后保存未带确认标记 |
+| `EXP001` | 422 | 周报内容为空，无法导出 | 空草稿触发导出 |
+| `EXP002` | 401 | 飞书授权失效 | 飞书令牌过期或被撤销 |
+| `EXP003` | 409 | 飞书已存在同名周报 | 重复导出未带确认标记 |
+| `EXP004` | 502 | 导出失败 | 飞书接口调用失败 |
+| `COMMON001` | 400 | 请求参数校验失败 | 类型错误、格式错误、超出长度 |
+| `COMMON002` | 500 | 服务端内部错误 | 未预期异常 |
+
+**统一错误体**
+
+```json
+{
+  "error_code": "AGG001",
+  "message": "时间跨度超过 31 天，请缩小范围",
+  "details": {
+    "field": "end_at",
+    "max_span_days": 31
+  }
+}
+```
+
+## 第 6 章 接口清单
+
+### 6.1 接口清单
+
+| # | 接口名称 | 方法与路径 | PRD 来源 |
+| --- | --- | --- | --- |
+| 1 | 注册账号 | `POST /api/v1/auth/register` | FR-01 |
+| 2 | 登录 | `POST /api/v1/auth/login` | FR-01 |
+| 3 | 查询群聊配置列表 | `GET /api/v1/group-chats` | FR-02 |
+| 4 | 创建群聊配置 | `POST /api/v1/group-chats` | FR-02 |
+| 5 | 查询汇总结果详情 | `GET /api/v1/aggregations/{aggregation_id}` | FR-02 |
+| 6 | 触发群聊消息汇总 | `POST /api/v1/aggregations` | FR-02 |
+| 7 | 查询周报草稿详情 | `GET /api/v1/weekly-reports/{weekly_report_id}` | FR-03 |
+| 8 | 生成周报草稿 | `POST /api/v1/weekly-reports` | FR-03 |
+| 9 | 保存周报草稿 | `PUT /api/v1/weekly-reports/{weekly_report_id}` | FR-04 |
+| 10 | 导出周报到飞书 | `POST /api/v1/weekly-reports/{weekly_report_id}/exports` | FR-05 |
+| 11 | 查询导出记录列表 | `GET /api/v1/weekly-reports/{weekly_report_id}/exports` | FR-06 |
+
+### 6.2 无接口功能
+
+| PRD 来源 | 功能 | 为什么不需要接口 |
+| --- | --- | --- |
+| FR-06 | 长期保存用户数据 | 该需求由第 4 章各实体的持久化与上述查询接口共同承载，本身不派生独立接口；其可访问性由 `GET /api/v1/weekly-reports/{weekly_report_id}` 与 `GET /api/v1/weekly-reports/{weekly_report_id}/exports` 验证 |
+
+> 说明：FR-06 的「长期保存」是横切能力，已由数据模型与既有查询接口覆盖，不另设接口。FR-01 至 FR-05 全部落在 6.1 接口清单中，两条清单互斥且并集覆盖 PRD 第 7 章全部功能需求。
+
+## 第 7 章 接口详情
+
+### POST /api/v1/auth/register
+
+**接口名称**：注册账号
+
+**用途**：用账号密码创建新账号。
+
+**PRD 来源**：FR-01
+
+**鉴权**：不需要登录。
+
+**请求体**
+
+| 字段 | 类型 | 必填 | 约束 |
+| --- | --- | --- | --- |
+| `account` | string | 是 | 长度 4–32，仅字母数字下划线 |
+| `password` | string | 是 | 长度 8–64 |
+| `display_name` | string | 否 | 长度 1–32，缺省为 `null` |
+| `timezone` | string | 否 | IANA 时区名，缺省 `Asia/Shanghai` |
+
+**请求示例**
+
+```json
+{
+  "account": "techlead01",
+  "password": "Str0ngPassw0rd",
+  "display_name": "张工",
+  "timezone": "Asia/Shanghai"
+}
+```
+
+**响应字段**
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 用户 ID |
+| `account` | string | 登录账号 |
+| `display_name` | string | 展示名，可能为 `null` |
+| `timezone` | string | 时区 |
+| `created_at` | string | 创建时间，ISO 8601 UTC |
+
+**成功响应示例**
+
+```json
+{
+  "id": "usr_a1b2c3d4e5f6",
+  "account": "techlead01",
+  "display_name": "张工",
+  "timezone": "Asia/Shanghai",
+  "created_at": "2025-01-13T02:15:00Z"
+}
+```
+
+**错误码**：`AUTH001`、`AUTH003`、`COMMON001`、`COMMON002`
+
+**幂等性**：写操作，支持 `Idempotency-Key`；相同 Key 24 小时内返回首次创建结果。
+
+**业务规则**：账号全局唯一；密码仅存哈希，任何响应不返回密码字段。
+
+**关联验收标准**：AC-03
+
+### POST /api/v1/auth/login
+
+**接口名称**：登录
+
+**用途**：用账号密码换取访问令牌。
+
+**PRD 来源**：FR-01
+
+**鉴权**：不需要登录。
+
+**请求体**
+
+| 字段 | 类型 | 必填 | 约束 |
+| --- | --- | --- | --- |
+| `account` | string | 是 | 长度 4–32 |
+| `password` | string | 是 | 长度 8–64 |
+
+**请求示例**
+
+```json
+{
+  "account": "techlead01",
+  "password": "Str0ngPassw0rd"
+}
+```
+
+**响应字段**
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `access_token` | string | 访问令牌 |
+| `token_type` | string | 固定 `Bearer` |
+| `expires_in` | integer | 有效期秒数 |
+| `user` | object | 用户对象，字段同注册响应 |
+
+**成功响应示例**
+
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature",
+  "token_type": "Bearer",
+  "expires_in": 604800,
+  "user": {
+    "id": "usr_a1b2c3d4e5f6",
+    "account": "techlead01",
+    "display_name": "张工",
+    "timezone": "Asia/Shanghai",
+    "created_at": "2025-01-13T02:15:00Z"
+  }
+}
+```
+
+**错误码**：`AUTH001`、`AUTH002`、`COMMON001`、`COMMON002`
+
+**幂等性**：写操作，支持 `Idempotency-Key`；相同 Key 24 小时内返回首次签发的令牌。
+
+**业务规则**：账号或密码错误统一返回 `AUTH002`，不区分账号不存在与密码错误。
+
+**关联验收标准**：AC-01、AC-02
+
+### GET /api/v1/group-chats
+
+**接口名称**：查询群聊配置列表
+
+**用途**：分页查询当前用户的群聊配置。
+
+**PRD 来源**：FR-02
+
+**鉴权**：需要登录，角色为技术负责人。
+
+**查询参数**
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `page` | integer | 否 | 1 | 页码，从 1 起 |
+| `page_size` | integer | 否 | 20 | 每页条数，上限 100 |
+
+**响应字段**
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `items` | array | 群聊配置数组 |
+| `items[].id` | string | 群聊配置 ID |
+| `items[].name` | string | 群聊名称 |
+| `items[].external_chat_id` | string | 外部群聊标识 |
+| `items[].member_count` | integer | 群成员数，可能为 `null` |
+| `items[].created_at` | string | 创建时间 |
+| `page` | integer | 当前页码 |
+| `page_size` | integer | 每页条数 |
+| `total` | integer | 总条数 |
+
+**成功响应示例**
+
+```json
+{
+  "items": [
+    {
+      "id": "gcp_9f8e7d6c5b4a",
+      "name": "产品研发群",
+      "external_chat_id": "oc_5f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c",
+      "member_count": 12,
+      "created_at": "2025-01-13T02:20:00Z"
+    }
+  ],
+  "page": 1,
+  "page_size": 20,
+  "total": 1
+}
+```
+
+**错误码**：`AUTH004`、`COMMON001`、`COMMON002`
+
+**业务规则**：服务端按当前登录用户强制过滤，不接受客户端传入 `user_id`。
+
+### POST /api/v1/group-chats
+
+**接口名称**：创建群聊配置
+
+**用途**：新增一个要汇总的群聊。
+
+**PRD 来源**：FR-02
+
+**鉴权**：需要登录，角色为技术负责人。
+
+**请求体**
+
+| 字段 | 类型 | 必填 | 约束 |
+| --- | --- | --- | --- |
+| `name` | string | 是 | 长度 1–64 |
+| `external_chat_id` | string | 是 | 长度 1–128 |
+| `member_count` | integer | 否 | ≥ 0，缺省 `null` |
+
+**请求示例**
+
+```json
+{
+  "name": "产品研发群",
+  "external_chat_id": "oc_5f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c",
+  "member_count": 12
+}
+```
+
+**响应字段**：同 `GET /api/v1/group-chats` 的 `items[]` 元素结构。
+
+**成功响应示例**
+
+```json
+{
+  "id": "gcp_9f8e7d6c5b4a",
+  "name": "产品研发群",
+  "external_chat_id": "oc_5f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c",
+  "member_count": 12,
+  "created_at": "2025-01-13T02:20:00Z"
+}
+```
+
+**错误码**：`AUTH004`、`COMMON001`、`COMMON002`
+
+**幂等性**：写操作，支持 `Idempotency-Key`；相同 Key 24 小时内返回首次创建结果。
+
+**业务规则**：同一用户下 `external_chat_id` 唯一，重复创建返回已存在的配置。
+
+### GET /api/v1/aggregations/{aggregation_id}
+
+**接口名称**：查询汇总结果详情
+
+**用途**：获取某次汇总的结果，作为生成周报草稿的素材。
+
+**PRD 来源**：FR-02
+
+**鉴权**：需要登录，角色为技术负责人。
+
+**路径参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `aggregation_id` | string | 是 | 汇总结果 ID |
+
+**响应字段**
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 汇总结果 ID |
+| `group_chat_id` | string | 群聊配置 ID |
+| `start_at` | string | 时间范围起点（含） |
+| `end_at` | string | 时间范围终点（不含） |
+| `status` | string | 汇总状态，枚举见附 A |
+| `message_count` | integer | 命中消息条数 |
+| `items` | array | 汇总条目数组 |
+| `failure_reason` | string | 失败原因，成功时为 `null` |
+| `created_at` | string | 创建时间 |
+| `updated_at` | string | 更新时间 |
+
+**成功响应示例**
+
+```json
+{
+  "id": "agg_1a2b3c4d5e6f",
+  "group_chat_id": "gcp_9f8e7d6c5b4a",
+  "start_at": "2025-01-06T00:00:00Z",
+  "end_at": "2025-01-13T00:00:00Z",
+  "status": "succeeded",
+  "message_count": 2,
+  "items": [
+    {
+      "message_id": "msg_001",
+      "sender_name": "李工",
+      "sent_at": "2025-01-07T03:12:00Z",
+      "content": "登录模块联调完成，已合并到主干",
+      "project_hint": "登录模块"
+    },
+    {
+      "message_id": "msg_002",
+      "sender_name": "王工",
+      "sent_at": "2025-01-08T07:45:00Z",
+      "content": "导出接口对接飞书时遇到限流，正在排查",
+      "project_hint": "导出模块"
+    }
+  ],
+  "failure_reason": null,
+  "created_at": "2025-01-13T02:30:00Z",
+  "updated_at": "2025-01-13T02:30:05Z"
+}
+```
+
+**错误码**：`AUTH004`、`AUTH005`、`COMMON001`、`COMMON002`
+
+**业务规则**：仅所属用户可读，跨用户访问返回 `AUTH005`。
+
+### POST /api/v1/aggregations
+
+**接口名称**：触发群聊消息汇总
+
+**用途**：汇总指定群聊在指定时间范围内的消息。
+
+**PRD 来源**：FR-02
+
+**鉴权**：需要登录，角色为技术负责人。
+
+**请求体**
+
+| 字段 | 类型 | 必填 | 约束 |
+| --- | --- | --- | --- |
+| `group_chat_id` | string | 是 | 必须属于当前用户 |
+| `start_at` | string | 是 | ISO 8601 UTC，含 |
+| `end_at` | string | 是 | ISO 8601 UTC，不含，且晚于 `start_at` |
+
+**请求示例**
+
+```json
+{
+  "group_chat_id": "gcp_9f8e7d6c5b4a",
+  "start_at": "2025-01-06T00:00:00Z",
+  "end_at": "2025-01-13T00:00:00Z"
+}
+```
+
+**响应字段**：同 `GET /api/v1/aggregations/{aggregation_id}`。
+
+**成功响应示例**
+
+```json
+{
+  "id": "agg_1a2b3c4d5e6f",
+  "group_chat_id": "gcp_9f8e7d6c5b4a",
+  "start_at": "2025-01-06T00:00:00Z",
+  "end_at": "2025-01-13T00:00:00Z",
+  "status": "succeeded",
+  "message_count": 2,
+  "items": [
+    {
+      "message_id": "msg_001",
+      "sender_name": "李工",
+      "sent_at": "2025-01-07T03:12:00Z",
+      "content": "登录模块联调完成，已合并到主干",
+      "project_hint": "登录模块"
+    },
+    {
+      "message_id": "msg_002",
+      "sender_name": "王工",
+      "sent_at": "2025-01-08T07:45:00Z",
+      "content": "导出接口对接飞书时遇到限流，正在排查",
+      "project_hint": "导出模块"
+    }
+  ],
+  "failure_reason": null,
+  "created_at": "2025-01-13T02:30:00Z",
+  "updated_at": "2025-01-13T02:30:05Z"
+}
+```
+
+**错误码**：`AUTH004`、`AUTH005`、`AGG001`、`AGG002`、`AGG003`、`AGG004`、`AGG005`、`COMMON001`、`COMMON002`
+
+**幂等性**：写操作，支持 `Idempotency-Key`；相同 Key 24 小时内返回首次结果。此外，同一用户对同一 `group_chat_id` 与同一 `[start_at, end_at)` 重复触发时，服务端命中唯一索引并返回已有汇总结果，不产生重复记录。
+
+**业务规则**：
+
+- 时间跨度上限 31 天，超出返回 `AGG001`。
+- `start_at` 不早于 `end_at` 返回 `AGG002`。
+- 时间范围按用户 `timezone` 解释，边界为 `[start_at, end_at)`。
+- 命中 0 条消息时返回 `AGG004`，不落库为空汇总结果，也不允许据此生成草稿。
+- 汇总失败时保留用户已选的群聊与时间范围，允许重试。
+
+**状态流转**：`pending` → `succeeded` / `failed`。
+
+**关联验收标准**：AC-05、AC-06、AC-07、AC-08、AC-09
+
+### GET /api/v1/weekly-reports/{weekly_report_id}
+
+**接口名称**：查询周报草稿详情
+
+**用途**：获取草稿内容用于展示与编辑。
+
+**PRD 来源**：FR-03
+
+**鉴权**：需要登录，角色为技术负责人。
+
+**路径参数**
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `weekly_report_id` | string | 是 | 周报草稿 ID |
+
+**响应字段**
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 周报草稿 ID |
+| `aggregation_id` | string | 来源汇总结果 ID |
+| `title` | string | 周报标题 |
+| `group_by` | string | 组织维度，枚举见附 A |
+| `status` | string | 草稿状态，枚举见附 A |
+| `sections` | array | 分组内容数组 |
+| `version` | integer | 乐观锁版本号 |
+| `is_edited` | boolean | 是否被人工编辑过 |
+| `created_at` | string | 创建时间 |
+| `updated_at` | string | 更新时间 |
+
+**成功响应示例**
+
+```json
+{
+  "id": "rpt_7c8d9e0f1a2b",
+  "aggregation_id": "agg_1a2b3c4d5e6f",
+  "title": "产品研发群周报 2025-01-06 ~ 2025-01-12",
+  "group_by": "person",
+  "status": "draft",
+  "sections": [
+    {
+      "key": "李工",
+      "entries": [
+        {
+          "entry_id": "ent_001",
+          "content": "登录模块联调完成，已合并到主干"
+        }
+      ]
+    },
+    {
+      "key": "王工",
+      "entries": [
+        {
+          "entry_id": "ent_002",
+          "content": "导出接口对接飞书时遇到限流，正在排查"
+        }
+      ]
+    }
+  ],
+  "version": 1,
+  "is_edited": false,
+  "created_at": "2025-01-13T02:35:00Z",
+  "updated_at": "2025-01-13T02:35:00Z"
+}
+```
+
+**错误码**：`AUTH004`、`AUTH005`、`RPT001`、`COMMON001`、`COMMON002`
+
+**业务规则**：仅所属用户可读，跨用户访问返回 `AUTH005`（对应 AC-22）。
+
+**关联验收标准**：AC-21、AC-22
+
+### POST /api/v1/weekly-reports
+
+**接口名称**：生成周报草稿
+
+**用途**：基于汇总结果，按人 / 项目维度生成周报草稿。
+
+**PRD 来源**：FR-03
+
+**鉴权**：需要登录，角色为技术负责人。
+
+**请求体**
+
+| 字段 | 类型 | 必填 | 约束 |
+| --- | --- | --- | --- |
+| `aggregation_id` | string | 是 | 必须属于当前用户且 `status = succeeded` |
+| `group_by` | string | 是 | 枚举：`person` / `project` |
+| `title` | string | 否 | 长度 1–128，缺省由服务端按群聊名与时间范围生成 |
+| `overwrite_confirmed` | boolean | 否 | 缺省 `false`；覆盖已编辑草稿时须为 `true` |
+
+**请求示例**
+
+```json
+{
+  "aggregation_id": "agg_1a2b3c4d5e6f",
+  "group_by": "person",
+  "title": "产品研发群周报 2025-01-06 ~ 2025-01-12",
+  "overwrite_confirmed": false
+}
+```
+
+**响应字段**：同 `GET /api/v1/weekly-reports/{weekly_report_id}`。
+
+**成功响应示例**
+
+```json
+{
+  "id": "rpt_7c8d9e0f1a2b",
+  "aggregation_id": "agg_1a2b3c4d5e6f",
+  "title": "产品研发群周报 2025-01-06 ~ 2025-01-12",
+  "group_by": "person",
+  "status": "draft",
+  "sections": [
+    {
+      "key": "李工",
+      "entries": [
+        {
+          "entry_id": "ent_001",
+          "content": "登录模块联调完成，已合并到主干"
+        }
+      ]
+    },
+    {
+      "key": "王工",
+      "entries":

@@ -1,0 +1,992 @@
+=== FILE: 00-README.md ===
+# 群聊周报助手 · AI 编程提示词套件
+
+本套件把已评审的 PRD 与接口文档转成 AI 编程工具可直接执行的提示词。按编号顺序逐个文件投喂，不要跳步。
+
+## 文件清单
+
+| 文件 | 类别 | 用途 | 本次是否生成 |
+| --- | --- | --- | --- |
+| `00-README.md` | 索引 | 使用说明与覆盖矩阵 | 是 |
+| `01-project-brief.md` | 总控 | 全局上下文与不可协商约束 | 是 |
+| `02-scaffold.md` | 脚手架 | 空目录 → 可运行骨架 | 是 |
+| `03-data-layer.md` | 数据层 | 数据模型落成表与迁移 | 是 |
+| `04-step-01-<模块名>.md` | 功能实现 | 按依赖顺序逐步实现 | 否（未生成） |
+| `04-step-02-<模块名>.md` | 功能实现 | 按依赖顺序逐步实现 | 否（未生成） |
+| `05-verify.md` | 验收自检 | 对照验收标准自检并补测试 | 否（未生成） |
+
+## 使用方式
+
+1. 先投喂 `01-project-brief.md`，建立全局上下文。
+2. 再投喂 `02-scaffold.md`，产出可启动的前后端骨架。
+3. 再投喂 `03-data-layer.md`，产出表结构与迁移。
+4. 之后按 `04-step-*.md` 编号顺序逐步实现，每步完成后执行该步的「验收」命令。
+5. 最后投喂 `05-verify.md` 做整体自检。
+
+## 覆盖矩阵
+
+| PRD 功能 | 优先级 | 覆盖步骤 |
+| --- | --- | --- |
+| FR-01 账号注册登录 | P0 | （未生成） |
+| FR-02 绑定群聊并汇总 | P0 | （未生成） |
+| FR-03 生成周报草稿 | P0 | （未生成） |
+| FR-04 导出到飞书 | P0 | （未生成） |
+| FR-05 人工编辑草稿 | P1 | （未生成） |
+| FR-06 导出历史记录 | P1 | （未生成） |
+| FR-07 按项目维度组织草稿 | P2 | （未生成） |
+| FR-08 多群对比 | P2 | （未生成） |
+
+> 本次仅生成 `00-README.md`、`01-project-brief.md`、`02-scaffold.md`、`03-data-layer.md`。
+> `04-step-*.md` 与 `05-verify.md` 由其它分片产出，产出后需回填本矩阵。
+
+## 全局约定速查
+
+| 项 | 值 |
+| --- | --- |
+| 产品名称 | 群聊周报助手 |
+| 平台 | Web 网站 |
+| 前端 | React + TypeScript |
+| 后端 | Python FastAPI |
+| 数据库 | PostgreSQL |
+| 接口风格 | REST，版本前缀 `/api/v1/` |
+| 鉴权 | JWT |
+| 部署 | 内网服务器，容器化，不上公有云 |
+
+=== FILE: 01-project-brief.md ===
+# 群聊周报助手 · 总控提示词
+
+## 项目定位
+
+群聊周报助手是一个 Web 网站。它把团队群聊里的进展、决策、阻塞信息自动汇总为按人 / 项目组织的周报草稿，技术负责人只需少量修改即可导出到飞书，把撰写耗时从约 2 小时降到 10 分钟以内。
+
+目标用户：20 人以下创业团队的技术负责人，兼做项目管理。
+
+## 技术栈与版本
+
+| 层 | 选型 |
+| --- | --- |
+| 前端 | React 18 + TypeScript 5，Vite 构建 |
+| 后端 | Python 3.11 + FastAPI |
+| 数据库 | PostgreSQL 15 |
+| 鉴权 | JWT（`Authorization: Bearer <jwt_token>`） |
+| 部署 | Docker 容器化，内网服务器 |
+
+## 目录结构
+
+```
+repo/
+├── frontend/
+│   ├── src/
+│   │   ├── pages/          # 登录页 / 表单页 / 汇总进度页 / 周报草稿页 / 导出历史页
+│   │   ├── components/     # 通用组件
+│   │   ├── api/            # 接口调用封装
+│   │   └── types/          # 与接口文档一致的 TS 类型
+│   └── package.json
+├── backend/
+│   ├── app/
+│   │   ├── api/v1/         # 路由，前缀 /api/v1/
+│   │   ├── models/         # 数据模型
+│   │   ├── schemas/        # 请求 / 响应模型
+│   │   ├── services/       # 业务逻辑
+│   │   └── core/           # 配置、鉴权、错误处理
+│   ├── migrations/         # 数据库迁移
+│   └── pyproject.toml
+└── docker-compose.yml
+```
+
+## 代码规范
+
+- 前后端分离，接口先定契约再实现。
+- 后端字段命名 `snake_case`，前端类型字段与接口文档逐字一致。
+- 时间统一 ISO 8601 + UTC，如 `2025-01-13T02:15:00Z`。
+- 空值返回 `null`，不省略字段。
+- 关键路径补测试。
+
+## 视觉与交互约定
+
+本次无该维度输入，待补充 `[待确认]`。
+
+## 数据约定
+
+- 主键为字符串，形如 `usr_001` / `grp_001` / `agg_001` / `rpt_001` / `exp_001`。
+- 列表接口统一分页：`page`（从 1 起）+ `page_size`（默认 20，上限 100），响应为 `{ items, page, page_size, total }`。
+- 写操作支持 `Idempotency-Key` 请求头，相同 Key 在 24 小时内返回首次结果。
+
+## 错误处理约定
+
+统一错误体：
+
+```json
+{
+  "code": "RPT001",
+  "message": "时间范围超过 31 天",
+  "detail": null
+}
+```
+
+状态码分界：400 请求不合法 / 401 未登录或凭证失效 / 403 无权限 / 404 资源不存在 / 409 状态或并发冲突 / 422 业务校验不通过 / 429 外部依赖限流 / 502 外部依赖失败 / 500 服务内部错误。
+
+## 安全与合规约定
+
+本次无该维度输入，待补充 `[待确认]`。
+
+## 硬性禁止事项
+
+- 禁止把密码明文落库，只存哈希。
+- 禁止把飞书应用凭证下发到前端。
+- 禁止引入接口文档未定义的接口路径或字段名。
+- 禁止使用 SSE / WebSocket，汇总进度通过轮询 `GET /api/v1/aggregations/{id}` 获取。
+- 禁止把数据传出内网。
+
+## 术语表
+
+| 术语 | 含义 |
+| --- | --- |
+| owner | 群聊归属人，可绑定 / 解绑群聊、编辑草稿、导出到飞书 |
+| member | 只读自己被汇总到的条目，不能改他人草稿 |
+| 汇总任务 | 对某群聊某时间范围消息的汇总，状态 `running` / `succeeded` / `failed` |
+| 周报草稿 | 基于汇总结果生成的草稿，状态 `draft` / `editing` / `exported` |
+| 分组维度 | `person`（按人）/ `project`（按项目） |
+
+=== FILE: 02-scaffold.md ===
+# 群聊周报助手 · 脚手架提示词
+
+## 目标
+
+把空目录变成能启动、能连库、能返回健康检查的前后端骨架。
+
+## 目标目录树
+
+```
+repo/
+├── frontend/
+│   ├── src/
+│   │   ├── pages/
+│   │   ├── components/
+│   │   ├── api/
+│   │   ├── types/
+│   │   ├── App.tsx
+│   │   └── main.tsx
+│   ├── index.html
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   └── package.json
+├── backend/
+│   ├── app/
+│   │   ├── api/v1/__init__.py
+│   │   ├── models/__init__.py
+│   │   ├── schemas/__init__.py
+│   │   ├── services/__init__.py
+│   │   ├── core/config.py
+│   │   ├── core/security.py
+│   │   ├── core/errors.py
+│   │   └── main.py
+│   ├── migrations/
+│   ├── tests/
+│   └── pyproject.toml
+├── .env.example
+├── docker-compose.yml
+└── README.md
+```
+
+## 依赖清单
+
+| 端 | 依赖 | 版本约束 | 用途 |
+| --- | --- | --- | --- |
+| 后端 | fastapi | >=0.110 | Web 框架 |
+| 后端 | uvicorn | >=0.29 | ASGI 服务器 |
+| 后端 | pydantic | >=2.6 | 请求 / 响应模型 |
+| 后端 | psycopg | >=3.1 | PostgreSQL 驱动 |
+| 后端 | pyjwt | >=2.8 | JWT 签发与校验 |
+| 后端 | passlib[bcrypt] | >=1.7 | 密码哈希 |
+| 后端 | httpx | >=0.27 | 调用飞书开放平台 |
+| 后端 | pytest | >=8.0 | 测试 |
+| 前端 | react | ^18 | UI 框架 |
+| 前端 | react-dom | ^18 | 渲染 |
+| 前端 | react-router-dom | ^6 | 路由 |
+| 前端 | typescript | ^5 | 类型 |
+| 前端 | vite | ^5 | 构建 |
+
+## 配置文件清单
+
+| 文件 | 内容 |
+| --- | --- |
+| `.env.example` | `DATABASE_URL`、`JWT_SECRET`、`JWT_EXPIRES_IN=86400`、`FEISHU_APP_ID`、`FEISHU_APP_SECRET` |
+| `docker-compose.yml` | `postgres`（15）+ `backend` + `frontend` 三个服务 |
+| `backend/app/core/config.py` | 从环境变量读取上述配置 |
+| `backend/app/core/errors.py` | 统一错误体与错误码常量 |
+| `backend/app/core/security.py` | JWT 签发 / 校验、密码哈希 |
+| `frontend/vite.config.ts` | 开发代理 `/api` → 后端 |
+
+## 启动与验证方式
+
+```bash
+docker compose up -d postgres
+cd backend && pip install -e . && uvicorn app.main:app --reload --port 8000
+cd frontend && npm install && npm run dev
+```
+
+验证：
+
+```bash
+curl -s http://localhost:8000/api/v1/health
+# 预期：{"status":"ok"}
+```
+
+## 部署与上线
+
+- 部署在内网服务器，不上公有云，容器化部署。
+- 前端构建产物由容器内静态服务托管，后端以 uvicorn 启动。
+- 飞书应用凭证由管理员配置到环境变量，服务端保存，不下发前端。
+
+## 暂不实现的部分
+
+- 不实现任何业务接口，只保留 `/api/v1/health`。
+- 不建业务表，表结构在 `03-data-layer.md` 中定义。
+- 不实现页面内容，只保留路由占位。
+- 不接入飞书开放平台，只预留配置项。
+
+=== FILE: 03-data-layer.md ===
+# 群聊周报助手 · 数据层提示词
+
+## 目标
+
+把接口文档第 4 章的数据模型落成 PostgreSQL 表、索引与迁移脚本。
+
+## 实体与字段
+
+### 用户 `users`
+
+| 字段 | 类型 | 必填 | 唯一 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `id` | string | 是 | 是 | 无 | 主键，形如 `usr_001` |
+| `name` | string | 是 | 否 | 无 | 姓名 |
+| `email` | string | 是 | 是 | 无 | 邮箱，登录账号 |
+| `password_hash` | string | 是 | 否 | 无 | 密码哈希，不落明文 |
+| `created_at` | string | 是 | 否 | 无 | 创建时间，ISO 8601 |
+
+索引：`email` 唯一索引。
+
+### 群聊配置 `chat_groups`
+
+| 字段 | 类型 | 必填 | 唯一 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `id` | string | 是 | 是 | 无 | 主键，形如 `grp_001` |
+| `name` | string | 是 | 否 | 无 | 群聊名称 |
+| `owner_id` | string | 是 | 否 | 无 | 归属人，外键 → `users.id` |
+| `created_at` | string | 是 | 否 | 无 | 创建时间，ISO 8601 |
+
+索引：`owner_id` 普通索引。
+
+### 汇总任务 `aggregations`
+
+| 字段 | 类型 | 必填 | 唯一 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `id` | string | 是 | 是 | 无 | 主键，形如 `agg_001` |
+| `chat_group_id` | string | 是 | 否 | 无 | 外键 → `chat_groups.id` |
+| `owner_id` | string | 是 | 否 | 无 | 触发人，外键 → `users.id` |
+| `start_at` | string | 是 | 否 | 无 | 汇总范围起，ISO 8601 |
+| `end_at` | string | 是 | 否 | 无 | 汇总范围止，ISO 8601 |
+| `message_count` | integer | 是 | 否 | `0` | 范围内消息数 |
+| `status` | string | 是 | 否 | `running` | 见枚举全集 |
+| `retry_count` | integer | 是 | 否 | `0` | 重试次数，不限上限 |
+| `error_message` | string | 否 | 否 | `null` | 失败原因 |
+| `created_at` | string | 是 | 否 | 无 | 创建时间，ISO 8601 |
+
+索引：`chat_group_id` + `status` 联合索引（用于并发去重）。
+
+### 周报草稿 `weekly_reports`
+
+| 字段 | 类型 | 必填 | 唯一 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `id` | string | 是 | 是 | 无 | 主键，形如 `rpt_001` |
+| `aggregation_id` | string | 是 | 否 | 无 | 外键 → `aggregations.id` |
+| `owner_id` | string | 是 | 否 | 无 | 归属人，外键 → `users.id` |
+| `group_by` | string | 是 | 否 | `person` | 组织维度，见枚举全集 |
+| `content` | object | 是 | 否 | 无 | 草稿正文，按人 / 项目组织的结构化内容 |
+| `status` | string | 是 | 否 | `draft` | 见枚举全集 |
+| `created_at` | string | 是 | 否 | 无 | 创建时间，ISO 8601 |
+| `updated_at` | string | 是 | 否 | 无 | 更新时间，ISO 8601 |
+
+索引：`aggregation_id` 普通索引，`owner_id` 普通索引。
+
+### 导出记录 `exports`
+
+| 字段 | 类型 | 必填 | 唯一 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `id` | string | 是 | 是 | 无 | 主键，形如 `exp_001` |
+| `report_id` | string | 是 | 否 | 无 | 外键 → `weekly_reports.id` |
+| `user_id` | string | 是 | 否 | 无 | 操作人，外键 → `users.id` |
+| `target` | string | 是 | 否 | `feishu` | 导出目标，见枚举全集 |
+| `document_url` | string | 否 | 否 | `null` | 飞书文档链接 |
+| `status` | string | 是 | 否 | `pending` | 见枚举全集 |
+| `created_at` | string | 是 | 否 | 无 | 创建时间，ISO 8601 |
+
+索引：`user_id` 普通索引，`report_id` 普通索引。
+
+## 实体关系
+
+- `users` 1 : N `chat_groups`（owner）
+- `chat_groups` 1 : N `aggregations`
+- `aggregations` 1 : N `weekly_reports`
+- `weekly_reports` 1 : N `exports`
+
+## 枚举全集
+
+| 枚举 | 取值 | 说明 |
+| --- | --- | --- |
+| `aggregation.status` | `running` / `succeeded` / `failed` | 汇总任务生命周期状态 |
+| `report.status` | `draft` / `editing` / `exported` | 草稿初始为 `draft`；进入编辑置 `editing`；导出成功置 `exported`；导出失败回落到 `editing` |
+| `report.group_by` | `person` / `project` | 按人组织 / 按项目组织 |
+| `user.role` | `owner` / `member` | `owner` 可绑定 / 解绑群聊、编辑草稿；`member` 只读自己被汇总到的条目 |
+| `export.target` | `feishu` | 本期唯一导出目标 |
+| `export.status` | `pending` / `succeeded` / `failed` | 导出记录状态 |
+
+## 级联规则
+
+| 父表 | 子表 | 删除父记录时 |
+| --- | --- | --- |
+| `users` | `chat_groups` | 禁止删除（RESTRICT），需先解绑群聊 |
+| `chat_groups` | `aggregations` | 禁止删除（RESTRICT） |
+| `aggregations` | `weekly_reports` | 禁止删除（RESTRICT） |
+| `weekly_reports` | `exports` | 禁止删除（RESTRICT） |
+
+本期不提供删除接口，级联规则仅用于约束数据库层，防止误删导致孤儿记录。
+
+## 迁移与种子数据
+
+迁移脚本放在 `backend/migrations/`，按编号顺序执行：
+
+```sql
+-- 0001_create_users.sql
+CREATE TABLE users (
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,
+  email         TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL
+);
+CREATE UNIQUE INDEX ux_users_email ON users (email);
+```
+
+```sql
+-- 0002_create_chat_groups.sql
+CREATE TABLE chat_groups (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  owner_id   TEXT NOT NULL REFERENCES users (id) ON DELETE RESTRICT,
+  created_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX ix_chat_groups_owner_id ON chat_groups (owner_id);
+```
+
+```sql
+-- 0003_create_aggregations.sql
+CREATE TABLE aggregations (
+  id            TEXT PRIMARY KEY,
+  chat_group_id TEXT NOT NULL REFERENCES chat_groups (id) ON DELETE RESTRICT,
+  owner_id      TEXT NOT NULL REFERENCES users (id) ON DELETE RESTRICT,
+  start_at      TIMESTAMPTZ NOT NULL,
+  end_at        TIMESTAMPTZ NOT NULL,
+  message_count INTEGER NOT NULL DEFAULT 0,
+  status        TEXT NOT NULL DEFAULT 'running',
+  retry_count   INTEGER NOT NULL DEFAULT 0,
+  error_message TEXT,
+  created_at    TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX ix_aggregations_group_status ON aggregations (chat_group_id, status);
+```
+
+```sql
+-- 0004_create_weekly_reports.sql
+CREATE TABLE weekly_reports (
+  id             TEXT PRIMARY KEY,
+  aggregation_id TEXT NOT NULL REFERENCES aggregations (id) ON DELETE RESTRICT,
+  owner_id       TEXT NOT NULL REFERENCES users (id) ON DELETE RESTRICT,
+  group_by       TEXT NOT NULL DEFAULT 'person',
+  content        JSONB NOT NULL,
+  status         TEXT NOT NULL DEFAULT 'draft',
+  created_at     TIMESTAMPTZ NOT NULL,
+  updated_at     TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX ix_weekly_reports_aggregation_id ON weekly_reports (aggregation_id);
+CREATE INDEX ix_weekly_reports_owner_id ON weekly_reports (owner_id);
+```
+
+```sql
+-- 0005_create_exports.sql
+CREATE TABLE exports (
+  id           TEXT PRIMARY KEY,
+  report_id    TEXT NOT NULL REFERENCES weekly_reports (id) ON DELETE RESTRICT,
+  user_id      TEXT NOT NULL REFERENCES users (id) ON DELETE RESTRICT,
+  target       TEXT NOT NULL DEFAULT 'feishu',
+  document_url TEXT,
+  status       TEXT NOT NULL DEFAULT 'pending',
+  created_at   TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX ix_exports_user_id ON exports (user_id);
+CREATE INDEX ix_exports_report_id ON exports (report_id);
+```
+
+种子数据：仅插入一条测试用户，用于本地联调。
+
+```sql
+-- 9999_seed.sql
+INSERT INTO users (id, name, email, password_hash, created_at)
+VALUES ('usr_001', '张伟', 'zhangwei@example.com', '<bcrypt-hash>', '2025-01-13T02:15:00Z');
+```
+
+## 验收
+
+```bash
+cd backend && python -m migrations.run
+psql "$DATABASE_URL" -c "\dt"
+# 预期：列出 users / chat_groups / aggregations / weekly_reports / exports 五张表
+```
+
+## 本步不做
+
+- 不实现任何接口逻辑。
+- 不实现汇总任务的并发去重逻辑，只建索引。
+- 不接入飞书开放平台。
+- 不实现审计日志表（留存时长与查询入口 `[待确认]`）。
+- 不实现手机号字段（加密存储方案与密钥管理方式 `[待确认]`）。
+
+=== FILE: 04-step-01-auth.md ===
+## 目标
+
+实现账号注册登录：未登录访问任意页面跳转 `/login`，注册成功可登录，登录成功获得 JWT 凭证并跳转 `/setup`。
+
+## 前置
+
+无。本步为第一步，依赖 `02-scaffold.md` 产出的前后端骨架与 `03-data-layer.md` 产出的 `users` 表。
+
+## 涉及文件
+
+- `backend/app/api/v1/auth.py`（新建）
+- `backend/app/schemas/auth.py`（新建）
+- `backend/app/core/security.py`（新建）
+- `backend/app/core/deps.py`（新建）
+- `backend/app/main.py`（修改：挂载 auth 路由）
+- `frontend/src/pages/LoginPage.tsx`（新建）
+- `frontend/src/api/auth.ts`（新建）
+- `frontend/src/router.tsx`（修改：加 `/login` 路由与未登录守卫）
+
+## 涉及接口
+
+- `POST /api/v1/auth/register`
+- `POST /api/v1/auth/login`
+
+## 约束
+
+- 密码用 bcrypt 哈希后写入 `users.password_hash`，禁止明文落库、禁止明文进日志。
+- JWT 有效期固定 86400 秒，`token_type` 固定 `Bearer`。
+- 登录失败统一返回 `AUTH002`（401），不区分账号不存在与密码错误。
+- 邮箱重复返回 `AUTH005`（409）。
+- 前端 token 存 `localStorage`，请求拦截器统一加 `Authorization: Bearer <jwt_token>`；收到 401 清 token 并跳 `/login`。
+- 屏幕宽度按 1280 起设计，登录页居中单列表单。
+
+## 验收
+
+```bash
+curl -X POST http://localhost:8000/api/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"张伟","email":"zhangwei@example.com","password":"pass1234"}'
+# 预期 200，返回 id/name/email/created_at，无 password 字段
+
+curl -X POST http://localhost:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"zhangwei@example.com","password":"pass1234"}'
+# 预期 200，返回 access_token / token_type=Bearer / expires_in=86400 / user
+
+curl -X POST http://localhost:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"zhangwei@example.com","password":"wrongpass"}'
+# 预期 401，code=AUTH002
+```
+
+浏览器验证：未登录直接访问 `/setup`，跳转到 `/login`；登录成功后跳转 `/setup`。
+
+## 本步不做
+
+- 不做群聊绑定、汇总、草稿、导出相关页面与接口。
+- 不做注册页与登录页的分离路由，注册与登录合并在 `/login` 一个页面内切换。
+- 不做密码找回、邮箱验证、第三方登录。
+- 不做 member 角色的创建入口（本期无邀请流程）。
+
+=== FILE: 04-step-02-chat-groups.md ===
+## 目标
+
+实现群聊绑定与列表查询：owner 可绑定群聊，`/setup` 页可看到已绑定群聊列表并选中一个。
+
+## 前置
+
+- `04-step-01-auth.md`：已产出 `backend/app/core/deps.py` 的 `get_current_user` 依赖、`frontend/src/api/auth.ts` 的请求拦截器。
+- `03-data-layer.md`：已产出 `chat_groups` 表。
+
+## 涉及文件
+
+- `backend/app/api/v1/chat_groups.py`（新建）
+- `backend/app/schemas/chat_group.py`（新建）
+- `backend/app/main.py`（修改：挂载 chat-groups 路由）
+- `frontend/src/pages/SetupPage.tsx`（新建）
+- `frontend/src/api/chatGroups.ts`（新建）
+- `frontend/src/router.tsx`（修改：加 `/setup` 路由）
+
+## 涉及接口
+
+- `POST /api/v1/chat-groups`
+- `GET /api/v1/chat-groups`
+
+## 约束
+
+- 两个接口均需 JWT 鉴权，仅 owner 可调用；非 owner 返回 `GRP002`（403）。
+- `external_group_id` 全局唯一，重复绑定返回 `GRP002`（403）。
+- 列表接口分页参数 `page`（从 1 起）、`page_size`（默认 20，上限 100），响应为 `items` / `page` / `page_size` / `total`。
+- 列表只返回 `owner_id` 等于当前用户的群聊。
+- 时间字段一律 ISO 8601 UTC，如 `2025-01-13T02:15:00Z`。
+
+## 验收
+
+```bash
+curl -X POST http://localhost:8000/api/v1/chat-groups \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"产品研发群","external_group_id":"oc_9f2a1b3c4d5e"}'
+# 预期 200，返回 id/name/owner_id/external_group_id/bound_at
+
+curl -X POST http://localhost:8000/api/v1/chat-groups \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"重复群","external_group_id":"oc_9f2a1b3c4d5e"}'
+# 预期 403，code=GRP002
+
+curl 'http://localhost:8000/api/v1/chat-groups?page=1&page_size=20' \
+  -H "Authorization: Bearer $TOKEN"
+# 预期 200，items 含刚绑定的群聊，total=1
+```
+
+## 本步不做
+
+- 不做解绑群聊接口与入口。
+- 不做群聊成员同步、群成员列表。
+- 不做汇总任务触发（下一步实现）。
+- 不做群聊名称的编辑。
+
+=== FILE: 04-step-03-aggregation.md ===
+## 目标
+
+实现汇总任务触发、查询与重试：`/setup` 选定时间范围后触发汇总并跳转 `/aggregations/:id`，进度页轮询展示 running / succeeded / failed，failed 可重试。
+
+## 前置
+
+- `04-step-02-chat-groups.md`：已产出 `chat_groups` 表读写与 `GET /api/v1/chat-groups`。
+- `03-data-layer.md`：已产出 `aggregations` 表与 `chat_group_id + status` 联合索引。
+
+## 涉及文件
+
+- `backend/app/api/v1/aggregations.py`（新建）
+- `backend/app/schemas/aggregation.py`（新建）
+- `backend/app/services/aggregation_service.py`（新建）
+- `backend/app/main.py`（修改：挂载 aggregations 路由）
+- `frontend/src/pages/AggregationPage.tsx`（新建）
+- `frontend/src/api/aggregations.ts`（新建）
+- `frontend/src/router.tsx`（修改：加 `/aggregations/:id` 路由）
+- `frontend/src/pages/SetupPage.tsx`（修改：加时间范围选择与触发按钮）
+
+## 涉及接口
+
+- `POST /api/v1/aggregations`
+- `GET /api/v1/aggregations/{aggregation_id}`
+- `POST /api/v1/aggregations/{aggregation_id}/retry`
+
+## 约束
+
+- `end_at - start_at > 31 天` 返回 `AGG001`（422）；`end_at` 早于 `start_at` 返回 `AGG002`（422）。
+- 同一 `chat_group_id` 已有 `running` 任务时，`POST` 返回既有任务且不新建；以数据库唯一约束保证。
+- 范围内无消息时 `is_empty` 为 `true`，不生成草稿。
+- 仅 `failed` 状态可重试，重试次数不限；非 `failed` 返回 `AGG004`（409）。
+- 汇总 500 条消息须在 30 秒内返回。
+- 进度页用轮询 `GET /api/v1/aggregations/{id}`，间隔 2 秒，不使用 SSE / WebSocket；`succeeded` 或 `failed` 后停止轮询。
+- 时间范围选择器前端就地校验 31 天上限，超限不提交并提示。
+
+## 验收
+
+```bash
+curl -X POST http://localhost:8000/api/v1/aggregations \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"chat_group_id":"grp_001","start_at":"2025-01-06T00:00:00Z","end_at":"2025-01-12T23:59:59Z"}'
+# 预期 200，status=running
+
+curl -X POST http://localhost:8000/api/v1/aggregations \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"chat_group_id":"grp_001","start_at":"2024-12-01T00:00:00Z","end_at":"2025-01-12T23:59:59Z"}'
+# 预期 422，code=AGG001
+
+curl http://localhost:8000/api/v1/aggregations/agg_001 -H "Authorization: Bearer $TOKEN"
+# 预期 200，status=succeeded，message_count=486，is_empty=false
+
+curl -X POST http://localhost:8000/api/v1/aggregations/agg_001/retry -H "Authorization: Bearer $TOKEN"
+# 预期 409，code=AGG004（任务非 failed）
+```
+
+## 本步不做
+
+- 不做周报草稿生成（下一步实现）。
+- 不做汇总结果的消息明细展示，只展示消息数与空态。
+- 不做汇总任务的取消、删除。
+- 不做定时自动汇总。
+
+=== FILE: 04-step-04-weekly-report.md ===
+## 目标
+
+实现周报草稿生成与查询：汇总 `succeeded` 后生成按人 / 项目组织的草稿，`/reports/:id` 可查看草稿内容。
+
+## 前置
+
+- `04-step-03-aggregation.md`：已产出 `aggregations` 表读写与 `GET /api/v1/aggregations/{id}`。
+- `03-data-layer.md`：已产出 `weekly_reports` 表。
+
+## 涉及文件
+
+- `backend/app/api/v1/weekly_reports.py`（新建）
+- `backend/app/schemas/weekly_report.py`（新建）
+- `backend/app/services/report_service.py`（新建）
+- `backend/app/main.py`（修改：挂载 weekly-reports 路由）
+- `frontend/src/pages/ReportPage.tsx`（新建）
+- `frontend/src/api/weeklyReports.ts`（新建）
+- `frontend/src/router.tsx`（修改：加 `/reports/:id` 路由）
+
+## 涉及接口
+
+- `POST /api/v1/weekly-reports`
+- `GET /api/v1/weekly-reports/{report_id}`
+
+## 约束
+
+- 汇总任务非 `succeeded` 时返回 `RPT003`（422）。
+- 同一 `aggregation_id` 重复生成返回既有草稿 `RPT002`（409），不新建。
+- `group_by` 取 `person` / `project`，默认 `person`；草稿初始状态固定 `draft`。
+- `GET` 对 member 只返回其被汇总到的条目，且 `sections[].editable` 恒为 `false`；owner 的 `editable` 为 `true`。
+- 未导出时 `feishu_doc_url` 返回 `null`，字段不省略。
+- 草稿正文按 `sections[].key`（人名或项目名）分组，`content` 为该分组正文。
+
+## 验收
+
+```bash
+curl -X POST http://localhost:8000/api/v1/weekly-reports \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"aggregation_id":"agg_001","group_by":"person"}'
+# 预期 200，status=draft，sections 按人名分组
+
+curl -X POST http://localhost:8000/api/v1/weekly-reports \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"aggregation_id":"agg_001","group_by":"person"}'
+# 预期 409，code=RPT002
+
+curl http://localhost:8000/api/v1/weekly-reports/rpt_001 -H "Authorization: Bearer $TOKEN"
+# 预期 200，status=draft，feishu_doc_url=null，sections[].editable=true
+```
+
+## 本步不做
+
+- 不做草稿编辑与保存（下一步实现）。
+- 不做导出到飞书（下一步实现）。
+- 不做草稿删除、草稿列表页。
+- 不做按项目维度的切换入口（仅接口支持 `group_by=project`）。
+
+=== FILE: 04-step-05-report-edit.md ===
+## 目标
+
+实现草稿人工编辑：owner 在 `/reports/:id` 修改措辞并保存，保存后状态置 `editing`；member 只读且不可编辑。
+
+## 前置
+
+- `04-step-04-weekly-report.md`：已产出 `weekly_reports` 表读写与 `GET /api/v1/weekly-reports/{id}`。
+- `04-step-01-auth.md`：已产出 `get_current_user` 依赖。
+
+## 涉及文件
+
+- `backend/app/api/v1/weekly_reports.py`（修改：加 PATCH 处理）
+- `backend/app/schemas/weekly_report.py`（修改：加更新请求体）
+- `frontend/src/pages/ReportPage.tsx`（修改：加编辑态与保存按钮）
+- `frontend/src/api/weeklyReports.ts`（修改：加 updateReport）
+
+## 涉及接口
+
+- `PATCH /api/v1/weekly-reports/{report_id}`
+
+## 约束
+
+- 仅 owner 可编辑，member 调用返回 `AUTH004`（403）。
+- `sections` 为全量覆盖，至少 1 条；`sections[].key` 须与草稿现有分组一致，不一致返回 `RPT005`（409）。
+- `sections[].content` 长度 0–5000，超限返回 `RPT005`（409）。
+- `exported` 状态草稿不可编辑，返回 `RPT005`（409）。
+- 并发控制：请求头 `If-Unmodified-Since` 携带上次 `updated_at`，不匹配返回 `RPT004`（409）。
+- 状态流转：`draft` → `editing`；`editing` → `editing`。
+- 前端进入编辑态即置 `editing`，保存时带上 `If-Unmodified-Since`。
+
+## 验收
+
+```bash
+curl -X PATCH http://localhost:8000/api/v1/weekly-reports/rpt_001 \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H 'If-Unmodified-Since: 2025-01-13T02:20:00Z' \
+  -d '{"sections":[{"key":"张伟","content":"完成登录模块联调；推进导出接口对接，预计本周内完成。"}]}'
+# 预期 200，status=editing，updated_at 已更新
+
+curl -X PATCH http://localhost:8000/api/v1/weekly-reports/rpt_001 \
+  -H "Authorization: Bearer $MEMBER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"sections":[{"key":"张伟","content":"改一下"}]}'
+# 预期 403，code=AUTH004
+
+curl -X PATCH http://localhost:8000/api/v1/weekly-reports/rpt_001 \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H 'If-Unmodified-Since: 2020-01-01T00:00:00Z' \
+  -d '{"sections":[{"key":"张伟","content":"改一下"}]}'
+# 预期 409，code=RPT004
+```
+
+## 本步不做
+
+- 不做多人协同编辑、不做实时同步。
+- 不做版本历史与回滚。
+- 不做导出到飞书（下一步实现）。
+- 不做草稿分组的增删（只改 `content`，不改 `key` 集合）。
+
+=== FILE: 04-step-06-export.md ===
+## 目标
+
+实现导出到飞书：`/reports/:id` 触发导出，成功则草稿状态置 `exported` 并展示文档链接，失败回落到 `editing`。
+
+## 前置
+
+- `04-step-05-report-edit.md`：已产出 `weekly_reports` 表读写与 `PATCH /api/v1/weekly-reports/{id}`。
+- `03-data-layer.md`：已产出 `exports` 表。
+
+## 涉及文件
+
+- `backend/app/api/v1/weekly_reports.py`（修改：加 export 处理）
+- `backend/app/services/feishu_client.py`（新建）
+- `backend/app/services/export_service.py`（新建）
+- `backend/app/core/config.py`（修改：加飞书 App ID / App Secret 配置项）
+- `frontend/src/pages/ReportPage.tsx`（修改：加导出按钮与文档链接展示）
+- `frontend/src/api/weeklyReports.ts`（修改：加 exportReport）
+
+## 涉及接口
+
+- `POST /api/v1/weekly-reports/{report_id}/export`
+
+## 约束
+
+- 飞书应用凭证（App ID / App Secret）由管理员配置在服务端环境变量，禁止下发前端、禁止进日志。
+- 飞书侧限流每分钟 5 次，按退避策略重试；重试后仍失败返回 `EXP002`（502），草稿状态回落到 `editing`。
+- 飞书凭证未配置返回 `RPT007`（409）。
+- 对 `exported` 草稿再次导出返回 `RPT002`（409）。
+- 导出成功：草稿状态置 `exported`，写一条 `exports` 记录（`target=feishu`、`status` 为成功态、`document_url` 为飞书链接）。
+- 状态流转：`editing` → `exported`；失败时 `editing` → `editing`。
+- 导出成功率 100%（含重试）。
+
+## 验收
+
+```bash
+curl -X POST http://localhost:8000/api/v1/weekly-reports/rpt_001/export \
+  -H "Authorization: Bearer $TOKEN"
+# 预期 200，status=exported，feishu_doc_url 非空，exported_at 为 ISO 8601 UTC
+
+curl -X POST http://localhost:8000/api/v1/weekly-reports/rpt_001/export \
+  -H "Authorization: Bearer $TOKEN"
+# 预期 409，code=RPT002
+
+# 模拟飞书返回限流（mock 返回 429），观察服务端按每分钟 5 次退避重试
+# 预期：重试后成功则 200；重试后仍失败则 502 + code=EXP002，且草稿状态仍为 editing
+```
+
+## 本步不做
+
+- 不做除飞书外的其它导出目标。
+- 不做自动把周报发到群里。
+- 不做导出记录的列表页（下一步实现）。
+- 不做飞书文档的更新（重复导出走新建文档）。
+
+=== FILE: 04-step-07-export-history.md ===
+## 目标
+
+实现导出历史页 `/exports`：已登录用户只看到与自己有关的导出记录，分页展示。
+
+## 前置
+
+- `04-step-06-export.md`：已产出 `exports` 表写入与 `POST /api/v1/weekly-reports/{id}/export`。
+- `04-step-01-auth.md`：已产出 `get_current_user` 依赖。
+
+## 涉及文件
+
+- `backend/app/api/v1/exports.py`（新建）
+- `backend/app/schemas/export.py`（新建）
+- `backend/app/main.py`（修改：挂载 exports 路由）
+- `frontend/src/pages/ExportsPage.tsx`（新建）
+- `frontend/src/api/exports.ts`（新建）
+- `frontend/src/router.tsx`（修改：加 `/exports` 路由）
+
+## 涉及接口
+
+- `GET /api/v1/exports`
+
+## 约束
+
+- 需 JWT 鉴权，owner 与 member 均可调用。
+- 仅返回与当前用户有关的记录：owner 返回其归属群聊下的全部导出，member 仅返回自己被汇总到的草稿的导出。
+- 分页参数 `page`（从 1 起）、`page_size`（默认 20，上限 100），响应为 `items` / `page` / `page_size` / `total`。
+- `items[].feishu_doc_url` 为飞书文档链接，`items[].exported_at` 为 ISO 8601 UTC。
+- 列表按 `exported_at` 倒序。
+
+## 验收
+
+```bash
+curl 'http://localhost:8000/api/v1/exports?page=1&page_size=20' \
+  -H "Authorization: Bearer $TOKEN"
+# 预期 200，items 含 exp_001，total=1
+
+curl 'http://localhost:8000/api/v1/exports?page=1&page_size=20' \
+  -H "Authorization: Bearer $MEMBER_TOKEN"
+# 预期 200，items 只含该 member 被汇总到的草稿的导出记录
+```
+
+## 本步不做
+
+- 不做导出记录的删除、重试。
+- 不做导出记录的详情页。
+- 不做按时间范围、按群聊筛选。
+- 不做导出记录的导出（下载 CSV 等）。
+
+=== FILE: 05-verify.md ===
+## 目标
+
+对照 PRD 第 2 章的全部验收标准 `AC-01` ~ `AC-10` 逐条自检，补齐缺失的自动化测试，并输出一份可复核的自检报告。
+
+## 前置
+
+已完成并验证通过的步骤：
+
+- `02-scaffold.md`：产出可启动的前后端骨架，前端 `frontend/`（React + TypeScript），后端 `backend/`（Python FastAPI），容器化配置 `docker-compose.yml`。
+- `03-data-layer.md`：产出 PostgreSQL 表 `users`、`chat_groups`、`aggregations`、`weekly_reports`、`exports`，迁移脚本 `backend/migrations/`，枚举值见接口文档附 A。
+- `04-step-01-auth.md`：产出 `POST /api/v1/auth/register`、`POST /api/v1/auth/login`，JWT 签发与校验中间件。
+- `04-step-02-chat-groups.md`：产出 `POST /api/v1/chat-groups`、`GET /api/v1/chat-groups`。
+- `04-step-03-aggregations.md`：产出 `POST /api/v1/aggregations`、`GET /api/v1/aggregations/{aggregation_id}`、`POST /api/v1/aggregations/{aggregation_id}/retry`。
+- `04-step-04-weekly-reports.md`：产出 `POST /api/v1/weekly-reports`、`GET /api/v1/weekly-reports/{report_id}`、`PATCH /api/v1/weekly-reports/{report_id}`。
+- `04-step-05-export.md`：产出 `POST /api/v1/weekly-reports/{report_id}/export`、`GET /api/v1/exports`，飞书开放平台出站调用与退避重试。
+
+## 涉及文件
+
+新建：
+
+- `backend/tests/test_acceptance_auth.py`
+- `backend/tests/test_acceptance_aggregation.py`
+- `backend/tests/test_acceptance_report.py`
+- `backend/tests/test_acceptance_export.py`
+- `backend/tests/conftest.py`
+- `docs/verify-report.md`
+
+修改：
+
+- `backend/pyproject.toml`（补充 `pytest`、`pytest-asyncio`、`httpx` 测试依赖）
+- `frontend/package.json`（补充 `vitest`、`@testing-library/react` 测试依赖）
+
+## 涉及接口
+
+- `POST /api/v1/auth/register`
+- `POST /api/v1/auth/login`
+- `POST /api/v1/chat-groups`
+- `GET /api/v1/chat-groups`
+- `POST /api/v1/aggregations`
+- `GET /api/v1/aggregations/{aggregation_id}`
+- `POST /api/v1/aggregations/{aggregation_id}/retry`
+- `POST /api/v1/weekly-reports`
+- `GET /api/v1/weekly-reports/{report_id}`
+- `PATCH /api/v1/weekly-reports/{report_id}`
+- `POST /api/v1/weekly-reports/{report_id}/export`
+- `GET /api/v1/exports`
+
+## 约束
+
+- 本步只补测试与自检报告，**不修改任何业务实现**。若测试暴露实现缺陷，只记录到 `docs/verify-report.md`，不就地改代码。
+- 测试必须打真实 PostgreSQL（`docker-compose up -d db`），禁止用 SQLite 替代，因为 `aggregations` 的并发去重依赖 `chat_group_id` + `status` 联合索引。
+- 飞书开放平台在测试中一律用 `httpx.MockTransport` 打桩，禁止真实调用；限流场景返回 HTTP 429，失败场景返回 HTTP 502。
+- 每个测试用例的命名格式为 `test_<AC编号小写>_<场景>`，例如 `test_ac03_range_over_31_days_rejected`。
+- 断言必须落在接口文档第 5 章的错误码上，禁止只断言 HTTP 状态码。
+- 时间字段一律用 ISO 8601 + UTC 断言，禁止断言本地时区字符串。
+
+## 验收
+
+全部 `AC-xx` 原文照录如下，逐条给出验证方式。
+
+| 编号 | 验收标准（PRD 原文） | 验证方式 |
+| --- | --- | --- |
+| AC-01 | 给定未登录用户，当访问除登录页外的任意页面时，则跳转到登录页；给定已注册账号，当输入正确账号密码时，则登录成功并获得 JWT 凭证 | `pytest backend/tests/test_acceptance_auth.py -k ac01`；前端 `vitest run frontend/src/router.test.tsx` |
+| AC-02 | 给定已登录的 owner，当绑定群聊并选定不超过 31 天的时间范围后触发汇总，则 30 秒内能看到按人分组的草稿 | `pytest backend/tests/test_acceptance_aggregation.py -k ac02`，断言 `POST /api/v1/aggregations` 返回 `status=running`，轮询 `GET /api/v1/aggregations/{id}` 至 `succeeded` 且耗时 < 30s |
+| AC-03 | 给定选定时间范围超过 31 天，当触发汇总时，则拒绝并给出提示；给定群聊在范围内没有任何消息，当触发汇总时，则展示空态而非空草稿 | `pytest backend/tests/test_acceptance_aggregation.py -k ac03`，断言超 31 天返回 422 + `AGG001`；无消息返回 `is_empty=true` 且不产生 `weekly_reports` 记录 |
+| AC-04 | 给定同一群聊已有汇总任务在运行，当再次触发汇总时，则返回既有任务且不新建任务 | `pytest backend/tests/test_acceptance_aggregation.py -k ac04`，并发两次 `POST /api/v1/aggregations`，断言两次返回同一 `id` 且 `aggregations` 表仅新增 1 行 |
+| AC-05 | 给定汇总任务 succeeded，当生成周报草稿时，则草稿按人 / 项目组织且状态为 draft | `pytest backend/tests/test_acceptance_report.py -k ac05`，断言 `POST /api/v1/weekly-reports` 返回 `status=draft`，`group_by` 为 `person` 或 `project`，`sections[].key` 非空 |
+| AC-06 | 给定汇总任务 failed，当人工触发重试时，则重新执行汇总，重试次数不限 | `pytest backend/tests/test_acceptance_aggregation.py -k ac06`，断言 `POST /api/v1/aggregations/{id}/retry` 返回 `status=running` 且 `retry_count` 递增；对 `succeeded` 任务重试返回 409 + `AGG004` |
+| AC-07 | 给定草稿处于 editing，当导出到飞书成功时，则草稿状态置为 exported 并返回文档链接，导出成功率 100%（含重试） | `pytest backend/tests/test_acceptance_export.py -k ac07`，MockTransport 首次返回 429、第二次返回 200，断言最终 `status=exported` 且 `feishu_doc_url` 非空 |
+| AC-08 | 给定飞书侧返回限流，当触发导出时，则按每分钟 5 次的限制退避重试；给定导出失败，则草稿状态回落到 editing | `pytest backend/tests/test_acceptance_export.py -k ac08`，断言重试间隔 ≥ 12s 且 60s 内不超过 5 次；MockTransport 持续返回 502 时断言返回 502 + `EXP002` 且草稿 `status=editing` |
+| AC-09 | 给定 owner 打开草稿并开始手改，当进入编辑时，则草稿状态置为 editing；给定 member 访问他人草稿，则只能只读自己被汇总到的条目，不能修改 | `pytest backend/tests/test_acceptance_report.py -k ac09`，断言 `PATCH /api/v1/weekly-reports/{id}` 后 `status=editing`；member 调用返回 403 + `AUTH004`，`GET` 响应中 `sections[].editable` 恒为 `false` |
+| AC-10 | 给定已登录用户，当打开导出历史页时，则只看到与自己有关的导出记录 | `pytest backend/tests/test_acceptance_export.py -k ac10`，断言 `GET /api/v1/exports` 返回的 `items[].report_id` 全部属于当前用户可见范围 |
+
+**自检报告格式**
+
+`docs/verify-report.md` 必须包含以下三节，缺一不可：
+
+```markdown
+## 1. 覆盖矩阵
+
+| AC 编号 | 对应 FR | 测试文件 | 测试用例名 | 结果 |
+| --- | --- | --- | --- | --- |
+
+## 2. 未通过项
+
+| AC 编号 | 现象 | 复现命令 | 定位到的文件 | 建议 |
+| --- | --- | --- | --- | --- |
+
+## 3. 未覆盖项
+
+| AC 编号 | 原因 | 后续动作 |
+| --- | --- | --- |
+```
+
+**测试用例清单**
+
+| 用例名 | 覆盖 AC | 断言要点 |
+| --- | --- | --- |
+| `test_ac01_unauthenticated_redirects_to_login` | AC-01 | 未带 JWT 访问 `/api/v1/chat-groups` 返回 401 + `AUTH003` |
+| `test_ac01_login_returns_jwt` | AC-01 | 登录成功返回 `access_token`、`token_type=Bearer`、`expires_in=86400` |
+| `test_ac02_aggregation_succeeds_within_30s` | AC-02 | 500 条消息汇总耗时 < 30s，`status=succeeded` |
+| `test_ac03_range_over_31_days_rejected` | AC-03 | 返回 422 + `AGG001` |
+| `test_ac03_empty_range_returns_empty_state` | AC-03 | `is_empty=true`，`weekly_reports` 无新增行 |
+| `test_ac04_concurrent_trigger_returns_existing` | AC-04 | 两次返回同一 `id`，`aggregations` 仅 1 行 |
+| `test_ac05_generate_draft_by_person` | AC-05 | `status=draft`，`group_by=person` |
+| `test_ac05_generate_draft_by_project` | AC-05 | `status=draft`，`group_by=project` |
+| `test_ac06_retry_failed_aggregation` | AC-06 | `status=running`，`retry_count` 递增 |
+| `test_ac06_retry_non_failed_rejected` | AC-06 | 返回 409 + `AGG004` |
+| `test_ac07_export_succeeds_after_retry` | AC-07 | 429 后重试成功，`status=exported` |
+| `test_ac08_export_rate_limited_backoff` | AC-08 | 60s 内调用次数 ≤ 5 |
+| `test_ac08_export_failure_falls_back_to_editing` | AC-08 | 返回 502 + `EXP002`，`status=editing` |
+| `test_ac09_owner_edit_sets_editing` | AC-09 | `PATCH` 后 `status=editing` |
+| `test_ac09_member_readonly_other_report` | AC-09 | 返回 403 + `AUTH004`，`editable=false` |
+| `test_ac10_exports_scoped_to_current_user` | AC-10 | 返回记录全部属于当前用户 |
+
+**执行命令**
+
+```bash
+docker-compose up -d db
+cd backend && pytest tests/ -v --tb=short
+cd frontend && vitest run
+```
+
+## 本步不做
+
+- 不实现 PRD 第 6 章「不在范围内」的任何内容：自动把周报发到群里、多人协同编辑同一份草稿、除飞书外的其它导出目标、群聊消息的自动分类打标、小程序形态。
+- 不为 `FR-08` 多群对比补测试 —— 该功能在 PRD 中标注 `[待确认]`，接口文档第 6 章已声明本期不定义接口。
+- 不补性能压测与安全渗透测试，仅覆盖 PRD 第 2 章的 `AC-01` ~ `AC-10`。
+- 不修改 `backend/app/` 与 `frontend/src/` 下的任何业务实现文件。
+- 不新增数据库表或字段。
+- 不接入 CI 流水线配置。
+</parameter>

@@ -1,0 +1,24 @@
+## 第 6 章 接口清单
+
+### 接口清单
+
+| 方法 | 路径 | 用途 | 对应的 FR-xx |
+| --- | --- | --- | --- |
+| GET | `/api/v1/auth/oauth/{provider}/authorize` | 获取第三方登录授权跳转地址 | FR-05 |
+| POST | `/api/v1/auth/oauth/{provider}/callback` | 用第三方授权码换取登录态 | FR-05 |
+| POST | `/api/v1/auth/logout` | 退出登录，失效当前登录态 | FR-05 |
+| GET | `/api/v1/me` | 获取当前用户信息与角色 | FR-05、FR-07 |
+| GET | `/api/v1/chat-groups` | 列出当前用户有权限访问的企业微信群 | FR-01 |
+| POST | `/api/v1/message-collections` | 按群与时间范围汇总消息，产出周报素材 | FR-01 |
+| GET | `/api/v1/message-collections/{collection_id}` | 查询一次消息汇总的结果 | FR-01 |
+| GET | `/api/v1/weekly-reports` | 查询历史周报列表 | FR-06、FR-07 |
+| POST | `/api/v1/weekly-reports` | 基于汇总素材生成按人分组的周报草稿 | FR-02 |
+| GET | `/api/v1/weekly-reports/{report_id}` | 查看周报草稿详情 | FR-06、FR-07 |
+| PATCH | `/api/v1/weekly-reports/{report_id}` | 人工修改周报草稿 | FR-03 |
+| GET | `/api/v1/weekly-reports/{report_id}/export` | 导出周报内容，供复制到飞书群 | FR-04 |
+
+### 无接口功能
+
+| FR-xx | 功能名 | 为什么不需要接口 |
+| --- | --- | --- |
+| — | — | 本期 PRD 第 7 章全部功能需求均需服务端接口承载，无纯前端功能 |

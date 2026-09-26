@@ -1,0 +1,48 @@
+# ---------- 环境与密钥 ----------
+.env
+.env.local
+*.env
+!.env.example
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv 的缓存/托管 Python 目录（沙箱下必须落在工作区内，故显式指定）
+.uv-cache/
+.uv-python/
+
+# ---------- Node（前端）----------
+node_modules/
+dist/
+.next/
+.pnpm-store/
+.pnpm-cache/
+.pnpm-state/
+
+# ---------- 运行时产物 ----------
+*.log
+.DS_Store
+Thumbs.db
+
+# ---------- 部署 ----------
+# Basic Auth 密码文件：**绝不能提交**（它本身就是一份可用凭据）
+deploy/.htpasswd
+# 打包上传用的临时压缩包（见 docs/部署.md §1 的"没有远端仓库"路径）。
+# 历史上踩过：`harnessprd.tar.gz` 自己被打进了自己（tar 里多出一个 450 KB 的同名文件）。
+harnessprd.tar.gz
+harnessprd-src.tar.gz
+*.tar.gz
+*.tgz
+
+# ---------- 临时与备份 ----------
+*.tmp
+*.bak
+*.orig
+.doc-bak/
