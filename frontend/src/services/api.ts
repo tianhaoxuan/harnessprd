@@ -140,6 +140,69 @@ export async function retrieveApiDocsRag(
 }
 
 /**
+ * **从结构化摘要生成 PRD**（流式）。
+ *
+ * 与 `generatePrdStream` 的区别只在输入：那个吃 20 题表单作答 + `known_info`，
+ * 这个吃技能包 8 字段摘要（+ 可选对话历史）—— 后者与技能包输入契约同形，没有有损映射。
+ *
+ * ⚠️ **务必把对话历史带上**（`history`）。实测同一份产品信息：
+ *
+ * | 输入 | 输入事实覆盖 |
+ * | --- | --- |
+ * | 只给摘要 | 11/14（漏掉 31 天 / 每分钟 5 次 / 空态） |
+ * | **摘要 + 对话历史** | **14/14** |
+ *
+ * 原因：结构化把"边界、限流、状态"这类细节压进了 `description` 字段，
+ * 单条细节的存在感变低，容易被概括掉；对话历史里那句原话才是它们的出处。
+ */
+/** 双智能体的阶段事件载荷（服务端 `stage` 命名事件的 data）。 */
+export interface PrdGenerationStage {
+  stage: 'writing' | 'reviewing' | 'rewriting' | 'done'
+  /** 第几稿（从 1 起） */
+  round?: number
+  /** 本次要修的问题（`rewriting` 时带上一轮的审核意见） */
+  issues?: Array<{ section?: string; problem?: string; suggestion?: string }>
+  /** 给人看的一句话（界面直接显示） */
+  detail?: string
+  /** `done` 时为 true 表示审核输出不可解析、本次按通过处理 */
+  review_skipped?: boolean
+  /** 这一稿是**哪个模型**审的（服务端给）。刻意显示出来：这条开关是环境变量，
+   * 服务换个方式重启就会静默回落成「自己审自己」，界面上写着模型名才看得出来。 */
+  review_model?: string
+}
+
+/**
+ * **双智能体**版：Writer 写初稿 → Reviewer 审核 → 有问题自动重写（服务端上限 1 次）。
+ *
+ * 比 `generatePrdFromSummaryStream` 多一层质检，代价是**调用数 1 → 2~3 次**、
+ * 耗时约翻倍（实测：2 次 / 5.6 秒，触发重写 3 次 / 10.5 秒），
+ * 且审核那一段没有流式输出 —— 用 `options.onStage` 拿阶段事件显示文案。
+ */
+export async function generatePrdWithReviewStream(
+  summary: Record<string, unknown>,
+  history: Array<{ role: 'user' | 'ai'; content: string }>,
+  options: StreamOptions = {},
+): Promise<string> {
+  return postStream(
+    '/conversation/generate-prd-from-summary-stream',
+    { summary, history, review: true },
+    options,
+  )
+}
+
+export async function generatePrdFromSummaryStream(
+  summary: Record<string, unknown>,
+  history: Array<{ role: 'user' | 'ai'; content: string }>,
+  options: StreamOptions = {},
+): Promise<string> {
+  return postStream(
+    '/conversation/generate-prd-from-summary-stream',
+    { summary, history },
+    options,
+  )
+}
+
+/**
  * 把 axios 的错误转成能直接显示给用户的一句话。
  *
  * axios 的错误对象结构复杂（`error.message` 对 4xx/5xx 只会说 "Request failed with status code 404"，
@@ -232,6 +295,14 @@ export interface StreamHandlers {
   onChunk?: (text: string, fullText: string) => void
   /** 正常结束时调一次，带服务端给的统计。 */
   onDone?: (meta: StreamChunkMeta, fullText: string) => void
+  /**
+   * 双智能体的**阶段事件**（`generatePrdWithReviewStream` 专用）。
+   *
+   * 阶段由**服务端**给出，不是前端猜的：`writing`（写初稿）、`reviewing`（审核，
+   * 这一段没有流式输出，界面必须给文案）、`rewriting`（重写，**要清空缓冲区重来**，
+   * 否则两稿会拼在一起）、`done`（终稿，`issues` 非空表示还有没修完的审核意见，必须显示）。
+   */
+  onStage?: (stage: PrdGenerationStage) => void
 }
 
 export interface StreamOptions extends StreamHandlers {
@@ -284,6 +355,16 @@ export async function readStream(
             fullText += text
             handlers.onChunk?.(text, fullText)
           }
+        } else if (parsed.event === 'stage') {
+          const stage = (parsed.data ?? {}) as PrdGenerationStage
+          // ⚠️ **重写要把这里累计的文本一起清掉。** 服务端说 `rewriting` 就是"上一稿整份作废、
+          // 从头写"，而 `fullText` 是客户端自己累计的：不清的话返回值会是「初稿 + 终稿」两份
+          // 粘在一起，服务端完全不知道，这份脏文本还会被当成产物存下来。
+          // 界面上那份预览另有清空（`App` 的 `onStage`），但**存的是这里**，两处都得清。
+          if (stage.stage === 'rewriting') {
+            fullText = ''
+          }
+          handlers.onStage?.(stage)
         } else if (parsed.event === 'done') {
           doneMeta = parsed.data as StreamChunkMeta
         } else if (parsed.event === 'error') {

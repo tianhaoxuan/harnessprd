@@ -1,9 +1,19 @@
 import { Check } from 'lucide-react'
 
-import { STEPS, VIEW_TO_STEP, type ViewState } from '../types'
+import {
+  STEP_VIEW,
+  stepIndexOf,
+  stepsForMode,
+  type EntryMode,
+  type ViewState,
+} from '../types'
 
 interface StepProgressProps {
   viewState: ViewState
+  /** 入口决定**显示哪几格**；不传按结构化入口（5 格） */
+  entryMode?: EntryMode
+  /** 点某一格跳过去。**自由推进**刻意不做前端门槛：真不满足条件的，生成按钮自己会是灰的 */
+  onSelect?: (view: ViewState) => void
 }
 
 /**
@@ -13,19 +23,30 @@ interface StepProgressProps {
  * `viewState`（将来由服务端 `snapshot.state` 推导）的一个投影 ——
  * 见 `types/index.ts` 里 `ViewState` 的说明。
  */
-export default function StepProgress({ viewState }: StepProgressProps) {
-  const current = VIEW_TO_STEP[viewState]
+export default function StepProgress({
+  viewState,
+  entryMode = 'structured',
+  onSelect,
+}: StepProgressProps) {
+  const steps = stepsForMode(entryMode)
+  const current = stepIndexOf(entryMode, viewState)
 
   return (
-    <nav aria-label="流程进度">
+    <nav aria-label="流程进度" data-testid="step-progress" data-entry-mode={entryMode}>
       <ol className="flex items-center gap-2">
-        {STEPS.map((step, index) => {
+        {steps.map((step, index) => {
           const isDone = index < current
           const isActive = index === current
 
           return (
             <li key={step.id} className="flex min-w-0 flex-1 items-center gap-2">
-              <div className="flex min-w-0 items-center gap-2">
+              <button
+                type="button"
+                data-testid={`step-${step.id}`}
+                onClick={() => onSelect?.(STEP_VIEW[step.id])}
+                disabled={!onSelect}
+                className="flex min-w-0 items-center gap-2 text-left disabled:cursor-default"
+              >
                 <span
                   aria-current={isActive ? 'step' : undefined}
                   className={[
@@ -51,9 +72,9 @@ export default function StepProgress({ viewState }: StepProgressProps) {
                 >
                   {step.label}
                 </span>
-              </div>
+              </button>
 
-              {index < STEPS.length - 1 && (
+              {index < steps.length - 1 && (
                 <span
                   aria-hidden
                   className={[

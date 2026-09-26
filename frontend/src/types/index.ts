@@ -347,3 +347,80 @@ export type OptimizeDocumentRequest = OptimizeDocumentBase &
   error?: string
 }
 
+// ---------------------------------------------------------------- 入口模式
+
+/** 步骤条里的一格（从 `STEPS` 推导，避免手抄一份 id 联合）。 */
+export type StepId = (typeof STEPS)[number]['id']
+
+/**
+ * 三种入口。**入口只决定「这一步要不要走」，不决定「能不能生成」** ——
+ * 生成能力始终由服务端与链条约束决定（提示词套件缺 `prd_content` 照样 422）。
+ *
+ * | 入口 | 走什么 | 跳过什么 |
+ * | --- | --- | --- |
+ * | `structured` | 表单 → 对话澄清 → PRD → 接口文档 → 提示词 | 不跳 |
+ * | `prd-shortcut` | 已有 PRD →（先 RAG 检索规范）→ 接口文档 → 提示词 | 表单、对话、PRD 生成 |
+ * | `prompts-debug` | 提示词套件（自带 PRD 文本） | 表单、对话、PRD 与接口文档生成 |
+ */
+export type EntryMode = 'structured' | 'prd-shortcut' | 'prompts-debug'
+
+export interface EntryModeMeta {
+  id: EntryMode
+  label: string
+  /** 一句话说明「跳过什么」，直接显示给用户 */
+  hint: string
+  /** 这个入口显示的步骤（顺序即步骤条顺序） */
+  steps: readonly StepId[]
+}
+
+export const ENTRY_MODES: readonly EntryModeMeta[] = [
+  {
+    id: 'structured',
+    label: '结构化需求入口',
+    hint: '完整流程：表单 → AI 对话澄清 → PRD → 接口文档 → 提示词',
+    steps: ['form', 'chatting', 'review-prd', 'review-api-docs', 'review-prompts'],
+  },
+  {
+    id: 'prd-shortcut',
+    label: 'PRD 快捷入口',
+    hint: '已有 PRD：先 RAG 检索规范与历史示例，再生成接口文档和提示词套件',
+    steps: ['review-prd', 'review-api-docs', 'review-prompts'],
+  },
+  {
+    id: 'prompts-debug',
+    label: '提示词调试入口',
+    hint: '跳过前置流程，直接生成提示词套件（需要自带 PRD 文本）',
+    steps: ['review-prompts'],
+  },
+]
+
+/** 步骤 → 默认落在哪个视图（步骤条点击用）。 */
+export const STEP_VIEW: Record<StepId, ViewState> = {
+  form: 'form',
+  chatting: 'chatting',
+  'review-prd': 'review-prd',
+  'review-api-docs': 'review-api-docs',
+  'review-prompts': 'review-prompts',
+}
+
+/** 该入口要显示哪些步骤。 */
+export function stepsForMode(mode: EntryMode): readonly (typeof STEPS)[number][] {
+  const meta = ENTRY_MODES.find((item) => item.id === mode) ?? ENTRY_MODES[0]
+  return STEPS.filter((step) => meta.steps.includes(step.id))
+}
+
+/**
+ * `ViewState` → **该入口步骤条**里的序号。
+ *
+ * 先经全量 `VIEW_TO_STEP` 换成步骤 id，再在入口自己的步骤表里找位置。
+ * 两种情况特殊：`done` 归到末尾；该入口没有这一步（例如快捷入口下落到 `chatting`）
+ * 归到 **0**（进度条不许倒退），而不是「全部完成」 —— 后者会让进度看起来是满的。
+ */
+export function stepIndexOf(mode: EntryMode, view: ViewState): number {
+  if (view === 'done') return stepsForMode(mode).length
+  const stepId = STEPS[VIEW_TO_STEP[view]]?.id
+  if (!stepId) return 0
+  const index = stepsForMode(mode).findIndex((step) => step.id === stepId)
+  return index === -1 ? 0 : index
+}
+

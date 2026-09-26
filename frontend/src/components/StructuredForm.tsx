@@ -373,6 +373,41 @@ interface SkillPayload {
   technical_constraints?: Record<string, string>
 }
 
+/**
+ * 从**表单作答**（本机草稿的形状）重建技能包摘要。
+ *
+ * 为什么需要它：摘要是内存态，刷新页面就没了，而「生成 PRD」是否走**双智能体审核**
+ * 取决于它在不在 —— 没有它就会静默退回没有审核的表单路径。用表单草稿重建，
+ * 用户就不必为了拿回审核而重填一遍（重填还会开一段新会话，把刚聊完的澄清丢掉）。
+ *
+ * 解析规则仍只有 `buildRequirementsSummary()` 一处，这里只负责补缺省值
+ * （与本组件恢复草稿时用的 `{ ...EMPTY, ...saved }` 是同一个口径）。
+ * 没有任何作答时返回 `null`（调用方据此走老路径）。
+ */
+export function summaryFromFormValues(
+  raw: Record<string, string>,
+): Record<string, unknown> | null {
+  if (!raw || Object.keys(raw).length === 0) return null
+  const { schemaPayload } = buildRequirementsSummary({ ...EMPTY, ...raw })
+  return Object.keys(schemaPayload).length > 0
+    ? (schemaPayload as Record<string, unknown>)
+    : null
+}
+
+/**
+ * 读**本机草稿**并重建摘要（给上层在刷新之后找回摘要用）。
+ *
+ * 为什么不让上层自己拼：草稿的键与形状是**本组件**的事（`DRAFT_KIND` + camelCase 作答）。
+ * 上层手里的 `values` 是 20 题映射（`product_name` 这种键），拿它重建只会得到一份空摘要，
+ * 而空摘要又会被上层当成"没有摘要" —— 于是静默退回没有双智能体审核的老路径。
+ * 这种错配不会报错，只会让功能悄悄失效，所以收口在这里。
+ */
+export function summaryFromStoredDraft(): Record<string, unknown> | null {
+  const saved = readLocal<Record<string, string>>(DRAFT_KIND)
+  if (!saved) return null
+  return summaryFromFormValues(saved)
+}
+
 /** `buildRequirementsSummary()` 的返回值：解析结果 + 与 schema 完全匹配的载荷。 */
 interface RequirementsSummary {
   productName: string

@@ -50,18 +50,13 @@ export function safeFileName(text: string, fallback = 'document'): string {
 }
 
 /**
- * 弹出一次下载。
+ * 弹出一次**任意 Blob** 的下载（`downloadFile` 与打包下载共用这一处）。
  *
- * @param filename 建议的文件名（**应当是安全的** —— 用 `safeFileName()` 清过）
- * @param content 文件内容（文本，按 UTF-8 编码写出）
- * @param mimeType MIME 类型。只影响浏览器对类型的判断，不影响字节内容
+ * 为什么把"点那个 `<a>`"单独抽出来：多份产物打包成 zip 时下载的是**二进制**，
+ * 而不是文本 —— 两处各写一遍"创建 URL、插节点、点、延迟释放"必然漂移，
+ * 而上面那三个坑（游离节点 / 过早 revoke / BOM）就藏在其中。
  */
-export function downloadFile(
-  filename: string,
-  content: string,
-  mimeType = 'text/markdown;charset=utf-8',
-): void {
-  const blob = new Blob([content], { type: mimeType })
+export function downloadBlob(filename: string, blob: Blob): void {
   const url = URL.createObjectURL(blob)
 
   const anchor = document.createElement('a')
@@ -74,4 +69,19 @@ export function downloadFile(
   document.body.removeChild(anchor)
 
   window.setTimeout(() => URL.revokeObjectURL(url), REVOKE_DELAY_MS)
+}
+
+/**
+ * 弹出一次文本文件下载。
+ *
+ * @param filename 建议的文件名（**应当是安全的** —— 用 `safeFileName()` 清过）
+ * @param content 文件内容（文本，按 UTF-8 编码写出）
+ * @param mimeType MIME 类型。只影响浏览器对类型的判断，不影响字节内容
+ */
+export function downloadFile(
+  filename: string,
+  content: string,
+  mimeType = 'text/markdown;charset=utf-8',
+): void {
+  downloadBlob(filename, new Blob([content], { type: mimeType }))
 }

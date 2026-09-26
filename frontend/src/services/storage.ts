@@ -165,6 +165,74 @@ export function clearFormDraft(): void {
   clearLocal(FORM_DRAFT_KIND)
 }
 
+// ---------------------------------------------------------------- 结构化录入（摘要 + 附加项）
+
+/**
+ * 结构化录入的 kind：技能包 8 字段摘要 + 「20 题之外」那部分附加项。
+ *
+ * ## 为什么必须持久化
+ *
+ * 这两样原先只活在内存里，刷新页面就没了。而「生成 PRD」是否走**双智能体审核**
+ * （Writer 写 + Reviewer 审）恰好取决于摘要在不在：摘要丢了会**静默**退回没有审核的
+ * 表单路径，界面上一点区别都看不出来 —— 实测踩过：用户刷新后点生成，阶段文案一个都没出现。
+ * 顺带，用户逐条确认过的摘要与附加项本身，也不该因为一次刷新就全部退回表单口径。
+ */
+export const STRUCTURED_KIND = 'structured-intake'
+
+/** 结构化录入的载荷。两样都是生成 PRD 的输入，必须一起存、一起取。 */
+export interface StructuredIntake {
+  /** 技能包 8 字段摘要（与 `field-schema.json` 对齐） */
+  summary: Record<string, unknown>
+  /** 附加项文本，上层并进 `known_info` */
+  extras: string
+}
+
+export function readStructuredIntake(): StructuredIntake | null {
+  const payload = readLocal<StructuredIntake>(STRUCTURED_KIND)
+  if (!payload || typeof payload !== 'object') return null
+  const summary = payload.summary
+  // 形状不对就当作没有：宁可退回表单路径，也不要把半份摘要喂给生成接口
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) return null
+  return {
+    summary: summary as Record<string, unknown>,
+    extras: typeof payload.extras === 'string' ? payload.extras : '',
+  }
+}
+
+export function writeStructuredIntake(payload: StructuredIntake): void {
+  writeLocal(STRUCTURED_KIND, payload)
+}
+
+/**
+ * 清掉结构化录入。
+ *
+ * 「重新开始」时**必须**调用：否则下一轮会悄悄继承上一轮的摘要与附加项 ——
+ * 它们会并进 `known_info`，用户以为从零开始，实际带着上一款产品的约束在生成。
+ */
+export function clearStructuredIntake(): void {
+  clearLocal(STRUCTURED_KIND)
+}
+
+// ---------------------------------------------------------------- 入口模式
+
+/**
+ * 入口模式（`structured` / `prd-shortcut` / `prompts-debug`）。
+ *
+ * 与 `viewState` **不同，这个是允许落本地的**：它是「用户选了哪套流程」这种偏好，
+ * 不是「服务端现在到哪一步了」那种状态（后者落了就会出现「服务端已完成、界面还在生成中」，
+ * 见 `types/index.ts` 里 `ViewState` 的警告）。刷新后按老入口继续，才不用重选一遍。
+ */
+export const ENTRY_MODE_KIND = 'entry-mode'
+
+export function readEntryMode(): string | null {
+  const value = readLocal<string>(ENTRY_MODE_KIND)
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+export function writeEntryMode(mode: string): void {
+  writeLocal(ENTRY_MODE_KIND, mode)
+}
+
 // ---------------------------------------------------------------- 会话（单一键）
 
 /**
