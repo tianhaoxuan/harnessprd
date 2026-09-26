@@ -12,7 +12,10 @@ import DocumentReview, {
 // （结构化录入）。`FormStep`（20 题逐题渲染）仍保留在仓库里，想切回去把下面这行换成
 // 默认导入、并把 `<StructuredForm .../>` 换回 `<FormStep .../>` 即可。
 import { type FormValues, validateForm } from './components/FormStep'
-import StructuredForm, { type StructuredSubmit } from './components/StructuredForm'
+import StructuredForm, {
+  summaryFromStoredDraft,
+  type StructuredSubmit,
+} from './components/StructuredForm'
 import RagHitsPanel from './components/RagHitsPanel'
 import SummaryDiffPanel, {
   diffSummaries,
@@ -25,6 +28,8 @@ import {
   describeApiError,
   extractStreamingMessage,
   generateApiDocsStream,
+  generatePrdWithReviewStream,
+  type PrdGenerationStage,
   generatePrdStream,
   generatePromptsStream,
   getDocumentPlan,
@@ -39,20 +44,28 @@ import {
 } from './services/api'
 import {
   clearFormDraft,
+  clearStructuredIntake,
   clearLocal,
   readFormDraft,
+  readEntryMode,
+  readStructuredIntake,
   readLocal,
   SESSION_KIND,
   writeFormDraft,
+  writeEntryMode,
+  writeStructuredIntake,
   writeLocal,
 } from './services/storage'
-import { downloadFile, safeFileName } from './services/download'
+import { downloadBlob, downloadFile, safeFileName } from './services/download'
+import { buildZip, splitPromptSuite, type ZipEntry } from './services/zip'
 import {
   STEPS,
   type ChatMessage,
   type ConversationTurn,
   type DocStatus,
   type QuestionsConfig,
+  ENTRY_MODES,
+  type EntryMode,
   type ViewState,
 } from './types'
 
@@ -579,6 +592,37 @@ export default function App() {
   const [ragBusy, setRagBusy] = useState(false)
   /** 用户确认过的检索片段，拼进 `known_info` 一起发给生成接口。 */
   const [ragExtras, setRagExtras] = useState('')
+  /**
+   * 双智能体生成 PRD 的**阶段**（由服务端 `stage` 事件给出，不是前端自己猜的）。
+   *
+   * 为什么非要有它：`reviewing`（审核）那一段**没有任何流式输出**，界面如果只写「生成中…」，
+   * 用户会以为卡死；`rewriting`（重写）时上一稿的正文必须**清空重来**，否则两稿会首尾拼
+   * 成一份前后矛盾的 PRD，而用户只会觉得「模型写歪了」。`done` 时 `issues` 非空表示
+   * 审核意见没改完就停了（重写有上限，防无限循环），必须显示出来。
+   */
+  const [prdStage, setPrdStage] = useState<PrdGenerationStage | null>(null)
+  /**
+   * 当前入口（三套流程）。
+   *
+   * 它**只影响显隐与跳转**，不改变任何生成逻辑：三条路最终都调同几个生成接口，
+   * 差别只在"前面那些步走不走"。所以切入口只是切 `viewState` 与步骤条，
+   * 不会出现"某个入口下生成规则不一样"这种第二套真相。
+   */
+  const [entryMode, setEntryMode] = useState<EntryMode>('structured')
+  /** 快捷入口里粘贴进来的 PRD 正文（确认后写进 `prd` 产物）。 */
+  const [importedPrd, setImportedPrd] = useState('')
+  /** 这份 PRD 是否已作为基准被接受 —— 只影响面板的显示与按钮态，不参与生成逻辑。 */
+  const [baselineAccepted, setBaselineAccepted] = useState(false)
+  /**
+   * 接受基准之后要**自动开起来**的那份产物（`null` = 没有待启动）。
+   *
+   * 为什么用标记 + effect 而不是当场直接调 `handleGenerateDocument()`：
+   * 同一次事件里 `writeDoc()` 还没落到 state 上，当场调用拿到的还是**旧的** prdContent（空），
+   * 后端会因缺 `prd_content` 返 422 —— 一个只在「点得快」时出现、极难查的 bug。
+   */
+  const [pendingAutoGenerate, setPendingAutoGenerate] = useState<DocKind | null>(null)
+  /** 正在打包 zip（打包要算 CRC + deflate，产物大时不是瞬间完成）。 */
+  const [bundleBusy, setBundleBusy] = useState(false)
   /** 防死循环：确认那一次要跳过检索闸门。 */
   const ragConfirmedRef = useRef(false)
   const [restoredDraft, setRestoredDraft] = useState(false)
@@ -783,6 +827,14 @@ export default function App() {
       setValues(loaded.data.form)
     }
 
+    // 结构化摘要与附加项是**内存态**，刷新就没 —— 恢复它们，否则「生成 PRD」
+    // 会静默退回没有双智能体审核的表单路径（实测踩过）。
+    const intake = readStructuredIntake()
+    if (intake) {
+      setStructuredSummary(intake.summary)
+      setStructuredExtras(intake.extras)
+    }
+
     setHydrated(true)
     setChatHydrated(true)
   }, [load.status])
@@ -798,9 +850,15 @@ export default function App() {
       // 就凭空造一个空草稿 key。
       if (Object.keys(values).length === 0) clearFormDraft()
       else writeFormDraft(values)
+
+      // 同一轮防抖里把结构化录入也落下：刷新之后仍能走「摘要 + 双智能体」那条路，
+      // 而不是悄悄退回没有审核的表单路径。
+      if (structuredSummary) {
+        writeStructuredIntake({ summary: structuredSummary, extras: structuredExtras })
+      }
     }, DRAFT_DEBOUNCE_MS)
     return () => window.clearTimeout(timer)
-  }, [values, hydrated])
+  }, [values, hydrated, structuredSummary, structuredExtras])
 
   // 每完成一轮落一次本地。
   // **不是每收一个 chunk 写一次** —— 流式期间 `messages` 不变（增量在 `streamingContent`），
@@ -1162,6 +1220,131 @@ export default function App() {
    */
   const showStartPrd = submitted !== null && messages.length > 0
   const canStartPrd = showStartPrd && dialogueFinished
+  /** 快捷入口（非结构化）下：进度条之外的步骤也要能进，见下面的入口条与可点击步骤条。 */
+  const shortcutMode = entryMode !== 'structured'
+
+  /**
+   * 切入口。
+   *
+   * 三套流程的「起点」不同，所以切过去要**把视图挪到该入口的第一步**：
+   * 否则会出现"选了快捷入口，界面还停在对话页"这种对不上的状态。
+   */
+  const chooseEntryMode = useCallback(
+    (mode: EntryMode) => {
+      setEntryMode(mode)
+      writeEntryMode(mode)
+      if (mode === 'structured') setViewState('form')
+      else if (mode === 'prd-shortcut') setViewState('review-prd')
+      else setViewState('review-prompts')
+      // 进快捷入口时把输入框预填成当前会话的 PRD（有的话），省一次粘贴
+      if (mode !== 'structured') setImportedPrd((prev) => prev || prdContent)
+      setBaselineAccepted(false)
+    },
+    [prdContent],
+  )
+
+  /** 步骤条点击：**自由推进**，不做前端门槛（不合条件的生成按钮自己会灰）。 */
+  const handleStepSelect = useCallback((next: ViewState) => setViewState(next), [])
+
+  /** 启动时恢复上次选的入口。 */
+  useEffect(() => {
+    const saved = readEntryMode()
+    if (saved === 'structured' || saved === 'prd-shortcut' || saved === 'prompts-debug') {
+      setEntryMode(saved)
+    }
+  }, [])
+  /**
+   * 这次生成能不能走「摘要 + 双智能体审核」那条路。
+   *
+   * 内存态摘要、或能从表单草稿重建出摘要，都算有。两个都没有时才为 false ——
+   * 那时界面必须**明说**这次没有审核，而不是让用户对着结果猜。
+   */
+  // 挂 `useMemo`：`summaryFromStoredDraft()` 是**同步读 localStorage**，
+  // 放在渲染路径上会让流式期间（每个 chunk 重渲一次）反复读存储。
+  // 依赖只有这两样，流式期间都不变 —— 增量在 `streamingDoc` 之类的 state 里。
+  const prdSummaryAvailable = useMemo(
+    () => structuredSummary !== null || summaryFromStoredDraft() !== null,
+    [structuredSummary, values],
+  )
+
+  /**
+   * 双智能体的阶段 / 结果标签。
+   *
+   * ⚠️ 它必须挂在**所有屏之上**（顶部提示区，与 `notice` 同一处）：生成 PRD 有**两个**
+   * 入口 —— 对话步的「生成 PRD」和产物页底部的「重新生成」（`docActionsFor`）。
+   * 只挂在对话步按钮旁的话，用户在 PRD 页点重新生成时就什么都看不到（实测被抓到）。
+   *
+   * 显示条件：有阶段事件（正在跑 / 刚跑完），或者"这次没有审核"这件事需要告知
+   * （正在生成，或屏幕上已经有 PRD）。终态标签额外要求**屏幕上确有 PRD** ——
+   * 否则状态一残留它就在骗人。
+   */
+  const showPrdStatus =
+    prdStage !== null || (!prdSummaryAvailable && (isGenerating || Boolean(prdContent)))
+  const prdStatusBadges = showPrdStatus ? (
+    <div className="flex flex-wrap items-center gap-2">
+      {prdStage && prdStage.stage !== 'done' ? (
+        <span
+          data-testid="prd-stage"
+          className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs text-slate-600"
+        >
+          {prdStage.stage === 'reviewing' ? (
+            <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+          ) : null}
+          {prdStage.stage === 'writing'
+            ? `双智能体：正在写第 ${prdStage.round ?? 1} 稿…`
+            : prdStage.stage === 'reviewing'
+              ? '写完了，正在审核（这一步没有正文输出，属正常）…'
+              : `审核提了 ${prdStage.issues?.length ?? 0} 条问题，正在重写…`}
+        </span>
+      ) : null}
+      {prdStage?.stage === 'done' && prdStage.review_skipped ? (
+        <span
+          data-testid="prd-stage-skipped"
+          className="rounded-md border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs text-amber-700"
+        >
+          审核没跑成：审核员的输出无法解析（或缺问题清单），已按通过处理 ——
+          这一稿实际上没经过质检，请自己过一遍。
+          {prdStage.review_model ? `（原本要用的审核模型：${prdStage.review_model}）` : ''}
+        </span>
+      ) : null}
+      {prdStage?.stage === 'done' &&
+      (prdStage.issues?.length ?? 0) === 0 &&
+      !prdStage.review_skipped &&
+      prdContent ? (
+        <span
+          data-testid="prd-stage-passed"
+          className="rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs text-emerald-700"
+        >
+          双智能体：写作 → 审核通过，没有发现问题。
+          {prdStage.review_model ? `（审核模型：${prdStage.review_model}）` : ''}
+        </span>
+      ) : null}
+      {prdStage?.stage === 'done' &&
+      (prdStage.issues?.length ?? 0) > 0 &&
+      prdContent ? (
+        <span
+          data-testid="prd-stage-issues"
+          className="rounded-md border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs text-amber-700"
+        >
+          PRD 已生成，但审核还有 {prdStage.issues?.length} 条意见没改完（重写有上限，
+          改满一轮就停，避免无限循环）：
+          {(prdStage.issues ?? [])
+            .map((issue) => issue.problem ?? issue.section ?? '未描述')
+            .join('；')}
+          {prdStage.review_model ? `（审核模型：${prdStage.review_model}）` : ''}
+        </span>
+      ) : null}
+      {!prdSummaryAvailable ? (
+        <span
+          data-testid="prd-no-review"
+          className="rounded-md border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs text-amber-700"
+        >
+          这次没有双智能体审核：结构化摘要和表单草稿都没有，只能走表单路径（没有任何质检）。
+          填一次结构化表单就会带上 Writer 和 Reviewer 两个智能体。
+        </span>
+      ) : null}
+    </div>
+  ) : null
 
   /**
    * 生成一份产物。
@@ -1263,6 +1446,17 @@ export default function App() {
         onDone: (meta: StreamChunkMeta) => {
           if (meta.truncated === true) truncatedAnyPart = true
         },
+        /**
+         * 双智能体的阶段事件。**重写时必须清空这一片的缓冲** —— 重写是从零重写的，
+         * 不清空就会把旧稿和新稿拼在一起。
+         */
+        onStage: (stage: PrdGenerationStage) => {
+          setPrdStage(stage)
+          if (stage.stage === 'rewriting') {
+            docPartialRef.current = ''
+            setStreamingDoc('')
+          }
+        },
       }
 
       try {
@@ -1270,6 +1464,8 @@ export default function App() {
         // **切分规则由服务端给**（它解析提示词文件得出，那是章节清单的唯一真相），
         // 前端只负责循环与拼接。计划拿不到就是拿不到：这里**不回退成"整份生成"** ——
         // 那会让接口文档与套件悄悄变回被截断的残文档，而界面上看不出任何区别（坑 #18）。
+        // 每次生成都从「没有阶段」起步，否则上一次的审核意见会挂在新稿上。
+        if (kind === 'prd') setPrdStage(null)
         const plan = await getDocumentPlan(kind)
         setDocProgress({ kind, total: plan.parts.length, part: 0, label: plan.source })
 
@@ -1281,10 +1477,29 @@ export default function App() {
           docPartialRef.current = ''
           setStreamingDoc('')
           const scope = { outline: part.outline, scope: part.scope, spec: part.spec }
+          // 摘要不在时**从表单草稿重建**：摘要是内存态，刷新就没，而它决定要不要走
+          // 双智能体审核 —— 不重建就会静默退回没有审核的表单路径（实测踩过）。
+          const prdSummary = structuredSummary ?? summaryFromStoredDraft()
           // 三个分支各自直接调用（而不是先拼一个 request 再 as 断言）：
           // `kind` 是判别联合的判别式，分开写才有类型收窄，也免掉三处 `as`。
           if (kind === 'prd') {
-            pieces.push(await generatePrdStream({ ...context, scope }, options))
+            // 优先走「结构化摘要 + 对话历史」这条路（A/B 实测覆盖 14/14，
+            // 优于只给摘要的 11/14、也优于表单版的 13/14）。
+            // 没有摘要时（没走结构化录入）回落到表单 + known_info 那条。
+            //
+            // 走的是**双智能体**版（Writer 写初稿 → Reviewer 审核 → 有问题自动重写，
+            // 上限 1 次）：实测审核通过 2 次调用 / 5.6 秒，触发重写 3 次调用 / 10.5 秒。
+            // 代价是慢一倍，换来的是「编造的约束」这类问题在交付前就被拦掉——
+            // 实测确实拦到过两条凭空捏造的约束。
+            pieces.push(
+              prdSummary
+                ? await generatePrdWithReviewStream(
+                    prdSummary,
+                    messages.map((message) => ({ role: message.role, content: message.content })),
+                    options,
+                  )
+                : await generatePrdStream({ ...context, scope }, options),
+            )
           } else if (kind === 'api') {
             pieces.push(
               await generateApiDocsStream({ ...context, prd_content: prdContent, scope }, options),
@@ -1346,7 +1561,7 @@ export default function App() {
         }
       }
     },
-    [isGenerating, prdContent, apiDocsContent, messages, submitted, writeDoc],
+    [isGenerating, prdContent, apiDocsContent, messages, submitted, structuredSummary, writeDoc],
   )
 
   // ---------------------------------------------------------------- 对话 → 摘要回填
@@ -1365,7 +1580,10 @@ export default function App() {
    * - 回填成功 → 打开 diff 面板，等用户的 `确认/拒绝`（见 `applySummaryChanges()`）。
    */
   const handleGeneratePrdWithSync = useCallback(async () => {
-    if (!structuredSummary || messages.length === 0) {
+    // 摘要优先用内存态；内存态没有（刷新过）就用表单草稿重建 —— 否则会静默走
+    // 没有双智能体审核的表单路径。
+    const base = structuredSummary ?? summaryFromStoredDraft()
+    if (!base || messages.length === 0) {
       void handleGenerateDocument('prd')
       return
     }
@@ -1374,10 +1592,10 @@ export default function App() {
     setSummarySyncError(null)
     try {
       const result = await syncSummaryFromConversation(
-        structuredSummary,
+        base,
         messages.map((message) => ({ role: message.role, content: message.content })),
       )
-      const changes = diffSummaries(structuredSummary, result.summary)
+      const changes = diffSummaries(base, result.summary)
       setPendingSummary({ changes })
       if (changes.length === 0) {
         // 没有可回填的内容：不留一个空面板，直接说明并生成
@@ -1392,7 +1610,7 @@ export default function App() {
     } finally {
       setSummarySyncBusy(false)
     }
-  }, [structuredSummary, messages, handleGenerateDocument])
+  }, [structuredSummary, messages, values, handleGenerateDocument])
 
   /**
    * diff 面板的「确认更新」：把**用户勾选的那几条**写回摘要，然后才开始生成。
@@ -1421,7 +1639,7 @@ export default function App() {
         }
         acc[root] = list
         return acc
-      }, structuredSummary ? { ...structuredSummary } : {})
+      }, { ...(structuredSummary ?? summaryFromStoredDraft() ?? {}) })
 
       setStructuredSummary(next)
       // 摘要变了 → `known_info` 也要跟着变，否则用户确认的修正进不了提示词
@@ -1429,7 +1647,7 @@ export default function App() {
       setPendingSummary(null)
       void handleGenerateDocument('prd')
     },
-    [structuredSummary, handleGenerateDocument],
+    [structuredSummary, values, handleGenerateDocument],
   )
 
   /** 「拒绝更改」：摘要一字不动，照常生成（用户只是不接受这次回填）。 */
@@ -1612,11 +1830,20 @@ export default function App() {
    */
   const downloadNameFor = useCallback(
     (kind: DocKind): string => {
-      const productName = (submitted?.product_name ?? '').trim()
+      // 快捷入口**没有表单作答**（`submitted` 为空），产品名要从**导入的 PRD 标题**里取
+      // （第一个 `# ` 标题），否则下载名会退化成光秃秃的 `PRD.md`，
+      // 与「产品名称-文档类型」的约定不符。
+      // 末尾的 `PRD` / `产品需求文档` 去掉：那是文档类型，不是产品名。
+      const heading = /^#\s+(.+)$/m.exec(prdContent)?.[1]?.trim() ?? ''
+      const fromPrd = heading
+        .replace(/\s*PRD\s*$/i, '')
+        .replace(/产品需求文档$/, '')
+        .trim()
+      const productName = (submitted?.product_name ?? '').trim() || fromPrd
       const stem = DOC_META[kind].fileStem
       return `${productName ? `${safeFileName(productName)}-${stem}` : stem}.md`
     },
-    [submitted],
+    [submitted, prdContent],
   )
 
   /**
@@ -1627,7 +1854,7 @@ export default function App() {
    * 在某些浏览器里还可能被当成路径分隔符。
    *
    * ⚠️ 提示词套件是**多文件**产物（`=== FILE: ===` 分隔），这里**整体下一个文件**，
-   * 分隔行原样保留 —— 按文件拆开是尚未实现的那条待办（见 README）。
+   * 分隔行原样保留 —— 想按文件拆开请用上面的「打包下载三份产物」（zip 里会拆成单文件）。
    */
   const handleDownloadDocument = useCallback(
     (kind: DocKind) => {
@@ -1641,6 +1868,73 @@ export default function App() {
     [readDoc, downloadNameFor],
   )
 
+  /**
+   * 一键打包下载三份产物（zip）。
+   *
+   * 三个刻意的决定：
+   * 1. **提示词套件按 `=== FILE: ===` 拆成单个文件**放进 zip —— 它本来就是
+   *    "多文件产物"，整份下下来还得让用户自己手动切；拆不出来（老产物没有分隔行）
+   *    就整份放一个文件，并在通知里如实说明。
+   * 2. **没有的产物不占位、也不失败**：只打包已有的，通知里点名"还没生成的是哪几份"。
+   *    直接失败会被当成按钮坏了；静默少文件则会被当成产物齐了。
+   * 3. **打包在本地做**（见 `services/zip.ts`）：离线可用，也不把产物再传回服务端。
+   */
+  const handleDownloadBundle = useCallback(() => {
+    const folder = safeFileName((submitted?.product_name ?? '').trim(), 'harnessprd-产物')
+    const entries: ZipEntry[] = []
+    const missing: DocKind[] = []
+    let suiteNote = ''
+    for (const kind of DOC_ORDER) {
+      const content = readDoc(kind).trim()
+      if (!content) {
+        missing.push(kind)
+        continue
+      }
+      if (kind === 'prompts') {
+        const files = splitPromptSuite(content)
+        if (files.length > 0) {
+          for (const file of files) {
+            entries.push({
+              path: `${folder}/${DOC_META.prompts.fileStem}/${file.path}`,
+              content: file.content,
+            })
+          }
+          suiteNote = `提示词套件拆成 ${files.length} 个文件`
+          continue
+        }
+        suiteNote = '提示词套件没有分隔行，整份存放'
+      }
+      entries.push({ path: `${folder}/${DOC_META[kind].fileStem}.md`, content })
+    }
+    if (entries.length === 0) {
+      setNotice({ text: '三份产物都还没有内容，没有可打包的东西。', warn: true })
+      return
+    }
+    setBundleBusy(true)
+    void (async () => {
+      try {
+        const bytes = await buildZip(entries)
+        downloadBlob(
+          `${folder}-三份产物.zip`,
+          new Blob([bytes as BlobPart], { type: 'application/zip' }),
+        )
+        setNotice({
+          text:
+            `已打包 ${entries.length} 个文件（${(bytes.length / 1024).toFixed(1)} KB` +
+            `${suiteNote ? '，' + suiteNote : ''}）；` +
+            (missing.length > 0
+              ? `还没生成：${missing.map((k) => DOC_META[k].title).join('、')}`
+              : '三份产物齐全'),
+          warn: missing.length > 0,
+        })
+      } catch (error) {
+        setNotice({ text: `打包失败：${describeApiError(error)}`, warn: true })
+      } finally {
+        setBundleBusy(false)
+      }
+    })()
+  }, [readDoc, submitted])
+
   /** 用户编辑产物正文。 */
   const handleDocChange = useCallback(    (kind: DocKind, content: string) => {
       writeDoc(kind, content)
@@ -1649,6 +1943,45 @@ export default function App() {
     },
     [writeDoc],
   )
+
+  /**
+   * 快捷入口把**外部 PRD** 当基准：写进 `prd` 产物并直接标记「已通过」。
+   *
+   * 为什么可以直接算通过：这份 PRD 是用户给定的事实输入，不是本工具生成的产物 ——
+   * 链条约束要求的只是「有 PRD 可读」。把它挂到「必须由本工具生成并通过」上，
+   * 快捷入口就永远推不动（这正是它要省掉的那段流程）。
+   * 提示词调试入口连接口文档也一并算通过：后端允许 `api_content` 缺失并填「（尚无）」。
+   */
+  const handleImportPrdAsBaseline = useCallback(() => {
+    const text = importedPrd.trim()
+    if (!text) return
+    writeDoc('prd', text)
+    setApprovedDocs((prev) => ({
+      ...prev,
+      prd: true,
+      ...(entryMode === 'prompts-debug' ? { api: true } : {}),
+    }))
+    setNotice({ text: `已把 ${text.length} 字符的 PRD 作为基准（跳过表单与对话澄清）。`, warn: false })
+    setBaselineAccepted(true)
+    // "并继续"就该**真的继续**：把该入口要生成的那份产物挂成待启动，
+    // 等 PRD 落到 state 之后由下面的 effect 开起来。
+    // （接口文档那一步会先弹 RAG 检索结果让你逐条确认 —— 那是有意保留的人工关口。）
+    if (entryMode === 'prompts-debug') {
+      setViewState('review-prompts')
+      setPendingAutoGenerate('prompts')
+    } else {
+      setViewState('review-api-docs')
+      setPendingAutoGenerate('api')
+    }
+  }, [importedPrd, entryMode, writeDoc])
+
+  /** 待启动的那份产物：等 PRD 内容真的就绪再开（见 `pendingAutoGenerate` 的说明）。 */
+  useEffect(() => {
+    if (!pendingAutoGenerate) return
+    if (!prdContent.trim()) return
+    setPendingAutoGenerate(null)
+    void handleGenerateDocument(pendingAutoGenerate)
+  }, [pendingAutoGenerate, prdContent, handleGenerateDocument])
 
   /**
    * 「重新开始」：把这一轮的东西全清掉，回到表单。
@@ -1687,6 +2020,18 @@ export default function App() {
     setStreamingDoc('')
     setIsGenerating(false)
     setGeneratingKind(null)
+    // ⚠️ 双智能体阶段是**上一次生成**的痕迹：不清就会在还没开始生成 PRD 时
+    // 挂着「审核通过」（实测被用户当场抓到）。同一批会话态一起清：
+    // 摘要/附加项/待确认项都属于这一轮，留着会让下一轮悄悄继承旧输入。
+    setPrdStage(null)
+    setStructuredSummary(null)
+    setStructuredExtras('')
+    setSummaryExtras('')
+    setRagExtras('')
+    setPendingSummary(null)
+    setPendingRag(null)
+    setSummarySyncError(null)
+    clearStructuredIntake()
     setViewState('form')
     clearFormDraft()
     clearSession()
@@ -1749,7 +2094,13 @@ export default function App() {
       const stage = STAGE_ACTIONS[kind]
       const status = statusFor(kind)
       const approved = approvedDocs[kind]
-      const upstreamReady = stage.upstream === null || approvedDocs[stage.upstream]
+      // 提示词调试入口要「跳过前置流程」：不拿「接口文档已通过」当门槛，
+      // 只要求**真的有 PRD 文本可读** —— 后端 422 的判据也只有这一条，
+      // 前端不另立一套（两套判据必然漂移）。
+      const upstreamReady =
+        stage.upstream === null ||
+        approvedDocs[stage.upstream] ||
+        (entryMode === 'prompts-debug' && stage.upstream === 'api' && Boolean(prdContent))
       const hasContent = status !== 'not_started'
       const actions: DocumentAction[] = []
 
@@ -1808,10 +2159,13 @@ export default function App() {
 
       return actions
     },
-    [statusFor, approvedDocs, handleApproveDocument, handleGenerateDocument, handleEndTask, viewState],
+    [statusFor, approvedDocs, handleApproveDocument, handleGenerateDocument, handleEndTask, viewState, entryMode, prdContent],
   )
 
   const showDone = load.status === 'ok' && viewState === 'done'
+  /** 只要有一份产物有内容就给打包入口 —— 不要求三份齐全（缺哪份会在通知里点名）。 */
+  const showBundleButton =
+    load.status === 'ok' && DOC_ORDER.some((kind) => readDoc(kind).trim().length > 0)
 
   return (
     <div className="mx-auto flex min-h-full max-w-3xl flex-col gap-6 p-8">
@@ -1833,7 +2187,11 @@ export default function App() {
         )}
       </header>
 
-      <StepProgress viewState={viewState} />
+      <StepProgress
+        viewState={viewState}
+        entryMode={entryMode}
+        onSelect={handleStepSelect}
+      />
 
       {/* 恢复提示放在**所有屏之上**：现在恢复的可能是任意一屏（某个产物的审核页 / done /
           对话页），只挂在对话页上的话大部分时候都看不到。
@@ -1851,6 +2209,57 @@ export default function App() {
           {notice.text}
         </p>
       )}
+
+      {/* 双智能体阶段与结果也放**所有屏之上**，理由同上面的恢复提示：
+          生成 PRD 有两个入口（对话步按钮 / 产物页「重新生成」），只挂一处必然有看不到的时候。 */}
+      {prdStatusBadges}
+
+      {/* 三个入口。放在**所有屏之上**：随时可切，且切换时把视图带到该入口的第一步。 */}
+      <div
+        data-testid="entry-mode-bar"
+        className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2"
+      >
+        <span className="text-xs text-slate-400">入口</span>
+        {ENTRY_MODES.map((mode) => (
+          <button
+            key={mode.id}
+            type="button"
+            data-testid={`entry-mode-${mode.id}`}
+            onClick={() => chooseEntryMode(mode.id)}
+            title={mode.hint}
+            className={[
+              'rounded-md border px-2.5 py-1 text-xs transition',
+              entryMode === mode.id
+                ? 'border-primary-300 bg-primary-50 font-medium text-primary-800'
+                : 'border-slate-200 bg-white text-slate-500 hover:text-slate-700',
+            ].join(' ')}
+          >
+            {mode.label}
+          </button>
+        ))}
+        <span data-testid="entry-mode-hint" className="text-xs text-slate-400">
+          {ENTRY_MODES.find((mode) => mode.id === entryMode)?.hint}
+        </span>
+      </div>
+
+      {/* 打包下载也放**所有屏之上**：产物可能分散在三步里看，用户不该为了下载而先跳回去。 */}
+      {showBundleButton ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            data-testid="download-bundle"
+            onClick={handleDownloadBundle}
+            disabled={bundleBusy}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-slate-800 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-slate-900 disabled:cursor-not-allowed disabled:bg-slate-300"
+          >
+            {bundleBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : null}
+            {bundleBusy ? '正在打包…' : '打包下载三份产物（.zip）'}
+          </button>
+          <span data-testid="bundle-hint" className="text-xs text-slate-400">
+            只打包已有内容；提示词套件会按 `=== FILE: ===` 拆成单个文件。
+          </span>
+        </div>
+      ) : null}
 
       {load.status === 'loading' && (
         <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-500 shadow-sm">
@@ -2015,6 +2424,67 @@ export default function App() {
               </span>
             </div>
           )}
+        </section>
+      )}
+
+      {/* 快捷入口的 PRD 输入框要跟着**该入口的第一步**走：PRD 快捷入口落在 PRD 步，
+          提示词调试入口直接落在提示词步 —— 只认 `activeDoc === 'prd'` 的话，
+          后者永远看不到粘贴框（实测被用户问到）。 */}
+      {load.status === 'ok' &&
+      shortcutMode &&
+      (activeDoc === 'prd' || entryMode === 'prompts-debug') && (
+        <section
+          data-testid="prd-import"
+          className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm"
+        >
+          <h2 className="text-sm font-medium text-slate-800">
+            {entryMode === 'prd-shortcut'
+              ? 'PRD 快捷入口：把你的 PRD 贴进来当基准'
+              : '提示词调试入口：贴一份 PRD 当输入'}
+          </h2>
+          <p className="mt-1 text-xs text-slate-500">
+            {entryMode === 'prd-shortcut'
+              ? '跳过表单与对话澄清。确认之后先生成接口文档（那一步会先做 RAG 检索：接口规范 + 历史接口示例，由你逐条确认），再生成提示词套件。'
+              : '跳过前面的全部流程。提示词套件必须吃 PRD（后端缺 prd_content 会 422），接口文档可以留空（后端填「（尚无）」）。'}
+          </p>
+          <textarea
+            data-testid="prd-import-textarea"
+            value={importedPrd}
+            onChange={(event) => {
+              setImportedPrd(event.target.value)
+              // 内容变了就不再是「已确认」的那一份，按钮要能再点一次
+              setBaselineAccepted(false)
+            }}
+            rows={8}
+            placeholder="把已有 PRD 的 Markdown 全文粘贴到这里…"
+            className="mt-3 w-full rounded-lg border border-slate-200 p-3 font-mono text-xs text-slate-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400"
+          />
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              data-testid="prd-import-confirm"
+              onClick={handleImportPrdAsBaseline}
+              disabled={!importedPrd.trim() || baselineAccepted}
+              className="rounded-lg bg-primary-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-primary-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+            >
+              {baselineAccepted ? '已作为基准 ✓' : '作为基准并继续'}
+            </button>
+            <button
+              type="button"
+              data-testid="prd-import-load"
+              onClick={() => setImportedPrd(prdContent)}
+              disabled={!prdContent.trim()}
+              className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs text-slate-600 transition hover:text-slate-800 disabled:cursor-not-allowed disabled:text-slate-300"
+            >
+              载入当前会话的 PRD
+            </button>
+            <span className="text-xs text-slate-400">{importedPrd.trim().length} 字符</span>
+            {baselineAccepted ? (
+              <span data-testid="prd-baseline-state" className="text-xs text-emerald-600">
+                已作为基准，正在按这个入口往下走（想改内容就再编辑一次上面的文本）。
+              </span>
+            ) : null}
+          </div>
         </section>
       )}
 
