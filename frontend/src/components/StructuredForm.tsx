@@ -920,6 +920,14 @@ function Section({ index, title, summary, open, onToggle, children }: SectionPro
 export interface StructuredSubmit {
   form: FormValues
   extras: string
+  /**
+   * 结构化摘要（与 `field-schema.json` 同形）。
+   *
+   * 上层要用它做**对话回填**：澄清结束后把这份摘要 + 对话历史交给服务端，
+   * 拿到"更新后的摘要"，让用户确认后再生成 PRD。所以这份摘要的**所有权在上层**，
+   * 表单只是把它算出来并交出去（表单自己不持有它，也就不存在两份真相）。
+   */
+  summary: Record<string, unknown>
 }
 
 interface StructuredFormProps {
@@ -1054,7 +1062,11 @@ export default function StructuredForm({ onSubmit, submitting = false }: Structu
     }
     const request = buildRequest(summary)
     // 草稿**不清**：用户从对话步退回来时，填过的东西还在
-    onSubmit({ form: request.form, extras: request.known_info })
+    onSubmit({
+      form: request.form,
+      extras: request.known_info,
+      summary: summary.schemaPayload as Record<string, unknown>,
+    })
   }, [validation, summary, onSubmit])
 
   /** 面板标题右侧的"已填几条"。名字叫 countLabel 而不是 summary —— 后者已被解析结果占用。 */

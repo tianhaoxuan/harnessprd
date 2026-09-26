@@ -66,6 +66,80 @@ export async function getDocumentPlan(kind: DocKind): Promise<DocumentPlan> {
 }
 
 /**
+ * 把对话里**用户明确说过**的补充与修正回填进结构化摘要。
+ *
+ * ⚠️ 这是**非流式**接口（与 `generate-*-stream` 不同）：输出是一小段 JSON，
+ * 调用方要拿整份结构做 diff，流式没意义、半截 JSON 也没法用。
+ * 服务端在模型给出不可解析的 JSON 时返回 **502**，不会返回半个摘要。
+ *
+ * `summary` 传的是**当前**结构化摘要（与 `field-schema.json` 同形），
+ * 服务端只做合并：没返回的键保持原值、空值一律不写、schema 之外的键丢弃。
+ */
+export async function syncSummaryFromConversation(
+  summary: Record<string, unknown>,
+  history: Array<{ role: 'user' | 'ai'; content: string }>,
+): Promise<SyncSummaryResult> {
+  const { data } = await http.post<{
+    summary: Record<string, unknown>
+    changed: string[]
+    dropped_keys: string[]
+    truncated: boolean
+    finish_reason: string | null
+  }>('/conversation/sync-summary-from-conversation', { summary, history })
+  return {
+    summary: data.summary,
+    changed: data.changed,
+    droppedKeys: data.dropped_keys,
+    truncated: data.truncated,
+    finishReason: data.finish_reason,
+  }
+}
+
+/** 回填结果。字段名转成 camelCase，转换点只有上面那一处。 */
+export interface SyncSummaryResult {
+  /** 更新后的**完整**摘要（未改动的字段原样带回） */
+  summary: Record<string, unknown>
+  /** 内容变化的顶层字段名 */
+  changed: string[]
+  /** 模型自己发明、被服务端丢掉的键（正常为空） */
+  droppedKeys: string[]
+  truncated: boolean
+  finishReason: string | null
+}
+
+/** 一条检索命中（服务端字段转成 camelCase）。 */
+export interface RagHit {
+  /** 来源，仓库相对路径 */
+  source: string
+  /** 类别：`规范` 或 `历史接口示例` */
+  kind: string
+  /** 块标题（Markdown 标题路径） */
+  title: string
+  /** 块正文，可直接拼进提示词 */
+  content: string
+  /** 相关度（越大越相关；绝对值没有意义） */
+  score: number
+}
+
+/**
+ * 检索接口文档相关的规范与历史示例。
+ *
+ * ⚠️ 服务端是**词法检索（BM25 近似）**，不是向量检索：查询与语料**用词重合**时才召回。
+ * 不调模型（所以不花钱、也不需要配 Key），空结果是正常结果。
+ */
+export async function retrieveApiDocsRag(
+  prdContent: string,
+  history: Array<{ role: 'user' | 'ai'; content: string }>,
+  topK = 6,
+): Promise<{ hits: RagHit[]; corpusSize: number }> {
+  const { data } = await http.post<{ hits: RagHit[]; corpus_size: number }>(
+    '/conversation/retrieve-api-docs-rag',
+    { prd_content: prdContent, history, top_k: topK },
+  )
+  return { hits: data.hits, corpusSize: data.corpus_size }
+}
+
+/**
  * 把 axios 的错误转成能直接显示给用户的一句话。
  *
  * axios 的错误对象结构复杂（`error.message` 对 4xx/5xx 只会说 "Request failed with status code 404"，

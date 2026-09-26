@@ -48,20 +48,30 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import math
+import re
+from collections import Counter
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 from core.config import Settings, get_settings
-from core.prompts import build_system_prompt, declared_placeholders, render_prompt_text
+from core.prompts import (
+    build_system_prompt,
+    declared_placeholders,
+    load_prompt,
+    render_prompt_text,
+)
 from core.questions import load_questions
 from services.conversation_service import format_form_data, message_text
-from services.llm import StreamOutcome, finish_reason_of
+from services.llm import StreamOutcome, finish_reason_of, is_truncated
 from services.llm_factory import get_llm
 from services.prompts import (
     API_DOCS_GENERATION_PROMPT,
@@ -108,6 +118,9 @@ SKILL_PRD_DIR = "prd-generator"
 # 常量放这里，那边 import 过去，避免同一个路径写两遍（改一处漏一处的老问题）。
 SKILL_PRD_TEMPLATE = "references/prd-template.md"
 
+# 技能包的输入契约。回填摘要时要把它的**原文**注入 human message（字段集合的唯一真相）。
+SKILL_PRD_FIELD_SCHEMA = "references/field-schema.json"
+
 # 组装 PRD 技能 system prompt 时读取的文件，**顺序即拼接顺序**：
 # 先工作流（做什么、按什么顺序做），再模板（输出什么结构），再写作规则（怎么写），
 # 最后输入契约（字段定义）。与 `gen_common + gen_*` 的"基线在前、产物专属在后"同一条道理。
@@ -130,6 +143,447 @@ SKILL_PRD_HUMAN_TEMPLATE = (
     "用户跳过的项（必须原样落进文档，并在原处标注 [待确认]）：\n{open_questions}\n\n"
     "已发现的矛盾及其结论：\n{conflicts}\n"
 )
+
+# ---------------------------------------------------------------- 对话 → 结构化摘要回填
+
+# 回填用的 system prompt 名。规则（只回填、四不改、完整返回）都在这个文件里，
+# **不在这里再写一遍** —— 提示词只有一份真相（HANDOFF.md §4 坑 #10）。
+SYNC_SUMMARY_PROMPT = "sync_summary"
+
+# 回填的 human message 模板。
+# `{field_schema}` 注入的是 `field-schema.json` 的**原文**，而不是在 Python 里再列一遍字段：
+# 字段集合必须只有一处真相，否则提示词与 schema 必然漂移（同上坑 #10）。
+SYNC_SUMMARY_HUMAN_TEMPLATE = (
+    "字段定义（唯一真相，键名以此为准）：\n\n{field_schema}\n\n"
+    "当前结构化需求摘要：\n\n{current_summary}\n\n"
+    "对话历史（按时间正序）：\n\n{conversation}\n\n"
+    "按上面的规则回填，只输出更新后的**完整**摘要 JSON。"
+)
+
+
+# ---------------------------------------------------------------- 从结构化摘要直接生成 PRD
+
+# 这条路径的 human message：输入是**结构化摘要**（8 字段），而不是 20 题表单作答。
+# 约束写在这里而不是散进提示词文件：它是"这一次调用"的指令（同 `GEN_HUMAN_TEMPLATE` 的定位），
+# 而产物结构、写作规则仍然全部来自技能包那三份文件（system prompt 负责）。
+#
+# ⚠️ 占位符必须**全部**被 `_build_prd_from_summary_prompt()` 注入 —— 少一个就会以字面量
+# 进提示词，而模型看到 `{summary_json}` 这种字样照样能写出像样的结果（坑 #11）。
+PRD_FROM_SUMMARY_HUMAN_TEMPLATE = (
+    "结构化需求摘要（本次生成的**唯一**输入）：\n\n{summary_json}\n\n"
+    "对话历史（可选，仅用于理解摘要里没写全的措辞）：\n\n{conversation}\n\n"
+    "生成约束（优先级高于上面所有内容）：\n\n"
+    "1. **只用用户提供的信息**。摘要与对话里没有的事实，一律不要补。\n"
+    "2. **不要编造**：不写没给过的业务规则、角色权限、数据实体、指标数值、\n"
+    "   外部依赖、时间计划。\n"
+    "3. **缺失就标 `[待确认]`**：某一章或某一项在输入里找不到出处时，就地标注 `[待确认]`\n"
+    "   并说明缺什么，不要用邻近内容顶替、也不要留空标题。\n"
+    "4. 摘要字段与 PRD 章节的对应关系、每章必含子项、写作规范，全部按上面提供的技能包执行。\n"
+)
+
+
+def _build_prd_from_summary_prompt(
+    summary: Mapping[str, Any], history: Sequence[Mapping[str, str]] = ()
+) -> str:
+    """把结构化摘要（+ 可选对话历史）渲染成 PRD 生成的 human message。
+
+    与 `SKILL_PRD_HUMAN_TEMPLATE` 的分工：那个吃的是"20 题表单 + 对话确认信息"，
+    这个吃的是**已经结构化的 8 字段摘要** —— 后者本就与技能包的输入契约同形，
+    所以不再需要模型自己从表单文本里对字段（少一层有损转换）。
+
+    摘要用**缩进 JSON** 原样给出，不做二次加工：字段名就是技能包 schema 的字段名，
+    模型照着 schema 找值即可；任何"帮它翻译一下"的改写都可能丢字段。
+    """
+    return render_prompt_text(
+        PRD_FROM_SUMMARY_HUMAN_TEMPLATE,
+        {
+            "summary_json": json.dumps(summary, ensure_ascii=False, indent=2),
+            "conversation": _render_conversation(history),
+        },
+    )
+
+
+class SummarySyncError(RuntimeError):
+    """回填失败：模型没给出可解析的 JSON 对象。
+
+    刻意不返回"半个摘要"：调用方要靠整份结构做 diff，残缺的结果会让前端显示一堆假改动。
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class SummarySyncResult:
+    """回填结果。**摘要本体 + 便于前端做 diff 与排查的元信息**。"""
+
+    summary: dict[str, Any]
+    """更新后的完整摘要（已按 schema 过滤、已按规则保住原值）。"""
+
+    changed: tuple[str, ...]
+    """内容发生变化的**顶层字段名**（前端可直接高亮这几项）。"""
+
+    dropped_keys: tuple[str, ...]
+    """模型自己发明、被我们丢掉的键（规则 3 的硬保证）。正常应为空，非空说明提示词没被遵守。"""
+
+    truncated: bool
+    """输出是否撞上单次上限被截断。截断时 JSON 多半也不完整，会先抛 `SummarySyncError`。"""
+
+    finish_reason: str | None
+    """厂商原话（`stop` / `length` …），排查用。"""
+
+
+def _is_blank(value: Any) -> bool:
+    """空值判定：`None` / 空串 / 空数组 / 空对象都算空。
+
+    `False` 与 `0` **不算空** —— 虽然本摘要里几乎没有布尔与数字，但这符合直觉且不会被误判。
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, dict, tuple)):
+        return len(value) == 0
+    return False
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    """从模型输出里抠出**第一个完整的 JSON 对象**。
+
+    只做两件事，都不猜内容：
+    1. 去掉 ```` ```json ```` 围栏（模型很爱加，而围栏会让整体 `json.loads` 失败）；
+    2. 从第一个 `{` 起用 `raw_decode` 解析 —— 它能**在 JSON 结束处停下**，
+       所以后面的解释文字不会影响解析（比"找最后一个 `}`"稳得多，正文里出现 `}` 也不会崩）。
+
+    Raises:
+        SummarySyncError: 找不到 `{`，或解析失败。错误信息带上输出开头，便于定位。
+    """
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        # ```json\n{...}\n``` → 取第一行之后到最后一个 ``` 之前
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+
+    start = stripped.find("{")
+    if start < 0:
+        raise SummarySyncError(f"模型输出里没有 JSON 对象，开头是：{stripped[:120]!r}")
+
+    try:
+        parsed, _end = json.JSONDecoder().raw_decode(stripped[start:])
+    except json.JSONDecodeError as exc:
+        raise SummarySyncError(
+            f"模型输出不是合法 JSON：{exc.msg}（位置 {exc.pos}），开头是：{stripped[start:start + 120]!r}"
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise SummarySyncError(f"模型输出的 JSON 不是对象，而是 {type(parsed).__name__}")
+    return parsed
+
+
+def _allowed_keys(schema: Mapping[str, Any]) -> tuple[set[str], dict[str, set[str]]]:
+    """从 `field-schema.json` 取出**顶层允许的键**，以及**数组元素允许的键**。
+
+    元素级也要取：`mvp_features` / `ui_pages` 的元素写的是 `additionalProperties: false`，
+    模型很可能顺手加个 `user_value`、`modules` 之类的键 —— 那些会让这份 JSON 不再符合 schema。
+
+    返回 `(顶层键集合, {顶层键: 元素允许键集合})`；解析不出结构的项不进第二个字典（即不限制）。
+    """
+    top = set((schema.get("properties") or {}).keys())
+    element_keys: dict[str, set[str]] = {}
+    for name, spec in (schema.get("properties") or {}).items():
+        if not isinstance(spec, Mapping):
+            continue
+        items = spec.get("items")
+        if not isinstance(items, Mapping):
+            continue
+        # 元素是 anyOf（字符串或对象）时，取其中带 properties 的那一支
+        candidates = items.get("anyOf") if isinstance(items.get("anyOf"), list) else [items]
+        for candidate in candidates:
+            if isinstance(candidate, Mapping) and isinstance(candidate.get("properties"), Mapping):
+                element_keys[name] = set(candidate["properties"].keys())
+                break
+    return top, element_keys
+
+
+def _filter_by_schema(
+    candidate: Mapping[str, Any], top: set[str], element_keys: Mapping[str, set[str]]
+) -> tuple[dict[str, Any], list[str]]:
+    """按 schema 过滤模型输出：丢掉 schema 之外的顶层键与元素键（规则 3 的硬保证）。
+
+    **不碰值**，只删键 —— 值的取舍由 `_merge_summary()` 负责。
+    """
+    kept: dict[str, Any] = {}
+    dropped: list[str] = []
+    for key, value in candidate.items():
+        if key not in top:
+            dropped.append(key)
+            continue
+        allowed = element_keys.get(key)
+        if allowed and isinstance(value, list):
+            cleaned: list[Any] = []
+            for index, item in enumerate(value):
+                if not isinstance(item, Mapping):
+                    cleaned.append(item)
+                    continue
+                extra = [k for k in item if k not in allowed]
+                if extra:
+                    dropped.extend(f"{key}[{index}].{k}" for k in extra)
+                cleaned.append({k: v for k, v in item.items() if k in allowed})
+            kept[key] = cleaned
+            continue
+        kept[key] = value
+    return kept, dropped
+
+
+def _merge_summary(
+    current: Mapping[str, Any], updated: Mapping[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    """把模型给的新值合并进当前摘要，返回 `(合并结果, 改动字段名)`。
+
+    两条规则**在这里落地**（不指望模型永远听话）：
+
+    1. **空值一律不写进结果**（规则 2「不确定保持原值」的硬保证）：
+       模型把某个字段返回成空（空串 / 空数组 / 空对象）→ 既**不覆盖**原有的非空值，
+       也**不会**把原本不存在的键补成一个空值 —— 后者会在前端 diff 里显示成一条假改动
+       （"v2_features：无 → []"），实测踩到过。
+    2. **模型没返回的键保持原值**（规则 1/2）：所以这是**合并**，不是替换。
+
+    注意：模型**返回了非空的、但内容不同的值**时是接受的 —— 那正是它认为"用户明确改了"的情况，
+    是否真的对由用户在前端看 diff 决定（本函数的职责是给出完整结构，不做业务判断）。
+    """
+    merged: dict[str, Any] = dict(current)
+    changed: list[str] = []
+
+    for key, value in updated.items():
+        if _is_blank(value):
+            continue  # 空值一律不写（见上面第 1 条）
+        if current.get(key) != value:
+            changed.append(key)
+        merged[key] = value
+
+    # 模型明确说了"这个字段现在没有了"（例如清空 v2_features）时**不改**：
+    # 空值与"没返回"在 JSON 里长得一样，这里选择保守 —— 删字段属于人工操作，
+    # 不该由一次回填顺手做掉。
+    return merged, changed
+
+
+def _render_conversation(history: Sequence[Mapping[str, str]]) -> str:
+    """把对话历史渲染成"人读得懂"的文本。
+
+    ⚠️ AI 侧的原始 `content` 是**一个 JSON 信封**（含 `message` / `questions` / `stage_status`）。
+    直接把它整段喂给模型，噪音很大且容易被照着模仿成"也输出 JSON 信封"。
+    所以这里尽量取信封里的 `message` 正文（取不到就原样用），与前端 `extractStreamingMessage()`
+    的判据保持一致。
+    """
+    if not history:
+        return "（没有对话历史）"
+
+    lines: list[str] = []
+    for turn in history:
+        role = (turn.get("role") or "").strip().lower()
+        content = (turn.get("content") or "").strip()
+        if role == "ai":
+            try:
+                envelope = json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            else:
+                if isinstance(envelope, dict) and isinstance(envelope.get("message"), str):
+                    content = envelope["message"].strip()
+        speaker = "用户" if role == "user" else "助手"
+        lines.append(f"【{speaker}】{content or '（空）'}")
+    return "\n\n".join(lines)
+
+
+# ---------------------------------------------------------------- 接口文档 RAG 检索
+
+# 仓库根目录（`services/` → `backend/` → 仓库根）。
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# 检索语料。**只读仓库内的既有文件**，不引入向量库与 embedding 依赖：
+#
+# - 「规范」= 接口文档模板与提示词里的硬性规则（人写的、稳定的）
+# - 「历史接口示例」= `validation_out/` 里真实模型产出的接口文档（可借鉴的写法）
+#
+# ⚠️ 这是**词法检索**（BM25 近似），不是向量检索：查询与语料**用词重合**时才召回，
+# 同义改写召回不到（"鉴权" 查不到只写了 "JWT" 的段落）。要真正的语义召回，
+# 得先决定 embedding 提供方（DeepSeek 没有 embeddings 接口）+ 向量库 + 新依赖，
+# 那是独立的一件事，不该悄悄混进这次改动里。
+#
+# 元素：(相对仓库根的路径, 类别, 排序权重)。文件缺失时**跳过并告警**，不报错 ——
+# 部署镜像里不一定带着 `docs/`（后端镜像只 COPY backend/），缺语料不该让接口 500。
+RAG_CORPUS: tuple[tuple[str, str, float], ...] = (
+    ("docs/接口文档模板.md", "规范", 1.6),
+    ("backend/core/prompts/gen_api.md", "规范", 1.4),
+    ("backend/core/prompts/gen_common.md", "规范", 1.0),
+    ("backend/validation_out/gen_api.txt", "历史接口示例", 1.2),
+    ("backend/validation_out/gen_api_via_service.txt", "历史接口示例", 1.0),
+    ("backend/validation_out/split_api.txt", "历史接口示例", 1.0),
+    ("backend/validation_out/flow_api.txt", "历史接口示例", 0.6),
+)
+
+# **放资料的地方**：把 `.md` / `.txt` 丢进这两个目录（仓库根下），重启后端即生效。
+# 不用改代码、不用重建索引文件 —— 目录会被扫描成一类语料。
+#
+# 权重比内置的模板略高：模板讲的是"格式"，而你自己团队的规范/示例讲的是"我们怎么写"，
+# 后者才是这次生成真正要贴的东西。
+RAG_DROP_DIRS: tuple[tuple[str, str, float], ...] = (
+    ("rag/接口规范", "规范", 1.8),
+    ("rag/历史示例", "历史接口示例", 1.5),
+)
+
+# 单块上限：太大则"命中一处、带回一屏"，检索结果就没人读了。
+_RAG_CHUNK_CHARS = 1200
+
+# 检索词：ASCII 连续串（含 `{}` `/` 等路径字符）各算一个词；中文按相邻二字切
+# （不引 jieba：多一个依赖，而二字组的召回对中文已经够用）。
+_RAG_TOKEN_RE = re.compile(r"[A-Za-z0-9_/.:{}-]+|[\u4e00-\u9fff]")
+_CJK_RE = re.compile(r"^[\u4e00-\u9fff]$")
+
+
+def _rag_tokens(text: str) -> list[str]:
+    """切词。中文额外产出**相邻二元组**，否则单字召回噪声极大（"的""是"到处都在）。"""
+    raw = _RAG_TOKEN_RE.findall(text.lower())
+    tokens: list[str] = []
+    for index, token in enumerate(raw):
+        tokens.append(token)
+        if (
+            _CJK_RE.match(token)
+            and index + 1 < len(raw)
+            and _CJK_RE.match(raw[index + 1])
+        ):
+            tokens.append(token + raw[index + 1])
+    return tokens
+
+
+def _rag_chunks_of(text: str, source: str, kind: str, weight: float) -> list[dict[str, Any]]:
+    """按 Markdown 标题切块。标题作为 `title`，标题路径带上级便于人读（`第 4 章 > 字段`）。"""
+    chunks: list[dict[str, Any]] = []
+    heading_path: list[str] = []
+    title = source.rsplit("/", 1)[-1]
+    body: list[str] = []
+
+    def flush() -> None:
+        content = "\n".join(body).strip()
+        if content:
+            chunks.append(
+                {
+                    "source": source,
+                    "kind": kind,
+                    "title": " > ".join(heading_path) if heading_path else title,
+                    "content": content,
+                    "weight": weight,
+                }
+            )
+        body.clear()
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") and len(stripped) <= 100:
+            flush()
+            level = len(stripped) - len(stripped.lstrip("#"))
+            name = stripped.lstrip("#").strip()
+            del heading_path[level - 1 :]
+            heading_path.append(name)
+            body.append(stripped)
+            continue
+        body.append(line)
+        # 超长块就地断开：宁可同一节出多块，也不要"命中一处带回三千字"
+        if sum(len(item) for item in body) > _RAG_CHUNK_CHARS:
+            flush()
+    flush()
+    return chunks
+
+
+@lru_cache(maxsize=1)
+def _rag_index() -> tuple[tuple[dict[str, Any], ...], dict[str, int]]:
+    """建一次索引（进程内缓存）：返回 `(块列表, 文档频率)`。
+
+    **纯读文件 + 纯计算**，不联网、不调模型，所以可以放心缓存、也可以随便测。
+    """
+    chunks: list[dict[str, Any]] = []
+    for relative_path, kind, weight in RAG_CORPUS:
+        path = REPO_ROOT / relative_path
+        if not path.is_file():
+            logger.warning("RAG 语料缺失，已跳过：%s", relative_path)
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        chunks.extend(_rag_chunks_of(text, relative_path, kind, weight))
+
+    # 用户自己丢进去的资料（`rag/接口规范/`、`rag/历史示例/`）。
+    # 按文件名排序，保证同一批文件的检索结果**稳定可复现**（目录遍历顺序不保证）。
+    for relative_dir, kind, weight in RAG_DROP_DIRS:
+        directory = REPO_ROOT / relative_dir
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*")):
+            if path.suffix.lower() not in {".md", ".txt"} or not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            source = str(path.relative_to(REPO_ROOT)).replace("\\", "/")
+            chunks.extend(_rag_chunks_of(text, source, kind, weight))
+            logger.info("RAG 已收录自有语料：%s（%s）", source, kind)
+
+    document_frequency: dict[str, int] = {}
+    for chunk in chunks:
+        for term in set(_rag_tokens(chunk["content"])):
+            document_frequency[term] = document_frequency.get(term, 0) + 1
+    for chunk in chunks:
+        chunk["tokens"] = _rag_tokens(chunk["content"] + " " + chunk["title"])
+    return tuple(chunks), document_frequency
+
+
+def _rag_query(prd_content: str, history: Sequence[Mapping[str, str]]) -> str:
+    """检索用的查询串：PRD 正文 + 对话里**用户说过的话**。
+
+    AI 侧不取：它大段是复述与提问，词面上会把查询带偏（同 `sync` 那里剥信封的理由）。
+    """
+    user_turns = [
+        (turn.get("content") or "")
+        for turn in history
+        if (turn.get("role") or "").lower() == "user"
+    ]
+    return "\n".join([prd_content, *user_turns]).strip()
+
+
+def _rag_search(query: str, top_k: int) -> list[dict[str, Any]]:
+    """BM25 近似打分：`tf` 饱和 + `idf` 加权 + 语料权重，标题命中额外加分。
+
+    刻意**不做长度归一化**：命中的块往往正是"长而全"的那一节，惩罚长度会把它们压下去。
+    """
+    chunks, document_frequency = _rag_index()
+    if not chunks or not query.strip():
+        return []
+
+    query_counts = Counter(_rag_tokens(query))
+    total = len(chunks)
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for chunk in chunks:
+        counts = Counter(chunk["tokens"])
+        score = 0.0
+        for term, query_tf in query_counts.items():
+            tf = counts.get(term, 0)
+            if tf == 0:
+                continue
+            idf = math.log(1 + (total + 0.5) / (document_frequency.get(term, 0) + 0.5))
+            score += min(query_tf, 3) * (tf / (tf + 1.5)) * idf
+        if score > 0:
+            title_hits = sum(1 for term in query_counts if term in chunk["title"].lower())
+            score *= chunk["weight"] * (1.0 + min(title_hits, 3) * 0.15)
+            scored.append((score, chunk))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [
+        {
+            "source": chunk["source"],
+            "kind": chunk["kind"],
+            "title": chunk["title"],
+            "content": chunk["content"],
+            "score": round(score, 4),
+        }
+        for score, chunk in scored[: max(1, top_k)]
+    ]
 
 
 @lru_cache(maxsize=None)
@@ -516,6 +970,145 @@ class DocumentService:
             api_content=api_content or _EMPTY,
         )
         async for chunk in self._stream_document("prompts", values, outcome=outcome):
+            yield chunk
+
+    # ------------------------------------------------------------ 对话 → 结构化摘要回填
+
+    async def sync_requirements_summary(
+        self,
+        *,
+        summary: Mapping[str, Any],
+        history: Sequence[Mapping[str, str]],
+    ) -> SummarySyncResult:
+        """把对话里用户**明确说过**的补充与修正回填进结构化摘要。
+
+        这是**非流式**的一次调用（与三个 `generate_*_stream` 不同），三个理由：
+
+        1. 输出是一小段 JSON，分片/流式没有意义；
+        2. 调用方要的是**整份结构**做 diff，半截 JSON 没法用；
+        3. 出错要能干净地报错（流式接口的异常会变成"200 + 流里一个 error"，见坑 #18 那类形状）。
+
+        Args:
+            summary: 当前结构化摘要，形状以 `field-schema.json` 为准。
+            history: 对话历史，按时间正序，元素形如 `{"role": "user"|"ai", "content": "…"}`。
+                AI 侧既可以是原始 JSON 信封，也可以只给 `message` 正文 —— `_render_conversation()`
+                会把信封剥出来。
+
+        Returns:
+            `SummarySyncResult`：更新后的完整摘要 + 改动字段 + 被丢掉的越界键 + 截断信息。
+
+        Raises:
+            SummarySyncError: 模型没给出可解析的 JSON 对象（含截断导致的残缺 JSON）。
+            LlmConfigError: 没配 Key（由 `model` 属性抛出，路由层转 503）。
+        """
+        schema_text = _load_skill_artifact(SKILL_PRD_FIELD_SCHEMA)
+        try:
+            schema = json.loads(schema_text)
+        except json.JSONDecodeError as exc:  # pragma: no cover - schema 是仓库内的静态文件
+            raise SummarySyncError(f"技能包的 field-schema.json 不是合法 JSON：{exc}") from exc
+
+        values = {
+            "field_schema": schema_text,
+            "current_summary": json.dumps(summary, ensure_ascii=False, indent=2),
+            "conversation": _render_conversation(history),
+        }
+        messages: list[BaseMessage] = [
+            SystemMessage(content=load_prompt(SYNC_SUMMARY_PROMPT)),
+            HumanMessage(content=render_prompt_text(SYNC_SUMMARY_HUMAN_TEMPLATE, values)),
+        ]
+
+        response = await self.model.ainvoke(messages)
+        text = message_text(response)
+        reason = finish_reason_of(response)
+        truncated = is_truncated(reason)
+
+        candidate = _extract_json_object(text)
+        top_keys, element_keys = _allowed_keys(schema)
+        filtered, dropped = _filter_by_schema(candidate, top_keys, element_keys)
+        merged, changed = _merge_summary(summary, filtered)
+
+        if dropped:
+            # 越界键说明模型没守规则 3。不报错（结果仍可用），但**必须留痕** ——
+            # 静默丢弃会让提示词退化到没人发现。
+            logger.warning(
+                "回填摘要时模型返回了 schema 之外的键，已丢弃：%s", "、".join(dropped)
+            )
+
+        return SummarySyncResult(
+            summary=merged,
+            changed=tuple(changed),
+            dropped_keys=tuple(dropped),
+            truncated=truncated,
+            finish_reason=reason,
+        )
+
+    # ------------------------------------------------------------ 接口文档 RAG 检索
+
+    def retrieve_api_docs_rag_hits(
+        self,
+        *,
+        prd_content: str,
+        history: Sequence[Mapping[str, str]] = (),
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        """检索与本次接口文档生成相关的规范与历史示例。
+
+        **不调模型**：纯读仓库内文件 + 打分排序，所以它是确定性的、免费的、可缓存的
+        （索引在 `_rag_index()` 里按进程缓存一次）。生成接口文档时把返回的片段拼进提示词，
+        相当于给模型几份"照这个写"的样例。
+
+        Args:
+            prd_content: 已通过审核的 PRD 全文 —— 检索的主要依据（它决定了本次要写哪些接口）。
+            history: 对话历史，只取用户说过的话（AI 侧是复述与提问，词面会把查询带偏）。
+            top_k: 返回几条。上限故意不设大：检索结果是要拼进提示词的，多给只会挤占上下文。
+
+        Returns:
+            按相关度倒序的命中列表，每条含 `source` / `kind` / `title` / `content` / `score`。
+            `source` 是仓库相对路径，`kind` 区分「规范」与「历史接口示例」，
+            便于调用方按类别分别处置（例如规范一定要给、示例按预算给）。
+        """
+        query = _rag_query(prd_content, history)
+        return _rag_search(query, top_k)
+
+    # ------------------------------------------------------------ 从结构化摘要生成 PRD
+
+    async def generate_prd_from_summary_stream(
+        self,
+        *,
+        summary: Mapping[str, Any],
+        history: Sequence[Mapping[str, str]] = (),
+        outcome: StreamOutcome | None = None,
+    ) -> AsyncIterator[str]:
+        """**直接从结构化摘要生成 PRD**，流式产出裸文本片段。
+
+        与 `generate_prd_stream()` 的区别（两条路径并存，别混用）：
+
+        | | 输入 | 前置环节 |
+        | --- | --- | --- |
+        | `generate_prd_stream()` | 20 题表单作答 + `known_info` | 表单 → 对话澄清 |
+        | 本方法 | 技能包 8 字段的结构化摘要 | 结构化录入（→ 可选回填） |
+
+        本方法的输入**与技能包的输入契约同形**，所以：
+        - 技能包第一步「校验输入」第一次真正可执行（缺必填项在摘要里一眼可见）；
+        - 少了一层"从表单文本里猜字段"的有损转换。
+
+        代价：`[待确认]` 会变多 —— 原来由对话澄清补齐的细节，这条路径没有那一步。
+        所以约束里明确要求"缺失就地标注"，而不是让模型拿邻近内容顶替（坑 #3）。
+
+        system prompt 仍走技能包那四份文件（`_skill_system_prompt()`）；生成约束在
+        human message 里（见 `PRD_FROM_SUMMARY_HUMAN_TEMPLATE`）。
+        """
+        if not summary:
+            raise ValueError("summary 不能为空 —— 这条路径的唯一输入就是结构化摘要")
+
+        system, _ = self.prd_prompts(self.generation_values(form={}), use_skill=True)
+        async for chunk in self._stream_document(
+            "prd",
+            self.generation_values(form={}),
+            system=system,
+            human=_build_prd_from_summary_prompt(summary, history),
+            outcome=outcome,
+        ):
             yield chunk
 
     # ------------------------------------------------------------ 文档修订

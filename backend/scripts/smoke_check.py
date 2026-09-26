@@ -86,9 +86,10 @@ def _outcome_wiring_report() -> str | None:
         if "_make_sse_generator(stream, outcome)" not in source:
             return f"{path} 没有把 outcome 交给 _make_sse_generator"
 
-    # 6 = 对话 2 条 + 文档 4 条；少一条说明路由被删了或改名了，值得人看一眼
-    if checked != 6:
-        return f"只发现 {checked} 个流式路由，期望 6 个"
+    # 7 = 对话 2 条 + 文档 5 条（PRD、从摘要生成 PRD、接口文档、套件、单节修订）；
+    # 少一条说明路由被删了或改名了，值得人看一眼
+    if checked != 7:
+        return f"只发现 {checked} 个流式路由，期望 7 个"
     return None
 
 
@@ -557,6 +558,154 @@ def main() -> int:
         not sorted(set(re.findall(r"\{([a-z][a-z0-9_]*)\}", low))),
         str(sorted(set(re.findall(r"\{([a-z][a-z0-9_]*)\}", low)))),
     )
+
+    # ---------- 对话 → 结构化摘要回填（纯逻辑 + 假模型，不联网） ----------
+    # 这一组守的是 prompt 里那四条规则的**硬保证**：模型不听话时服务端仍然不失守。
+    from langchain_core.messages import AIMessage  # noqa: PLC0415
+
+    class _FakeSyncModel:
+        """`ainvoke` 返回一段固定文本，模拟模型给的 JSON。"""
+
+        def __init__(self, text, finish_reason="stop"):
+            self.text = text
+            self.seen: list = []
+            self._reason = finish_reason
+
+        async def ainvoke(self, messages):
+            self.seen.append(list(messages))
+            return AIMessage(
+                content=self.text,
+                response_metadata={"finish_reason": self._reason},
+            )
+
+    base_summary = {
+        "product_name": "群聊周报助手",
+        "product_goal": "把周报整理从两小时降到十分钟",
+        "target_users": ["技术负责人"],
+        "platform": "Web 网站",
+        "mvp_features": [{"name": "绑定群聊并汇总", "description": "选定范围后汇总"}],
+        "technical_constraints": {"stack": "React + FastAPI", "auth": "账号密码"},
+    }
+
+    # 1) 围栏 + 前后有解释文字也要能解析（模型最爱干的两件事）
+    ok_parse = True
+    detail = ""
+    try:
+        parsed = ds._extract_json_object(
+            '好的，这是结果：\n```json\n{"product_name": "X"}\n```\n希望有帮助'
+        )
+        ok_parse = parsed == {"product_name": "X"}
+    except Exception as exc:  # noqa: BLE001
+        ok_parse, detail = False, f"{type(exc).__name__}: {exc}"
+    check("回填：能从围栏与解释文字里抠出 JSON 对象", ok_parse, detail or "解析正确")
+
+    # 2) 越界键必须被丢掉（规则 3 的硬保证）
+    filtered, dropped = ds._filter_by_schema(
+        {
+            "product_name": "A",
+            "invented_key": "不该出现",
+            "mvp_features": [{"name": "F", "user_value": "也不该出现"}],
+        },
+        {"product_name", "mvp_features"},
+        {"mvp_features": {"name", "description", "priority"}},
+    )
+    check(
+        "回填：schema 之外的键（含数组元素内的）被丢弃并留痕",
+        set(filtered) == {"product_name", "mvp_features"}
+        and filtered["mvp_features"] == [{"name": "F"}]
+        and len(dropped) == 2,
+        f"dropped={dropped}",
+    )
+
+    # 3) 空值不覆盖非空值（规则 2）+ 未返回的键保持原值（规则 1）
+    merged, changed = ds._merge_summary(
+        base_summary, {"product_goal": "", "platform": "微信小程序", "v2_features": []}
+    )
+    check(
+        "回填：模型返回空值时保留原值，返回新值时接受并记为改动",
+        merged["product_goal"] == base_summary["product_goal"]
+        and merged["platform"] == "微信小程序"
+        and "platform" in changed
+        and "product_goal" not in changed,
+        f"changed={changed}",
+    )
+    check(
+        "回填：模型没返回的键原样保留（是合并而不是替换）",
+        merged["target_users"] == base_summary["target_users"]
+        and merged["technical_constraints"] == base_summary["technical_constraints"],
+    )
+
+    # 4) AI 侧原始 JSON 信封要被剥成可读正文 —— 否则模型会照着模仿输出信封
+    rendered = ds._render_conversation(
+        [
+            {"role": "user", "content": "我们大概 20 个人用"},
+            {"role": "ai", "content": '{"message": "明白，我记下了", "questions": []}'},
+        ]
+    )
+    check(
+        "回填：对话历史里 AI 的 JSON 信封被剥成正文",
+        "明白，我记下了" in rendered and '"questions"' not in rendered
+        and "【用户】我们大概 20 个人用" in rendered,
+        rendered[:60],
+    )
+
+    # 5) 端到端（假模型）：完整结构 + 改动字段 + 越界键留痕
+    fake_sync = _FakeSyncModel(
+        '```json\n{"product_name": "群聊周报助手", "platform": "微信小程序",'
+        ' "bogus": 1}\n```'
+    )
+    svc3 = ds.DocumentService(model=fake_sync)
+    result = asyncio.run(
+        svc3.sync_requirements_summary(
+            summary=base_summary,
+            history=[{"role": "user", "content": "改成小程序吧"}],
+        )
+    )
+    check(
+        "回填：返回完整结构（含未改动的字段）",
+        set(result.summary) >= set(base_summary),
+        "、".join(sorted(result.summary)),
+    )
+    check(
+        "回填：changed 只列真正变了的字段",
+        result.changed == ("platform",),
+        f"changed={result.changed}",
+    )
+    check(
+        "回填：越界键进 dropped_keys（前端可据此提示提示词退化）",
+        result.dropped_keys == ("bogus",),
+        f"dropped={result.dropped_keys}",
+    )
+    check(
+        "回填：截断信息被如实带出（正常写完时 finish_reason=stop 且不截断）",
+        result.truncated is False and result.finish_reason == "stop",
+        f"{result.finish_reason} / truncated={result.truncated}",
+    )
+    sync_system = fake_sync.seen[0][0].content
+    sync_human = fake_sync.seen[0][1].content
+    check(
+        "回填：system 用的是 sync_summary.md，且 human 注入了 schema 原文与当前摘要",
+        "只回填" in sync_system
+        and '"product_name"' in sync_human
+        and "additionalProperties" in sync_human
+        and "{current_summary}" not in sync_human,
+        f"system={len(sync_system)} 字 / human={len(sync_human)} 字",
+    )
+
+    # 6) 模型给出不可解析的输出时必须**报错**，不能返回半个摘要
+    try:
+        asyncio.run(
+            ds.DocumentService(model=_FakeSyncModel("抱歉，我没法完成这个请求。"))
+            .sync_requirements_summary(summary=base_summary, history=[])
+        )
+    except ds.SummarySyncError:
+        check("回填：不可解析的输出抛 SummarySyncError（不返回残摘要）", True)
+    except Exception as exc:  # noqa: BLE001
+        check("回填：不可解析的输出抛 SummarySyncError（不返回残摘要）", False,
+              f"抛的是 {type(exc).__name__}")
+    else:
+        check("回填：不可解析的输出抛 SummarySyncError（不返回残摘要）", False, "居然成功了")
+
     try:
         asyncio.run(_collect_all(svc2.optimize_document_stream(
             kind="prd", section="", feedback="x", current_content="y")))
@@ -917,7 +1066,7 @@ def main() -> int:
     )
     # 服务层与路由层必须成对使用它：只降级不报告 = 静默截断（这正是坑 #18 的形态）
     wiring = _outcome_wiring_report()
-    check("六个流式路由与两个生成服务都接了 StreamOutcome", wiring is None, wiring or "全部接上")
+    check("七个流式路由与两个生成服务都接了 StreamOutcome", wiring is None, wiring or "全部接上")
 
     # ---------- 分片计划：覆盖必须完整、不重叠、不把示例当穷举（纯解析，不调模型） ----------
     from services.document_plan import build_plan  # noqa: PLC0415
@@ -999,10 +1148,13 @@ def main() -> int:
         "/api/v1/conversation/document-plan",
         "/api/v1/conversation/generate-api-docs-stream",
         "/api/v1/conversation/generate-prd-stream",
+        "/api/v1/conversation/generate-prd-from-summary-stream",
         "/api/v1/conversation/generate-prompts-stream",
         "/api/v1/conversation/optimize-document-stream",
         "/api/v1/conversation/questions",
         "/api/v1/conversation/start-stream",
+        "/api/v1/conversation/sync-summary-from-conversation",
+        "/api/v1/conversation/retrieve-api-docs-rag",
         "/api/v1/sessions",
         "/api/v1/sessions/{session_id}",
         "/api/v1/sessions/{session_id}/form",
@@ -1045,9 +1197,12 @@ def main() -> int:
         "/api/v1/conversation/start-stream",
         "/api/v1/conversation/continue-stream",
         "/api/v1/conversation/generate-prd-stream",
+        "/api/v1/conversation/generate-prd-from-summary-stream",
         "/api/v1/conversation/generate-api-docs-stream",
         "/api/v1/conversation/generate-prompts-stream",
         "/api/v1/conversation/optimize-document-stream",
+        "/api/v1/conversation/sync-summary-from-conversation",
+        "/api/v1/conversation/retrieve-api-docs-rag",
     }
     placeholders = {
         f"{method.upper()} {path}": operation.get("responses", {})

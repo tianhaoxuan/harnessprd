@@ -83,15 +83,40 @@ from api.schemas import (
     ContinueStreamRequest,
     DocumentPlanView,
     GenerateApiDocsRequest,
+    GeneratePrdFromSummaryRequest,
     GeneratePrdRequest,
     GeneratePromptsRequest,
     OptimizeDocumentRequest,
+    RagHit,
+    RetrieveRagRequest,
+    RetrieveRagResponse,
     StartStreamRequest,
+    SyncSummaryRequest,
+    SyncSummaryResponse,
 )
 from core.questions import QuestionsConfig, load_questions
 from services.conversation_service import ConversationService
 from services.document_plan import build_plan
-from services.document_service import DocumentService
+from services.document_service import (
+    DocumentService,
+    SummarySyncError,
+    _rag_index,
+)
+
+
+def _document_service() -> DocumentService:
+    """检索用一次性的 `DocumentService`。
+
+    ⚠️ 这个接口**不碰模型**（`retrieve_api_docs_rag_hits` 是纯函数式的读文件 + 打分），
+    所以不需要注入依赖、也不需要 `_ensure_llm_ready` —— 没配 Key 时它照样能用。
+    """
+    return DocumentService()
+
+
+def _rag_corpus_size() -> int:
+    """参与检索的块数（排查"为什么没召回"时先看它是不是 0：语料文件缺失会退化成 0）。"""
+    chunks, _ = _rag_index()
+    return len(chunks)
 from services.llm import LlmConfigError, StreamOutcome
 from services.state import DocKind
 
@@ -277,6 +302,109 @@ async def continue_stream(
         known_info=payload.known_info,
         open_questions=payload.open_questions,
         conflicts=payload.conflicts,
+        outcome=outcome,
+    )
+    return StreamingResponse(
+        _make_sse_generator(stream, outcome), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
+    )
+
+
+@router.post(
+    "/sync-summary-from-conversation",
+    response_model=SyncSummaryResponse,
+    summary="从对话回填结构化摘要（非流式）",
+)
+async def sync_summary_from_conversation(
+    payload: SyncSummaryRequest,
+    service: DocumentServiceDep,
+) -> SyncSummaryResponse:
+    """把对话里用户**明确说过**的补充与修正回填进结构化摘要，返回完整结构。
+
+    规则（只回填 / 不确定保持原值 / 不新增字段 / 返回完整结构）写在
+    `core/prompts/sync_summary.md` 里；**服务端另外做两道硬保证**，不指望模型永远听话：
+
+    - 越界键（schema 之外的顶层键与元素键）一律丢弃，并在 `dropped_keys` 里报出来；
+    - 模型把原有内容的字段返回成空值时**不覆盖**，保留原值。
+
+    **为什么不是流式**：输出是一小段 JSON，调用方要拿整份结构做 diff；
+    流式既没有意义，半截 JSON 也没法用。同理，模型给出不可解析的 JSON 时**直接报 502**，
+    而不是返回半个摘要 —— 那会让前端显示一堆假改动。
+    """
+    _ensure_llm_ready(service)
+
+    try:
+        result = await service.sync_requirements_summary(
+            summary=payload.summary,
+            history=[turn.model_dump() for turn in payload.history],
+        )
+    except SummarySyncError as exc:
+        # 上游（模型）给了不可用的输出 —— 这是网关类错误，不是客户端的错（422 不合适）
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=f"回填失败：{exc}"
+        ) from exc
+
+    return SyncSummaryResponse(
+        summary=result.summary,
+        changed=list(result.changed),
+        dropped_keys=list(result.dropped_keys),
+        truncated=result.truncated,
+        finish_reason=result.finish_reason,
+    )
+
+
+@router.post(
+    "/retrieve-api-docs-rag",
+    response_model=RetrieveRagResponse,
+    summary="检索接口文档规范与历史示例（不调模型）",
+)
+async def retrieve_api_docs_rag(payload: RetrieveRagRequest) -> RetrieveRagResponse:
+    """按 PRD 正文与对话历史，检索「规范」与「历史接口示例」两类片段。
+
+    ⚠️ **这是词法检索（BM25 近似），不是向量 RAG。** 本项目没有向量库，也没有可用的
+    embedding 提供方（DeepSeek 不提供 embeddings 接口），所以语料就是**仓库里现成的文件**：
+    `docs/接口文档模板.md` 与 `gen_api.md`（规范）、`validation_out/*api*.txt`（真实模型产出的历史示例）。
+
+    含义（用之前要知道）：查询与语料**用词重合**时才召回；同义改写召回不到
+    （"鉴权"查不到只写了 "JWT" 的段落）。要真正的语义召回，得先定 embedding 提供方 +
+    向量库 + 新依赖 —— 那是独立的一件事。
+
+    **不调模型、无副作用**：纯读文件 + 打分排序（索引进程内缓存），所以它不花钱、可重放，
+    也不需要 `_ensure_llm_ready`（没配 Key 时这个接口照样能用）。
+    """
+    hits = _document_service().retrieve_api_docs_rag_hits(
+        prd_content=payload.prd_content,
+        history=[turn.model_dump() for turn in payload.history],
+        top_k=payload.top_k,
+    )
+    return RetrieveRagResponse(
+        hits=[RagHit(**hit) for hit in hits],
+        corpus_size=_rag_corpus_size(),
+    )
+
+
+@router.post(
+    "/generate-prd-from-summary-stream",
+    summary="从结构化摘要生成 PRD（SSE）",
+)
+async def generate_prd_from_summary_stream(
+    payload: GeneratePrdFromSummaryRequest,
+    service: DocumentServiceDep,
+) -> StreamingResponse:
+    """**直接从结构化摘要生成 PRD**，流式返回 Markdown。
+
+    与 `generate-prd-stream` 是**两条并存的路径**（见
+    `DocumentService.generate_prd_from_summary_stream` 的对比表）：
+    这条的输入是技能包 8 字段摘要，不经过 20 题表单与对话澄清。
+
+    ⚠️ 因此这条路径的 `[待确认]` 会明显更多 —— 对话澄清补的那些细节它没有。
+    设计意图是"摘要已经够完整时走最短链路"，不是替代澄清流程。
+    """
+    _ensure_llm_ready(service)
+
+    outcome = StreamOutcome()
+    stream = service.generate_prd_from_summary_stream(
+        summary=payload.summary,
+        history=[turn.model_dump() for turn in payload.history],
         outcome=outcome,
     )
     return StreamingResponse(

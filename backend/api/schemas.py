@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, Field, model_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 
 # 枚举定义在 services/state.py（内部状态契约）。api → services 是允许的方向；
 # import 复用而不是各写一份 —— 两份枚举必然漂移。
@@ -58,9 +58,17 @@ __all__ = [
     "DocumentGenerationRequest",
     "DocumentScopeView",
     "GenerateApiDocsRequest",
+    "GeneratePrdFromSummaryRequest",
     "GeneratePrdRequest",
     "GeneratePromptsRequest",
     "OptimizeDocumentRequest",
+    # 对话 → 结构化摘要回填（非流式）
+    "SyncSummaryRequest",
+    "SyncSummaryResponse",
+    # 接口文档 RAG 检索（非流式，不调模型）
+    "RetrieveRagRequest",
+    "RetrieveRagResponse",
+    "RagHit",
 ]
 
 
@@ -404,6 +412,55 @@ class GeneratePromptsRequest(DocumentGenerationRequest):
     )
 
 
+class SyncSummaryRequest(BaseModel):
+    """`POST /conversation/sync-summary-from-conversation` 的入参。
+
+    ⚠️ 与上面四个生成接口不同，这是**非流式**的：输出是一小段 JSON，
+    调用方要拿整份结构做 diff，流式既没意义、半截 JSON 又没法用。
+    """
+
+    summary: dict[str, Any] = Field(
+        description="当前结构化需求摘要，形状以 `skills/prd-generator/references/field-schema.json` 为准"
+    )
+    history: list[ConversationTurn] = Field(
+        default_factory=list,
+        description=(
+            "对话历史，按时间正序。AI 侧建议只传可读正文（`extractStreamingMessage()` 抠出来的那段），"
+            "传原始 JSON 信封也能接受 —— 服务层会把 `message` 剥出来"
+        ),
+    )
+
+    @field_validator("summary")
+    @classmethod
+    def _summary_not_empty(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """空摘要 = 调用方传错了（没有可回填的东西），在边界上就拦成 422。"""
+        if not value:
+            raise ValueError("summary 不能是空对象 —— 回填需要一份当前摘要作为基准")
+        return value
+
+
+class SyncSummaryResponse(BaseModel):
+    """回填结果。
+
+    `summary` 是**完整结构**（未改动的字段原样带回），前端拿它与旧版本 diff 即可；
+    `changed` 只是把 diff 的结论顺手给出，省得前端再算一遍。
+    """
+
+    summary: dict[str, Any] = Field(description="更新后的完整结构化摘要")
+    changed: list[str] = Field(
+        default_factory=list, description="内容发生变化的顶层字段名（可直接高亮这几项）"
+    )
+    dropped_keys: list[str] = Field(
+        default_factory=list,
+        description="模型自己发明、被服务端丢掉的键（提示词规则 3 的硬保证）。正常应为空",
+    )
+    truncated: bool = Field(
+        default=False,
+        description="输出是否撞上单次上限被截断。截断时 JSON 多半不完整，会先报 502",
+    )
+    finish_reason: str | None = Field(default=None, description="厂商原话（`stop` / `length` …）")
+
+
 class OptimizeDocumentRequest(ConversationContext):
     """`POST /conversation/optimize-document-stream` 的入参（F8.6 单节重生成）。"""
 
@@ -475,6 +532,62 @@ class DocumentPlanPart(BaseModel):
     scope: NonBlankStr = Field(description="进 `{generate_scope}`：本片的范围")
     spec: NonBlankStr = Field(description="进 `{scope_spec}`：本片的详细规格")
     outline: NonBlankStr = Field(description="进 `{doc_outline}`：整份结构（每片相同）")
+
+
+class GeneratePrdFromSummaryRequest(BaseModel):
+    """`POST /conversation/generate-prd-from-summary-stream` 的入参。
+
+    **只吃结构化摘要**（与技能包 `field-schema.json` 同形）+ 可选对话历史 ——
+    不走 20 题表单，也没有 `known_info`：摘要本身就是"已经确认过的信息"。
+    """
+
+    summary: dict[str, Any] = Field(
+        description="结构化需求摘要，形状以 skills/prd-generator/references/field-schema.json 为准"
+    )
+    history: list[ConversationTurn] = Field(
+        default_factory=list, description="对话历史（可选），仅用于理解摘要里没写全的措辞"
+    )
+
+    @field_validator("summary")
+    @classmethod
+    def _summary_required(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """空摘要 = 没有输入可生成，在边界上拦成 422（服务层还有一道同样的守卫）。"""
+        if not value:
+            raise ValueError("summary 不能是空对象 —— 这条路径的唯一输入就是结构化摘要")
+        return value
+
+
+class RetrieveRagRequest(BaseModel):
+    """`POST /conversation/retrieve-api-docs-rag` 的入参。
+
+    与 `SyncSummaryRequest` 一样是**非流式**：输出是一组片段，调用方要按 `source`/`kind`
+    自行取舍后拼进提示词，流式没有意义。
+    """
+
+    prd_content: NonBlankStr = Field(
+        description="已通过审核的 PRD 全文 —— 检索的主要依据（它决定本次要写哪些接口）"
+    )
+    history: list[ConversationTurn] = Field(
+        default_factory=list, description="对话历史，按时间正序。**只取用户说过的话**参与检索"
+    )
+    top_k: int = Field(default=5, ge=1, le=20, description="返回几条命中。上限刻意不大：片段要拼进提示词")
+
+
+class RagHit(BaseModel):
+    """一条检索命中。"""
+
+    source: str = Field(description="来源，仓库相对路径（如 `docs/接口文档模板.md`）")
+    kind: str = Field(description="类别：`规范` 或 `历史接口示例`")
+    title: str = Field(description="块标题（Markdown 标题路径，如 `模板 > 2.1 字段清单`）")
+    content: str = Field(description="块正文，可直接拼进提示词")
+    score: float = Field(description="相关度得分（BM25 近似）。只用于排序，绝对值没有意义")
+
+
+class RetrieveRagResponse(BaseModel):
+    """检索结果。**空列表是正常结果**（语料里没有相关片段），不是错误。"""
+
+    hits: list[RagHit] = Field(default_factory=list, description="按相关度倒序")
+    corpus_size: int = Field(default=0, description="参与检索的块总数（排查「为什么没召回」用，0 表示语料缺失）")
 
 
 class DocumentPlanView(BaseModel):

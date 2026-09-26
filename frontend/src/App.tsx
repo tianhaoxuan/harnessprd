@@ -13,6 +13,11 @@ import DocumentReview, {
 // 默认导入、并把 `<StructuredForm .../>` 换回 `<FormStep .../>` 即可。
 import { type FormValues, validateForm } from './components/FormStep'
 import StructuredForm, { type StructuredSubmit } from './components/StructuredForm'
+import RagHitsPanel from './components/RagHitsPanel'
+import SummaryDiffPanel, {
+  diffSummaries,
+  type SummaryChange,
+} from './components/SummaryDiffPanel'
 import MessageList from './components/MessageList'
 import StepProgress from './components/StepProgress'
 import {
@@ -27,6 +32,9 @@ import {
   optimizeDocumentStream,
   readDialogueStageStatus,
   startConversationStream,
+  retrieveApiDocsRag,
+  syncSummaryFromConversation,
+  type RagHit,
   type StreamChunkMeta,
 } from './services/api'
 import {
@@ -366,6 +374,23 @@ const SESSION_DEBOUNCE_MS = 800
 const SESSION_MAX_WAIT_MS = 2000
 
 /**
+ * 把用户确认过的结构化摘要渲染成 `known_info` 的一段。
+ *
+ * 为什么整份 JSON 都给出去：生成 PRD 时提示词吃的是 `known_info`（自由文本，优先级高于表单），
+ * 而回填可能改了任意字段。逐字段挑着给会让"下次加字段忘了同步"重演；
+ * 整份给出去，口径与摘要本身永远一致。
+ *
+ * 不覆盖 `structuredExtras`（页面结构 / 关键交互 / 在不在范围内 / LLM 说明 / 可用性）——
+ * 那几项不在 8 字段 schema 里，由表单那条通道单独送，两者在 `known_info` 里并列。
+ */
+function buildExtrasFromSummary(summary: Record<string, unknown>): string {
+  return [
+    '结构化摘要（对话澄清后已由用户逐条确认，优先级高于表单作答）：',
+    JSON.stringify(summary, null, 2),
+  ].join('\n')
+}
+
+/**
  * 把对话里**用户亲口说过的话**拼成 `known_info` 的过渡替代品。
  *
  * ⚠️ **这不是设计里的 `known_info`。** 设计要求它是「对话中确认的**结构化**信息：
@@ -537,6 +562,25 @@ export default function App() {
    * 那个接口只收 `form`，没有 `known_info` 字段。缺的细节正好由澄清阶段追问补齐。
    */
   const [structuredExtras, setStructuredExtras] = useState('')
+  /**
+   * 结构化摘要本体（表单交出来、对话回填可更新）。
+   *
+   * 它是**回填的基准**：没走结构化录入时为 `null`，此时回填整步跳过。
+   */
+  const [structuredSummary, setStructuredSummary] = useState<Record<string, unknown> | null>(null)
+  /** 用户确认后的摘要文本，单独一格并进 `known_info`（不覆盖 `structuredExtras`）。 */
+  const [summaryExtras, setSummaryExtras] = useState('')
+  /** 待用户确认的回填差异。`null` = 没有待确认项。 */
+  const [pendingSummary, setPendingSummary] = useState<{ changes: SummaryChange[] } | null>(null)
+  const [summarySyncBusy, setSummarySyncBusy] = useState(false)
+  const [summarySyncError, setSummarySyncError] = useState<string | null>(null)
+  /** 待确认的 RAG 检索结果（`null` = 没有待确认项）。 */
+  const [pendingRag, setPendingRag] = useState<{ hits: RagHit[]; corpusSize: number } | null>(null)
+  const [ragBusy, setRagBusy] = useState(false)
+  /** 用户确认过的检索片段，拼进 `known_info` 一起发给生成接口。 */
+  const [ragExtras, setRagExtras] = useState('')
+  /** 防死循环：确认那一次要跳过检索闸门。 */
+  const ragConfirmedRef = useRef(false)
   const [restoredDraft, setRestoredDraft] = useState(false)
   /** 草稿恢复完成前**禁止**写回，否则初始的空对象会把已存的草稿冲掉。 */
   const [hydrated, setHydrated] = useState(false)
@@ -966,8 +1010,9 @@ export default function App() {
    * `form`，没有 `known_info` 字段 —— 对话阶段看不到它，但它会在生成 PRD 时补上。
    */
   const handleStructuredSubmit = useCallback(
-    ({ form, extras }: StructuredSubmit) => {
+    ({ form, extras, summary }: StructuredSubmit) => {
       setStructuredExtras(extras)
+      setStructuredSummary(summary)
       // 同步一份到 `values`：草稿与"恢复上次会话"的逻辑都挂着它
       setValues(form)
       handleSubmit(form)
@@ -1139,6 +1184,30 @@ export default function App() {
     async (kind: DocKind) => {
       if (isGenerating) return
 
+      // ---------- 接口文档：先检索、用户确认，才真正生成（见 `RagHitsPanel`）----------
+      // 取消 = 一个字都不生成。已有内容时（重新生成）不拦：那时用户就是要一份新的，
+      // 再走一遍检索确认只会变啰嗦。
+      if (kind === 'api' && !ragConfirmedRef.current && !apiDocsContent) {
+        setRagBusy(true)
+        try {
+          const rag = await retrieveApiDocsRag(
+            prdContent,
+            messages.map((message) => ({ role: message.role, content: message.content })),
+          )
+          setPendingRag(rag)
+        } catch (error) {
+          // 检索失败不拦主流程：它只是参考资料，没有它照样能生成
+          setDocFailure({
+            kind,
+            message: `检索参考资料失败（${describeApiError(error)}）—— 可以直接重试生成。`,
+          })
+        } finally {
+          setRagBusy(false)
+        }
+        return
+      }
+      ragConfirmedRef.current = false
+
       // 链条约束：接口文档与提示词套件都必须能追溯到 PRD。
       // 后端也会拦（缺 prd_content → 422），这里先拦是为了不白跑一趟、并给出人话提示。
       if (DOC_META[kind].requiresPrd && !prdContent.trim()) {
@@ -1163,7 +1232,9 @@ export default function App() {
 
       // 结构化表单里"20 题装不下"的那部分（页面结构、关键交互、范围、LLM 说明、可用性）
       // 排在最前面：它是用户**明确填过**的内容，比从对话里抠出来的更硬。
-      const knownInfo = [structuredExtras, buildKnownInfo(messages)].filter(Boolean).join('\n\n')
+      const knownInfo = [structuredExtras, summaryExtras, ragExtras, buildKnownInfo(messages)]
+        .filter(Boolean)
+        .join('\n\n')
       const context = {
         form: submitted ?? {},
         // ⚠️ 空串**不要传**：后端对"不传"填「（尚无）」，传空串则会把提示词里那一格
@@ -1278,6 +1349,95 @@ export default function App() {
     [isGenerating, prdContent, apiDocsContent, messages, submitted, writeDoc],
   )
 
+  // ---------------------------------------------------------------- 对话 → 摘要回填
+
+  /**
+   * 点「生成 PRD」时的**前一步**：把对话里用户明确说过的东西回填进结构化摘要，
+   * 让用户在 diff 面板上逐条确认，确认之后才真正开始生成。
+   *
+   * 为什么要有这一步：澄清对话是自由文本，而 PRD 生成吃的是结构化摘要（`known_info`）。
+   * 不把对话里的修正搬过去，用户说了"改成微信小程序"也白说 —— 生成出来的还是表单里那份旧的。
+   *
+   * 三种出口：
+   * - 没有摘要（没走结构化录入，例如旧入口）→ 跳过回填，直接生成；
+   * - 回填失败（模型给了不可解析的 JSON，服务端返 502）→ **照常生成**，只提示一句。
+   *   回填是**增强**，不该因为它挂了就挡住主流程；
+   * - 回填成功 → 打开 diff 面板，等用户的 `确认/拒绝`（见 `applySummaryChanges()`）。
+   */
+  const handleGeneratePrdWithSync = useCallback(async () => {
+    if (!structuredSummary || messages.length === 0) {
+      void handleGenerateDocument('prd')
+      return
+    }
+
+    setSummarySyncBusy(true)
+    setSummarySyncError(null)
+    try {
+      const result = await syncSummaryFromConversation(
+        structuredSummary,
+        messages.map((message) => ({ role: message.role, content: message.content })),
+      )
+      const changes = diffSummaries(structuredSummary, result.summary)
+      setPendingSummary({ changes })
+      if (changes.length === 0) {
+        // 没有可回填的内容：不留一个空面板，直接说明并生成
+        setPendingSummary(null)
+        void handleGenerateDocument('prd')
+      }
+    } catch (error) {
+      setSummarySyncError(
+        `对话回填没成功（${describeApiError(error)}）—— 已按原摘要继续生成。`,
+      )
+      void handleGenerateDocument('prd')
+    } finally {
+      setSummarySyncBusy(false)
+    }
+  }, [structuredSummary, messages, handleGenerateDocument])
+
+  /**
+   * diff 面板的「确认更新」：把**用户勾选的那几条**写回摘要，然后才开始生成。
+   *
+   * 只按勾选项写回（而不是整份替换）：用户没勾的项要保持原值 ——
+   * 这正是"逐条确认"的意义，不然面板就只是个通知。
+   */
+  const applySummaryChanges = useCallback(
+    (accepted: SummaryChange[]) => {
+      const next = accepted.reduce<Record<string, unknown>>((acc, change) => {
+        // 只支持顶层与一级下标路径（与 `diffSummaries()` 产出的形状一致）
+        const match = /^([A-Za-z_][\w]*)(\[(\d+)\])?(\..+)?$/.exec(change.path)
+        if (!match) return acc
+        const [, root, , index, rest] = match
+        if (index === undefined) {
+          if (rest === undefined) acc[root] = change.after
+          return acc
+        }
+        const list = Array.isArray(acc[root]) ? [...(acc[root] as unknown[])] : []
+        const position = Number(index)
+        if (rest === undefined) {
+          list[position] = change.after
+        } else {
+          const current = (list[position] ?? {}) as Record<string, unknown>
+          list[position] = { ...current, [rest.replace(/^\./, '')]: change.after }
+        }
+        acc[root] = list
+        return acc
+      }, structuredSummary ? { ...structuredSummary } : {})
+
+      setStructuredSummary(next)
+      // 摘要变了 → `known_info` 也要跟着变，否则用户确认的修正进不了提示词
+      setSummaryExtras(buildExtrasFromSummary(next))
+      setPendingSummary(null)
+      void handleGenerateDocument('prd')
+    },
+    [structuredSummary, handleGenerateDocument],
+  )
+
+  /** 「拒绝更改」：摘要一字不动，照常生成（用户只是不接受这次回填）。 */
+  const rejectSummaryChanges = useCallback(() => {
+    setPendingSummary(null)
+    void handleGenerateDocument('prd')
+  }, [handleGenerateDocument])
+
   /**
    * AI 优化：只改一节（F8.6）。
    *
@@ -1300,7 +1460,9 @@ export default function App() {
 
       // 结构化表单里"20 题装不下"的那部分（页面结构、关键交互、范围、LLM 说明、可用性）
       // 排在最前面：它是用户**明确填过**的内容，比从对话里抠出来的更硬。
-      const knownInfo = [structuredExtras, buildKnownInfo(messages)].filter(Boolean).join('\n\n')
+      const knownInfo = [structuredExtras, summaryExtras, ragExtras, buildKnownInfo(messages)]
+        .filter(Boolean)
+        .join('\n\n')
       const context = {
         form: submitted ?? {},
         ...(knownInfo ? { known_info: knownInfo } : {}),
@@ -1806,25 +1968,50 @@ export default function App() {
               条件见 `showStartPrd` / `canStartPrd`：还没收到 AI 回复时**不显示**
               （开场那一轮还没回来，显示灰按钮没意义），收到之后**显示但可能禁用**，
               并在旁边说明还差什么。 */}
+          {summarySyncError && (
+            <p role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              {summarySyncError}
+            </p>
+          )}
+
+          {/* 回填的 diff：**生成前**让用户逐条确认（见 `handleGeneratePrdWithSync`）。
+              面板自带的两个按钮分别走 `applySummaryChanges()` 与 `rejectSummaryChanges()`，
+              两条路都会继续生成 —— 拒绝回填不等于放弃生成。 */}
+          {pendingSummary && (
+            <SummaryDiffPanel
+              changes={pendingSummary.changes}
+              busy={summarySyncBusy}
+              title={values.product_name}
+              onConfirm={applySummaryChanges}
+              onReject={rejectSummaryChanges}
+            />
+          )}
+
           {showStartPrd && (
             <div className="flex flex-wrap items-center gap-3 border-t border-slate-100 pt-3">
               <button
                 type="button"
                 data-testid="start-prd"
-                onClick={() => void handleGenerateDocument('prd')}
-                disabled={!canStartPrd}
+                onClick={() => void handleGeneratePrdWithSync()}
+                disabled={!canStartPrd || summarySyncBusy || pendingSummary !== null}
                 className="inline-flex items-center gap-1.5 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-primary-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 disabled:cursor-not-allowed disabled:bg-slate-300"
               >
-                <Sparkles className="h-4 w-4" aria-hidden />
-                {prdContent ? '重新生成 PRD' : '生成 PRD'}
+                {summarySyncBusy ? (
+                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                ) : (
+                  <Sparkles className="h-4 w-4" aria-hidden />
+                )}
+                {summarySyncBusy ? '正在比对对话…' : prdContent ? '重新生成 PRD' : '生成 PRD'}
               </button>
               <span className="text-xs text-slate-400">
-                {!dialogueFinished
-                  ? '等 AI 说聊完了（`stage_status` = `done`）才能生成。'
-                  : prdContent
-                    // ⚠️ 纯字符串里**不能写 `**加粗**`** —— 它不是 Markdown，会把星号原样显示给用户
-                    ? '已经有了 PRD —— 重新生成会覆盖它；想只改一节请用审核页的「AI 优化」。'
-                    : '澄清已结束，可以生成 PRD 了。'}
+                {pendingSummary
+                  ? '上面有对话回填的改动，确认或拒绝之后才会开始生成。'
+                  : !dialogueFinished
+                    ? '等 AI 说聊完了（`stage_status` = `done`）才能生成。'
+                    : prdContent
+                      // ⚠️ 纯字符串里**不能写 `**加粗**`** —— 它不是 Markdown，会把星号原样显示给用户
+                      ? '已经有了 PRD —— 重新生成会覆盖它；想只改一节请用审核页的「AI 优化」。'
+                      : '澄清已结束，可以生成 PRD 了（会先把对话里说过的改动列出来让你确认）。'}
               </span>
             </div>
           )}
@@ -1833,6 +2020,32 @@ export default function App() {
 
       {load.status === 'ok' && activeDoc && (
         <>
+          {pendingRag && (
+            <RagHitsPanel
+              hits={pendingRag.hits}
+              corpusSize={pendingRag.corpusSize}
+              busy={ragBusy || isGenerating}
+              onConfirm={(selected) => {
+                setRagExtras(
+                  selected.length === 0
+                    ? ''
+                    : [
+                        '接口文档参考资料（检索自团队规范与历史示例）：',
+                        ...selected.map(
+                          (hit) => `【${hit.kind}】${hit.title}（${hit.source}）\n${hit.content}`,
+                        ),
+                      ].join('\n\n'),
+                )
+                setPendingRag(null)
+                ragConfirmedRef.current = true
+                void handleGenerateDocument('api')
+              }}
+              onCancel={() => {
+                // 取消 = 不调用生成接口（用户明确要求）
+                setPendingRag(null)
+              }}
+            />
+          )}
           <DocumentReview
             className="min-h-0 flex-1"
             title={DOC_META[activeDoc].title}
