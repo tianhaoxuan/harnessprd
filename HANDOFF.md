@@ -1,7 +1,7 @@
 # HANDOFF —— 交接说明
 
 > 写给接手开发的**人 / AI**。读完这一份再读别的。
-> 最后更新：前端表单页 + 对话组件（`MessageList` / `ChatInput`）完成浏览器实测时。
+> 最后更新：LLM 观测 / token 预算 / 「一次产物生成 = 一个 run」跨分片合并落地，前端生成观测 UI 完成之后（维护范围见 §11 第 9 条：**只维护 V2**）。
 
 ---
 
@@ -419,8 +419,21 @@ $env:PYTHONIOENCODING='utf-8'
 | 6 | **提示词常量的落点** | `services/prompts.py` 只放**名字**，正文仍只在 `core/prompts/*.md`；常量由 `core.prompts.assemble_prompt_template()` 组装 | 避免第二份来源（§4 坑 #10）。`smoke_check.py` 有一条断言**逐字比对**常量与 `.md`——谁复制正文进 Python，它立刻失败 |
 | 7 | **LLM 工厂门面** | 新增 `services/llm_factory.py` 的 `get_llm()`，**转发**到既有的 `build_chat_model()`，不复制实现；**保留 deepseek** | 只留 anthropic / openai 会断掉唯一配了 Key 的链路（`validation_out/` 那 7 份留档全靠它） |
 | 8 | **API 版本段** | **保留 `/api/v1/`**，不改造成裸 `/api/` | 自检与文档全部按 `/api/v1` 写；版本段是将来做破坏性变更时唯一的退路（`docs/接口文档模板.md` 的原则也是「路径前缀 `/api/v1/`，破坏性变更才升版本」）。已因漏 `/v1` 排查过三次，故写进本节，并在 `backend/README.md` 加了可直接复制的 curl |
+| 9 | **维护范围：只维护 V2** | 以后**只维护 `/v2*`**（`/v2` 新建、`/v2/:id` 编辑、`/v2/list` 列表）；**V1 的 `/` 保留现状、不再维护** —— 不删、不补功能、不为它写新分支。localStorage 持久化层**暂时保留**（V2 仍在用它：表单草稿 / 结构化录入摘要 / 入口模式偏好 + 首屏秒开缓存） | `/` 与 `/v2*` 的路由都在 `frontend/src/main.tsx`；V2 外壳是 `frontend/src/pages/V2Workbench.tsx`。⚠️ 两种版本渲染**同一个** `App`（`frontend/src/App.tsx`），所以「只改 V2」通常意味着**只动外壳/路由层** |
 
 > 第 2 条是本轮发现的**第三处设计文档互相矛盾**（前两处见 §10 第 1、3 条）。判定依据：
 > `状态数据设计.md` 与 `会话持久化方案.md` 详细定义了数据契约与接口面，而 `功能清单.md`
 > 只在某行功能描述里带过；且 `接口文档模板.md` §3.1 的原则是「路径不带版本以外的前缀」——
 > `/api/v1/conversation/sessions` 多了一层无意义前缀。
+
+> **第 9 条（只维护 V2）落地时注意三件事**，都是读代码时容易踩的：
+>
+> 1. **`App` 是两版共用的**。在 `App` 内部的改动会**同时出现在 V1 的 `/`** —— 这不是 bug，
+>    是复用（见 `pages/V2Workbench.tsx` 的文件头）。所以「只改 V2」= 只动外壳层与路由；
+>    真要动 `App`，验收只看 V2 三条路由即可，不必再为 `/` 补测试。
+> 2. **不能按 `sessionId` 判断「是不是 V1」**：`/v2`（新建）与 `/` 的 `sessionId` 都是 `null`
+>    （`V2Workbench.tsx` 里 `id && !fromSelf ? id : null`）。要区分必须由 V2 外壳**显式传开关**。
+> 3. **V1 现在也会写服务端库**：`ensureSessionSaved()` 没设门槛（`App.tsx` 里挂在「开始对话」
+>    「生成 / 重新生成」「PRD 入口」三个按钮上），所以 V1 建的方案会进 `backend/harnessprd.db`，
+>    也会出现在 `/v2/list`。既然 V1 不维护，暂时**接受**这个行为；将来若要把 V1 隔离成本地-only，
+>    做法见第 2 条（加开关，别按 `sessionId` 判）。
