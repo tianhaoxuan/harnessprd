@@ -416,6 +416,83 @@ export function stepsForMode(mode: EntryMode): readonly (typeof STEPS)[number][]
  * 两种情况特殊：`done` 归到末尾；该入口没有这一步（例如快捷入口下落到 `chatting`）
  * 归到 **0**（进度条不许倒退），而不是「全部完成」 —— 后者会让进度看起来是满的。
  */
+// ---------------------------------------------------------------- 观测（01/02 后端产出）
+
+/**
+ * 一次 LLM 调用的摘要（`run_summary.steps[]`）。
+ *
+ * ⚠️ 字段**全部 optional**：后端可能不发、也可能只发一部分。消费处一律按「可能没有」处理，
+ * 后端没上线时页面不能崩。
+ */
+export interface RunStepSummary {
+  step: string
+  input_tokens?: number
+  output_tokens?: number
+  duration_ms?: number
+}
+
+/** 整趟流程的汇总（SSE `run_summary` 事件）。 */
+export interface RunSummary {
+  request_id: string
+  run_type: string
+  total_duration_ms: number
+  total_input_tokens: number
+  total_output_tokens: number
+  llm_call_count: number
+  /** PRD 是否自动改过一轮（决定第 3 步是 done 还是 pending） */
+  revision_applied?: boolean
+  steps?: RunStepSummary[]
+  /** 预算检查结果（02）；前端只用 level 看告警，不展示百分比 */
+  budget?: {
+    estimated_input_tokens: number
+    budget_tokens: number
+    ratio: number
+    level: string
+  }
+
+  // ---------- 一次产物生成 = 一个 run（04 观测修复）----------
+  // 背景：接口文档 / 提示词套件是**分片生成**的（前端按 `getDocumentPlan()` 循环发 N 次
+  // SSE 请求），而 `run_summary` 本来是**每请求一份** —— 所以界面上「本次生成」显示的
+  // 只是**最后一片**的账（实测提示词套件最后一片只有 1 个文件：用户等了 2 分钟，面板写 12s）。
+  // 后端现在按请求头 `X-Run-ID` 把同一趟的各片并起来，这里就是那份合计的形状。
+  //
+  // ⚠️ 全部 optional：老后端（或后端回滚）不带这些键，前端要按"没有"处理而不是崩。
+  // ⚠️ `total_*` 的**语义随分片进度变化**：第 1 片的帧里它只算那一片，最后一片的帧里
+  // 才是整份合计（后端边跑边累加）。前端不做相加 —— 耗时是墙钟，各片相加必然错。
+
+  /** 本次生成的 run id（请求头 `X-Run-ID` 回显）。**拿它一条 grep 能查全整份** */
+  run_id?: string
+  /** 这一趟已经并进来的各片 `request_id`（顺序同发片顺序） */
+  request_ids?: string[]
+  /** 当前帧是第几片（1 基） */
+  part_index?: number
+  /** 这一趟一共几片（= 前端 `plan.parts.length`） */
+  part_total?: number
+  /** 后端**已经并进来**的片数。`< part_total` 就说明还有片没入账 */
+  parts_seen?: number
+  /** 整份是否已经并完（`false` = 这一帧只是阶段性合计，**不能当"整份完整"显示**） */
+  complete?: boolean
+  /** 当前这一片自己的墙钟耗时（`total_duration_ms` 是整份墙钟，两者不是一回事） */
+  part_duration_ms?: number
+}
+
+/**
+ * 上下文占用（澄清流 `done.context_usage`）。
+ *
+ * 前端**只按 `level` 决定是否显示 amber 提示**；不用百分比进度条，
+ * `budget_source` / `hardware_cap` 这类调试字段一律不展示（会被当成 bug）。
+ */
+export interface ContextUsage {
+  estimated_input_tokens: number
+  budget_tokens: number
+  ratio: number
+  level: 'ok' | 'warn' | 'exceed'
+  budget_source?: 'policy' | 'hardware'
+  model?: string
+  policy_cap?: number
+  hardware_cap?: number
+}
+
 export function stepIndexOf(mode: EntryMode, view: ViewState): number {
   if (view === 'done') return stepsForMode(mode).length
   const stepId = STEPS[VIEW_TO_STEP[view]]?.id

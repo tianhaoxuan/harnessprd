@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertCircle,
   Check,
@@ -234,6 +234,27 @@ interface DocumentReviewProps {
   /** 底部自定义操作按钮（通过 / 打回 / 重生成……）。**忙碌时组件会自动禁用它们** */
   actions?: DocumentAction[]
   className?: string
+  /**
+   * 观测插槽（03）：本组件**只负责摆放**，内容一律由调用方给。
+   *
+   * 为什么用插槽、而不是让本组件自己去订阅观测 state：见文件头那张"这个组件不做的事"表 ——
+   * 观测属于编排层（`App` + `hooks/useGenerationObservability`），组件要保持纯展示、
+   * 可离线渲染。传 `ReactNode` 是这两条约束唯一能同时满足的形状：组件不知道
+   * `RunSummary` 长什么样，后端换字段也不用改这里。
+   *
+   * 四个位置（都在正文之外，**不动任何现有结构**）：
+   * - `stepperSlot`：正文**之上**（步骤条 + 已等待秒数）
+   * - `warnSlot`：紧接步骤条之下（澄清接近上限 / 预算告警这类 amber 提示）
+   * - `errorSlot`：接在 `failed` 分支的失败原因**之后** —— 那里只该放"可复制的请求 ID"，
+   *   失败正文已经由 `failureReason` 说过一遍，再整条横幅塞进来会把同一句话显示两遍
+   * - `summarySlot`：正文**之下**（`RunSummaryPanel` / `ClarificationContextPanel`）
+   *
+   * 全部可选：不传插槽时，渲染出来的 DOM 与加插槽之前**完全一致**。
+   */
+  stepperSlot?: ReactNode
+  warnSlot?: ReactNode
+  errorSlot?: ReactNode
+  summarySlot?: ReactNode
 }
 
 // ---------------------------------------------------------------- 状态呈现
@@ -315,6 +336,10 @@ export default function DocumentReview({
   progress,
   actions = [],
   className = '',
+  stepperSlot,
+  warnSlot,
+  errorSlot,
+  summarySlot,
 }: DocumentReviewProps) {
   const isGenerating = status === 'generating'
   const isEditable = EDITABLE.has(status)
@@ -488,6 +513,12 @@ export default function DocumentReview({
         </div>
       </header>
 
+      {/* ---------- 观测：步骤条 / 告警（正文之上，03）----------
+          `mx-4` 与下面各块对齐；插槽为空时连外层 `div` 都不渲染，
+          所以不传插槽的那条路径，DOM 与改动前**完全一致**。 */}
+      {stepperSlot && <div className="mx-4">{stepperSlot}</div>}
+      {warnSlot && <div className="mx-4">{warnSlot}</div>}
+
       {/* ---------- 失败原因 ---------- */}
       {status === 'failed' && (
         <div
@@ -502,6 +533,8 @@ export default function DocumentReview({
               下面是<strong className="font-medium">当前保留的版本</strong>，重试请用底部操作按钮。
             </span>
           </span>
+          {/* 观测（03）：失败正文上面已经给过了，这里只补"复制请求 ID" */}
+          {errorSlot && <span className="ml-auto shrink-0">{errorSlot}</span>}
         </div>
       )}
 
@@ -578,6 +611,9 @@ export default function DocumentReview({
           )}
         </div>
       )}
+
+      {/* ---------- 观测：整趟汇总（正文之下，03）---------- */}
+      {summarySlot && <div className="mx-4">{summarySlot}</div>}
 
       {/* ---------- AI 优化（F8.6）----------
           ⚠️ `approved` 时**不给**优化入口：这一状态本身就不可编辑（见 `EDITABLE` 的说明），

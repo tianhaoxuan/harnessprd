@@ -23,6 +23,15 @@ import SummaryDiffPanel, {
 } from './components/SummaryDiffPanel'
 import MessageList from './components/MessageList'
 import StepProgress from './components/StepProgress'
+// ---------- 观测（03）----------
+// 四个展示组件 + 一个 hook。**组件只负责摆放，state 全在 hook 里** ——
+// 页面里不该出现"步骤怎么变、秒表怎么走"这类与业务流程无关的代码。
+import ClarificationContextPanel from './components/ClarificationContextPanel'
+import ClarificationWarnBanner from './components/ClarificationWarnBanner'
+import GenerationStepper from './components/GenerationStepper'
+import RunSummaryPanel from './components/RunSummaryPanel'
+import StreamErrorBanner from './components/StreamErrorBanner'
+import { useGenerationObservability } from './hooks/useGenerationObservability'
 import {
   continueConversationStream,
   describeApiError,
@@ -34,6 +43,8 @@ import {
   generatePromptsStream,
   getDocumentPlan,
   getQuestions,
+  // 观测（04）：一次产物生成 = 一次 run，run id 只在编排层生成一次（样式见 `newRunId` 的说明）
+  newRunId,
   optimizeDocumentStream,
   readDialogueStageStatus,
   startConversationStream,
@@ -41,6 +52,8 @@ import {
   syncSummaryFromConversation,
   type RagHit,
   type StreamChunkMeta,
+  type StreamHandlers,
+  type StreamOptions,
 } from './services/api'
 import {
   clearFormDraft,
@@ -144,6 +157,22 @@ const DOC_META: Record<
 
 /** 链条顺序：PRD 是唯一源头，接口文档从 PRD 推导，套件消费前两者（`HANDOFF.md` §1）。 */
 const DOC_ORDER: DocKind[] = ['prd', 'api', 'prompts']
+
+/**
+ * `run_summary.run_type` → 它属于哪一份产物（03）。
+ *
+ * ⚠️ **必须有这张表。** `run_summary` 是**一份共享 state**，而澄清流与三份产物都会往里写；
+ * 不按 `run_type` 过滤的话，聊完天切到 PRD 页就会看到"澄清那一轮"的统计挂在 PRD 正文下面
+ * —— 数字是真的、但说的是别的事。
+ *
+ * 取值来自后端 `api/conversation.py` 里那 8 处 `run_type=`（PRD 有两个入口：
+ * 带双智能体审核的 `generate_prd_from_summary` 与表单路径的 `generate_prd`）。
+ */
+const DOC_RUN_TYPES: Record<DocKind, readonly string[]> = {
+  prd: ['generate_prd', 'generate_prd_from_summary'],
+  api: ['generate_api_docs'],
+  prompts: ['generate_prompts'],
+}
 
 /**
  * **每个审核阶段的操作配置。**
@@ -746,8 +775,17 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     api: false,
     prompts: false,
   })
-  /** 最近一次产物失败。记录是**哪一份**失败的 —— 否则切到别的文档页会看到不相干的报错。 */
-  const [docFailure, setDocFailure] = useState<{ kind: DocKind; message: string } | null>(null)
+  /**
+   * 最近一次产物失败。记录是**哪一份**失败的 —— 否则切到别的文档页会看到不相干的报错。
+   *
+   * `requestId`（03）来自 `StreamError`：失败时后端会回一个请求 ID，用户复制给维护者
+   * 就能直接定位那一趟日志。没有它时（网络断了、后端没起）保持 `null`，界面不显示复制按钮。
+   */
+  const [docFailure, setDocFailure] = useState<{
+    kind: DocKind
+    message: string
+    requestId?: string | null
+  } | null>(null)
   /** 正在流式接收的产物正文（与 `content` 分开，理由同对话侧的 `streamingContent`）。 */
   const [streamingDoc, setStreamingDoc] = useState('')
   /**
@@ -772,6 +810,45 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
   const sessionPendingSince = useRef<number | null>(null)
   /** 同上：产物流失败时也要能拿到已收到的部分。 */
   const docPartialRef = useRef('')
+
+  /**
+   * 观测（03）：步骤条 / 秒表 / `run_summary` / 上下文占用 / 失败的请求 ID。
+   *
+   * **只实例化一次**，四个流程（澄清、PRD、接口文档、提示词）共用同一份 —— 每个流程各起
+   * 一份的话，切换流程时上一份的秒表还在跑、步骤条还留着上一趟的状态。
+   *
+   * ⚠️ 这些 `useCallback` 的身份会随秒表每秒变一次（`captureStreamError` 依赖
+   * `generationElapsed`），所以它们**不能**出现在任何 effect 的依赖里 —— 现在没有，
+   * 加 effect 时要留意。
+   */
+  const {
+    runSummary,
+    contextUsage,
+    generationSteps,
+    generationElapsed,
+    generationHint,
+    errorRequestId,
+    clarificationRounds,
+    // 观测（04）：本次生成用的 run id —— 产物汇总面板按它归属（取代原先只看 run_type）
+    activeRunId,
+    resetGeneration,
+    resetErrorMeta,
+    resetClarification,
+    startRun,
+    startTimer,
+    stopTimer,
+    beginPrdGeneration,
+    beginApiDocsGeneration,
+    beginPromptsGeneration,
+    beginOptimizeGeneration,
+    captureStreamError,
+    copyErrorRequestId,
+    createPrdHandlers,
+    createApiDocsHandlers,
+    createPromptsHandlers,
+    createOptimizeHandlers,
+    createClarificationHandlers,
+  } = useGenerationObservability()
 
   const readDoc = useCallback(
     (kind: DocKind): string =>
@@ -1287,6 +1364,9 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       setRoundIndex(1)
       // 新会话开始了，之前那条"已恢复上次的会话"的提示就该消失
       setNotice(null)
+      // 观测（03）：轮次归零，澄清的上下文/分轮统计也要跟着归零 ——
+      // 不然新一轮的占用会追加在旧列表后面，界面上显示"第 4 轮"而实际只聊过 1 轮。
+      resetClarification()
       partialRef.current = ''
       setSending(true)
 
@@ -1304,6 +1384,10 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
           { form: formValues },
           {
             signal: controller.signal,
+            // 观测（03）：澄清流只在 `done` 里带 `context_usage`（后端按轮估算上下文占用）。
+            // ⚠️ 只走这一条路 —— `readStream` 已经把 done 帧里的 usage 交给这个 handler 了，
+            // 下面的 `onDone` 里**不要**再读一次 `meta.context_usage`，否则同一轮会记两条。
+            ...createClarificationHandlers(),
             onChunk: (_text, fullText) => {
               partialRef.current = fullText
               setStreamingContent(fullText)
@@ -1346,7 +1430,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         }
       }
     },
-    [conversationId],
+    [conversationId, createClarificationHandlers, resetClarification],
   )
 
   const handleSubmit = useCallback(
@@ -1442,6 +1526,8 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
           },
           {
             signal: controller.signal,
+            // 观测（03）：接续轮同样只收 `done.context_usage`（理由见 `handleStartConversation`）
+            ...createClarificationHandlers(),
             onChunk: (_piece, fullText) => {
               partialRef.current = fullText
               setStreamingContent(fullText)
@@ -1488,7 +1574,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         }
       }
     },
-    [submitted, messages, roundIndex],
+    [submitted, messages, roundIndex, createClarificationHandlers],
   )
 
   // ---------------------------------------------------------------- 产物生成 / 优化
@@ -1724,6 +1810,22 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       setStreamingDoc('')
       setViewState(DOC_META[kind].generating)
 
+      // 观测（03）：新的一趟开始 —— 清掉上一趟的汇总/步骤/请求 ID，并把秒表归零。
+      // ⚠️ 顺序不能反：`resetGeneration` 会清空步骤条，先 `begin*` 就白设了。
+      // 清 `errorRequestId` 是必须的：否则上一次失败的请求 ID 会挂在新一趟的失败横幅旁边。
+      resetGeneration()
+      resetErrorMeta()
+      // 观测（04，一次产物 = 一次 run）：**这一趟的 run id 只在这里生成一次**，
+      // 下面每一片请求都带同一个（`X-Run-ID`），后端据此把各片并成整份合计。
+      // ⚠️ 顺序：必须在 `resetGeneration` 之后（它清汇总）、在第一个请求之前（后端的账按它分组）。
+      // 也在 `begin*` 之前 —— 步骤条与汇总都属于这一趟，一起就位。
+      const runId = newRunId()
+      startRun(runId)
+      if (kind === 'prd') beginPrdGeneration()
+      else if (kind === 'api') beginApiDocsGeneration()
+      else beginPromptsGeneration()
+      startTimer()
+
       // 结构化表单里"20 题装不下"的那部分（页面结构、关键交互、范围、LLM 说明、可用性）
       // 排在最前面：它是用户**明确填过**的内容，比从对话里抠出来的更硬。
       const knownInfo = [structuredExtras, summaryExtras, ragExtras, buildKnownInfo(messages)]
@@ -1735,13 +1837,42 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         // 变成空 —— 而留空等于告诉模型"这个维度没输入"，它就会拿邻近内容顶替（坑 #3）。
         ...(knownInfo ? { known_info: knownInfo } : {}),
       }
+      /**
+       * 观测（03）：三份产物的 handler 集合**不一样** —— PRD 有双智能体的阶段事件
+       * （`onStage`），接口文档与提示词套件没有机器审查那一步，只有 `done`。
+       * 用 `Pick<StreamHandlers, …>` 挑出来的那份，缺的字段就是 `undefined`，
+       * 所以下面一律用 `?.` 调。
+       *
+       * ⚠️ 类型必须标成 `StreamHandlers`：三个 `Pick<…>` 的**联合类型**只允许访问
+       * 它们共有的字段（`onRunSummary`），`obsHandlers.onDone` 会直接报
+       * 「Property 'onDone' does not exist on type」—— 实测踩到过。
+       */
+      const obsHandlers: StreamHandlers =
+        kind === 'prd'
+          ? createPrdHandlers()
+          : kind === 'api'
+            ? createApiDocsHandlers()
+            : createPromptsHandlers()
+
       // 跨片累加的格位：`onDone` 里写、循环里读。
       // **必须是局部变量**：state 在同一个 tick 里读不到刚写的值。
       let truncatedAnyPart = false
-      // 失败时报告"断在第几片"（只在分片生成时有意义）
+      /**
+       * 循环里当前/断在第几片（1 基，只在分片生成时有意义）。
+       *
+       * ⚠️ 它有两个用途：失败时报告"断在第几片"，以及让 `onDone` 判断"这是不是最后一片"。
+       * 后者不能靠闭包里的 `offset` —— `baseOptions` 是在循环**之外**建好的，看不到循环变量。
+       */
       let failedPart: number | null = null
+      /** 这次要生成几片。`onDone` 靠它判断"这是不是最后一片"（分片计划到手后才填）。 */
+      let planTotal = 0
 
-      const options = {
+      /**
+       * 循环**之外**就建好的公共选项（正文回调、截断标记、阶段、汇总）。
+       *
+       * ⚠️ 它**不含** run 头：片序号是循环变量，只能在循环里拼 —— 见 `withPart`。
+       */
+      const baseOptions = {
         signal: controller.signal,
         onChunk: (_piece: string, fullText: string) => {
           docPartialRef.current = fullText
@@ -1766,6 +1897,10 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
          */
         onDone: (meta: StreamChunkMeta) => {
           if (meta.truncated === true) truncatedAnyPart = true
+          // 观测（03）：分片生成时 `onDone` **每一片都会回调一次** —— 只有最后一片
+          // 才允许把步骤条收成"全部完成"。不判这一下的话，第 1 片回来界面上两步就都打勾了，
+          // 而后面还有两片在跑。
+          if (failedPart === planTotal) obsHandlers.onDone?.(meta, docPartialRef.current)
         },
         /**
          * 双智能体的阶段事件。**重写时必须清空这一片的缓冲** —— 重写是从零重写的，
@@ -1777,7 +1912,17 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
             docPartialRef.current = ''
             setStreamingDoc('')
           }
+          // 观测（03）：阶段 → 步骤条（`writing/reviewing/rewriting` → 起草/审查/修订）
+          obsHandlers.onStage?.(stage)
         },
+        /**
+         * 观测（03/04）：整趟汇总。后端在 `done` 之前发一帧 `run_summary`。
+         *
+         * 分片生成时**每一片各发一帧**：归属判定（按 `run_id`）在 hook 里，
+         * 同一 run 的**后到者覆盖前者是预期的** —— 后端把整份合计放进后到的那一帧
+         * （第 1 片的帧只算第 1 片）。前端不做相加：耗时是墙钟、且有并发。
+         */
+        onRunSummary: obsHandlers.onRunSummary,
       }
 
       try {
@@ -1789,6 +1934,8 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         if (kind === 'prd') setPrdStage(null)
         const plan = await getDocumentPlan(kind)
         setDocProgress({ kind, total: plan.parts.length, part: 0, label: plan.source })
+        // 观测（03）：分片数要留给 `onDone`（它只能靠闭包里的可变格位判断"最后一片"）
+        planTotal = plan.parts.length
 
         // ---------- 逐片生成、逐片累加 ----------
         const pieces: string[] = []
@@ -1797,6 +1944,20 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
           setDocProgress({ kind, total: plan.parts.length, part: offset + 1, label: part.label })
           docPartialRef.current = ''
           setStreamingDoc('')
+          /**
+           * 这一片的请求头（观测 04）：**同一个 `runId`、逐片递增的 `partIndex`、
+           * 固定的 `partTotal`**。后端据此把 N 次请求并成"一次产物生成"，
+           * 否则每片各记一份账，界面上「本次生成」只会显示最后一片。
+           *
+           * 每片新建对象、只多三个可选字段 —— 片序号是循环变量，
+           * 放在循环外建的话每一片都会带上同一（错误的）序号。
+           */
+          const options: StreamOptions = {
+            ...baseOptions,
+            runId,
+            partIndex: offset + 1,
+            partTotal: plan.parts.length,
+          }
           const scope = { outline: part.outline, scope: part.scope, spec: part.spec }
           // 摘要不在时**从表单草稿重建**：摘要是内存态，刷新就没，而它决定要不要走
           // 双智能体审核 —— 不重建就会静默退回没有审核的表单路径（实测踩过）。
@@ -1857,7 +2018,10 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       } catch (error) {
         // 被掐掉的不算失败（清空重来 / 卸载）
         if (controller.signal.aborted) return
-        const message = describeApiError(error)
+        // 观测（03）：文案改成「生成在『机器审查』阶段失败 · 已等待 27s · 原因」，
+        // 并把后端给的 `request_id` 一起收下（界面在失败横幅右侧给一个复制按钮）。
+        // `elapsedSeconds` 不传：hook 里默认就用当前秒表值。
+        const { message, requestId } = captureStreamError(error)
         // ⚠️ **不把半截内容写进产物**：一次失败的重生成会把上一版好文档顶掉。
         // 分片生成时这条**尤其重要** —— 前几片可能已经成功了，但拼起来的仍然是残的
         // （缺后面几章却看着像完整文档），比"生成失败"危险得多。
@@ -1870,11 +2034,14 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
             failedPart !== null
               ? `${message}（分片生成中断在第 ${failedPart} 片，未写入任何内容 —— 已生成的分片不保留，避免留下缺章的残文档）`
               : message,
+          requestId,
         })
         setViewState(DOC_META[kind].review)
       } finally {
         setDocProgress(null)
         setStreamingDoc('')
+        // 观测（03）：秒表一定要停 —— 它是个 `setInterval`，不停会一直给组件喂 state
+        stopTimer()
         if (docAbortRef.current === controller) {
           setIsGenerating(false)
           setGeneratingKind(null)
@@ -1882,7 +2049,31 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         }
       }
     },
-    [isGenerating, prdContent, apiDocsContent, messages, submitted, structuredSummary, writeDoc],
+    [
+      isGenerating,
+      prdContent,
+      apiDocsContent,
+      messages,
+      submitted,
+      structuredSummary,
+      writeDoc,
+      // 观测（03）。⚠️ `captureStreamError` 的依赖里带着秒表，所以它**每秒换一次身份**，
+      // 这个 callback 也就跟着每秒换一次 —— 可接受：生成期间 App 本来就因为秒表在重渲染，
+      // 而这里没有被任何 effect 依赖（加 effect 时要留意这一条）。
+      resetGeneration,
+      resetErrorMeta,
+      // 观测（04）：run id 相关的两处依赖（`startRun` 与 `activeRunId` 见下面的过滤逻辑）
+      startRun,
+      startTimer,
+      stopTimer,
+      beginPrdGeneration,
+      beginApiDocsGeneration,
+      beginPromptsGeneration,
+      captureStreamError,
+      createPrdHandlers,
+      createApiDocsHandlers,
+      createPromptsHandlers,
+    ],
   )
 
   // ---------------------------------------------------------------- 对话 → 摘要回填
@@ -1997,6 +2188,16 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       setDocFailure(null)
       setStreamingDoc('')
 
+      // 观测（04）：AI 优化跟三份产物一样会发 `run_summary`，所以**接同一套观测**。
+      // 它是**单请求**（后端按 `1/1` 记账），但 run id 照样要生成：不生成的话
+      // `handleRunSummary` 的归属判定会把这一帧丢掉，优化完面板上什么都不显示。
+      resetGeneration()
+      resetErrorMeta()
+      const runId = newRunId()
+      startRun(runId)
+      beginOptimizeGeneration()
+      startTimer()
+
       // 结构化表单里"20 题装不下"的那部分（页面结构、关键交互、范围、LLM 说明、可用性）
       // 排在最前面：它是用户**明确填过**的内容，比从对话里抠出来的更硬。
       const knownInfo = [structuredExtras, summaryExtras, ragExtras, buildKnownInfo(messages)]
@@ -2006,8 +2207,20 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         form: submitted ?? {},
         ...(knownInfo ? { known_info: knownInfo } : {}),
       }
-      const options = {
+      /**
+       * 观测（04）：优化的观测接线。
+       *
+       * 它是**单请求**，所以 run 头固定 `1/1`（后端按一片记账）；`runId` 是这个请求
+       * 自己的那一趟 —— 面板按它归属，别把上一份产物的汇总挂到这一节上。
+       */
+      const options: StreamOptions = {
         signal: controller.signal,
+        runId,
+        partIndex: 1,
+        partTotal: 1,
+        // 汇总（耗时 / tokens / 调用次数）与失败时的 request_id 都走 hook 那一套；
+        // 原先这条路上一个都没接，所以优化既没有统计、失败也没有可复制的 id。
+        ...createOptimizeHandlers(),
         onChunk: (_piece: string, fullText: string) => {
           docPartialRef.current = fullText
           setStreamingDoc(fullText)
@@ -2058,9 +2271,14 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         setApprovedDocs((prev) => ({ ...prev, [kind]: false }))
       } catch (error) {
         if (controller.signal.aborted) return
-        setDocFailure({ kind, message: describeApiError(error) })
+        // 观测（03/04）：失败时把后端给的 `request_id` 一起收下 —— 成功面板上有 run id，
+        // 失败横幅上也得有一串能查日志的（原先这里只留一句文案）。
+        const { message, requestId } = captureStreamError(error)
+        setDocFailure({ kind, message, requestId })
       } finally {
         setStreamingDoc('')
+        // 观测（03）：秒表必须停（`setInterval`，不停会一直给组件喂 state）
+        stopTimer()
         if (docAbortRef.current === controller) {
           setIsGenerating(false)
           setGeneratingKind(null)
@@ -2068,7 +2286,23 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         }
       }
     },
-    [isGenerating, prdContent, messages, submitted, readDoc, writeDoc],
+    [
+      isGenerating,
+      prdContent,
+      messages,
+      submitted,
+      readDoc,
+      writeDoc,
+      // 观测（03/04）：与 `handleGenerateDocument` 同一套依赖（理由见那边的说明）
+      resetGeneration,
+      resetErrorMeta,
+      startRun,
+      startTimer,
+      stopTimer,
+      beginOptimizeGeneration,
+      captureStreamError,
+      createOptimizeHandlers,
+    ],
   )
 
   /**
@@ -2351,6 +2585,12 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     setStreamingDoc('')
     setIsGenerating(false)
     setGeneratingKind(null)
+    // 观测（03）：整轮观测状态一起清 —— 秒表、步骤条、汇总、上下文档位、失败的请求 ID。
+    // ⚠️ 秒表必须**停**：它是个 `setInterval`，不停会一直给这个已经清空的页面喂 state。
+    stopTimer()
+    resetGeneration()
+    resetClarification()
+    resetErrorMeta()
     // ⚠️ 双智能体阶段是**上一次生成**的痕迹：不清就会在还没开始生成 PRD 时
     // 挂着「审核通过」（实测被用户当场抓到）。同一批会话态一起清：
     // 摘要/附加项/待确认项都属于这一轮，留着会让下一轮悄悄继承旧输入。
@@ -2366,7 +2606,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     setViewState('form')
     clearFormDraft()
     clearSession()
-  }, [])
+  }, [stopTimer, resetGeneration, resetClarification, resetErrorMeta])
 
   /**
    * 真正交给列表渲染的消息。
@@ -2403,6 +2643,29 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     }
     return null
   }, [viewState])
+
+  /**
+   * 属于**当前这一趟生成**的汇总（观测 03/04）。
+   *
+   * ⚠️ 归属键是 **`run_id`**，不再是 `run_type`：分片生成（接口文档、提示词套件）是
+   * **N 次请求、N 帧 `run_summary`**，而 `run_type` 三片完全一样 —— 只看它的话，
+   * 面板上留下的永远是**最后一片**的账（实测：用户等了 2 分钟，面板写着 12s）。
+   * `run_id` 是"这几片是同一趟"的键，同 run 的后到帧覆盖先到帧（后端把整份合计放进后到帧）。
+   *
+   * ⚠️ 两道都必须：`run_id` 认这一趟，`run_type` 兜住**缺 `run_id` 的老后端**
+   * （那时退回改动前的行为，而不是整块面板消失）。`activeRunId` 为空（还没生成过）时
+   * 同样只认 `run_type` —— 刷新后重新进页面就是这种状态。
+   */
+  const docRunSummary = useMemo(() => {
+    if (!runSummary || !activeDoc) return null
+    const sameRun = Boolean(activeRunId) && runSummary.run_id === activeRunId
+    if (sameRun) return runSummary
+    // 老后端（帧里没有 run_id）或还没开过 run：退回按 run_type 归属
+    if (!runSummary.run_id) {
+      return DOC_RUN_TYPES[activeDoc].includes(runSummary.run_type) ? runSummary : null
+    }
+    return null
+  }, [runSummary, activeDoc, activeRunId])
 
   /**
    * 产物页底部的按钮。**按阶段配置生成**（`STAGE_ACTIONS`），不在渲染里写 if 链。
@@ -2746,6 +3009,22 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
             />
           )}
 
+          {/* ---------- 观测（03）：澄清上下文接近上限 ----------
+              放在「生成 PRD」按钮**正上方**：这条提示的下一步动作就是那个按钮，
+              放在顶部用户还要自己把两件事连起来。
+              ⚠️ 按钮**复用同一个入口与同一套可用性判据**（`handleGeneratePrdWithSync`
+              + `canStartPrd` / 回填未确认 / 保存中）—— 判据放松的话，这条提示就变成了
+              绕过「等 AI 说聊完了」这些前置条件的后门。 */}
+          <ClarificationWarnBanner
+            visible={contextUsage?.level === 'warn' || contextUsage?.level === 'exceed'}
+            onGeneratePrd={
+              canStartPrd && !summarySyncBusy && pendingSummary === null && !saveBusy
+                ? () => void handleGeneratePrdWithSync()
+                : undefined
+            }
+          />
+          <ClarificationContextPanel rounds={clarificationRounds} />
+
           {showStartPrd && (
             <div className="flex flex-wrap items-center gap-3 border-t border-slate-100 pt-3">
               <button
@@ -2884,6 +3163,41 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
             }
             onContentChange={(content) => handleDocChange(activeDoc, content)}
             onOptimize={(request) => handleOptimizeDocument(activeDoc, request)}
+            // ---------- 观测（03）：四个插槽，内容全在编排层决定 ----------
+            stepperSlot={
+              // 只在**这一份**正在生成时显示。步骤条本身不带 `run_type`（它是按阶段事件
+              // 推出来的），所以生成结束后它就过期了 —— 那时该看下面那个汇总面板。
+              isGenerating && generatingKind === activeDoc ? (
+                <GenerationStepper
+                  steps={generationSteps}
+                  elapsedSeconds={generationElapsed}
+                  hint={generationHint}
+                />
+              ) : undefined
+            }
+            errorSlot={
+              // 失败原因已经由 `failureReason` 渲染在同一个横幅里了，这里**只补复制按钮**
+              // （`showMessage={false}` 的作用就是只渲染那颗按钮）
+              docFailure?.kind === activeDoc && errorRequestId ? (
+                <StreamErrorBanner
+                  message=""
+                  showMessage={false}
+                  requestId={errorRequestId}
+                  onCopyRequestId={copyErrorRequestId}
+                />
+              ) : undefined
+            }
+            // 传 `undefined` 而不是空组件：否则插槽判断为真，正文下面会多一个空的 `mx-4`
+            // ⚠️ `streaming` 必须传：分片生成时第 1 片的帧里就只有 1/3，
+            // 不区分"还在跑"的话用户会读到一句假的"有一片没并进来"。
+            summarySlot={
+              docRunSummary ? (
+                <RunSummaryPanel
+                  summary={docRunSummary}
+                  streaming={isGenerating && generatingKind === activeDoc}
+                />
+              ) : undefined
+            }
           />
 
           {/* ⚠️ 该提醒的是**耗时**：一次要几分钟（实测 24–27 秒 + 排队），不说的话

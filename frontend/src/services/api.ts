@@ -26,6 +26,28 @@ import type {
  * ⚠️ **版本段 `/v1` 是刻意保留的，别去掉** —— 请求路径少了它会 404。
  * 决定与理由见 `HANDOFF.md` §11 第 8 条。
  */
+import type { ContextUsage, RunSummary } from '../types'
+
+/**
+ * 流里带出来的**结构化**错误。
+ *
+ * 比 `Error` 多两条给用户看的信息：
+ * - `code`：可编程判定（`TOKEN_BUDGET_EXCEEDED` 要显示后端那句友好中文，
+ *   而不是我们拼的「模型调用失败」）
+ * - `requestId`：出错时复制给维护者，拿它 grep 后端日志就能捞出整趟调用
+ */
+export class StreamError extends Error {
+  readonly code: string
+  readonly requestId: string | null
+
+  constructor(message: string, options: { code?: string; requestId?: string | null } = {}) {
+    super(message)
+    this.name = 'StreamError'
+    this.code = options.code ?? 'STREAM_ERROR'
+    this.requestId = options.requestId ?? null
+  }
+}
+
 export const API_BASE_URL = '/api/v1'
 
 /** 共享的 axios 实例。超时给 15s：对话单轮上限也是 15s（F3.14），对齐。 */
@@ -303,11 +325,47 @@ export interface StreamHandlers {
    * 否则两稿会拼在一起）、`done`（终稿，`issues` 非空表示还有没修完的审核意见，必须显示）。
    */
   onStage?: (stage: PrdGenerationStage) => void
+  /** 整趟流程的汇总（后端在 `done` 之前发一帧 `run_summary`） */
+  onRunSummary?: (summary: RunSummary) => void
+  /** 上下文占用（澄清流的 `done` 里带） */
+  onContextUsage?: (usage: ContextUsage) => void
 }
 
 export interface StreamOptions extends StreamHandlers {
   /** 取消用。**同一个 signal 要传给 `fetch`** —— 中断后 `reader.read()` 会抛 `AbortError`。 */
   signal?: AbortSignal
+  /**
+   * **本次生成**的 run id（一次生成的每一片都用同一个）。
+   *
+   * 为什么需要：产物是分片生成的（接口文档 / 提示词套件按后端的分片计划发 N 次请求），
+   * 而 `run_summary` 是**每请求一份** —— 不给后端一个把这几片认成同一趟的键，
+   * 它就只能按请求算账，界面上「本次生成」显示的会是**最后一片**的耗时与 tokens。
+   * 后端收到 `X-Run-ID` 后会把同 id 的各片并成整份合计。
+   *
+   * ⚠️ **只有产物生成要带**；澄清聊天不带（它不是产物、也不分片），
+   * 既然不给 `runId`，下面就不会发任何 run 头。
+   */
+  runId?: string
+  /** 第几片（**1 基**，来自 `getDocumentPlan()` 的顺序）。单请求产物固定 1。 */
+  partIndex?: number
+  /** 一共几片（`plan.parts.length`）。单请求产物固定 1。 */
+  partTotal?: number
+}
+
+/**
+ * 生成一个新的 run id：**同一次生成的所有分片请求都带它**，后端据此把分片并成一趟。
+ *
+ * 为什么优先 `crypto.randomUUID()`：它是浏览器内置的强随机 UUID。
+ * 为什么还要兜底：它只在**安全上下文**（https / localhost）里存在 —— 局域网 IP 上用
+ * `http://192.168.x.x:5173` 打开时 `crypto.randomUUID` 是 `undefined`，直接调会抛
+ * `TypeError` 把生成整条链路打断。兜底串只求"同一台机器同一时刻不撞"，
+ * 它**不做密码学用途**（后端只拿它当分组键 + grep 日志的键），所以时间戳 + 随机后缀就够。
+ */
+export function newRunId(): string {
+  // 写法与 `App.tsx` 的 `newConversationId()` 一致：先探测再调，别指望它一定在
+  const randomUUID = globalThis.crypto?.randomUUID
+  if (typeof randomUUID === 'function') return globalThis.crypto.randomUUID()
+  return `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
 }
 
 /**
@@ -355,6 +413,13 @@ export async function readStream(
             fullText += text
             handlers.onChunk?.(text, fullText)
           }
+        } else if (parsed.event === 'run_summary') {
+          // 后端把 type 也塞在 data 里，这里剥掉再交给上层。
+          // ⚠️ 同一次生成的**每一片**都会发一帧：`run_id` 是"这几片是同一趟"的键，
+          // 归属判定在上层（见 `useGenerationObservability` 的 `handleRunSummary`）。
+          const raw = (parsed.data ?? {}) as RunSummary & { type?: string }
+          const { type: _ignored, ...summary } = raw
+          handlers.onRunSummary?.(summary as RunSummary)
         } else if (parsed.event === 'stage') {
           const stage = (parsed.data ?? {}) as PrdGenerationStage
           // ⚠️ **重写要把这里累计的文本一起清掉。** 服务端说 `rewriting` 就是"上一稿整份作废、
@@ -367,11 +432,19 @@ export async function readStream(
           handlers.onStage?.(stage)
         } else if (parsed.event === 'done') {
           doneMeta = parsed.data as StreamChunkMeta
+          // 上下文占用跟着 done 一起回来（澄清首轮 / 接续轮）
+          const usage = (parsed.data as { context_usage?: ContextUsage } | null)?.context_usage
+          if (usage) handlers.onContextUsage?.(usage)
         } else if (parsed.event === 'error') {
-          const failure = parsed.data as { type?: string; message?: string } | null
-          throw new Error(
-            `模型调用失败（${failure?.type ?? 'Unknown'}）：${failure?.message ?? '无详情'}`,
-          )
+          const failure = parsed.data as
+            | { type?: string; message?: string; request_id?: string; code?: string }
+            | null
+          // 抛 StreamError 而不是 Error：上层要拿 code 判「是不是超预算」、拿 requestId 让用户复制。
+          // 少了这两条，用户只能报一句「失败了」，排查只能靠猜。
+          throw new StreamError(failure?.message ?? '模型调用失败，请重试', {
+            code: failure?.code ?? failure?.type ?? 'STREAM_ERROR',
+            requestId: failure?.request_id ?? null,
+          })
         }
       }
     }
@@ -416,19 +489,41 @@ async function toStreamError(response: Response): Promise<Error> {
   return new Error(`流式请求失败（HTTP ${response.status}）${detail ? `：${detail}` : ''}`)
 }
 
-/** POST 一个 JSON body，读它的 SSE 流。 */
+/**
+ * POST 一个 JSON body，读它的 SSE 流。
+ *
+ * run 头（`X-Run-ID` / `X-Part-Index` / `X-Part-Total`）在这里拼：**只有调用方给了
+ * `runId` 才拼**，所以澄清聊天那条路一个头都不带（行为与改动前完全一致）。
+ * 片序号只在**有效正整数**时才发：请求头契约是 1 基（`X-Part-Index: 1` 才是第一片），
+ * 顺手套一个 `0` / `NaN` / `undefined` 进去会让后端按错片号记账，日志里还对不上号。
+ * 不发更安全 —— 后端把缺头当 1/1 处理。
+ */
 async function postStream(
   path: string,
   body: unknown,
   options: StreamOptions = {},
 ): Promise<string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'text/event-stream',
+  }
+  if (options.runId) {
+    headers['X-Run-ID'] = options.runId
+    if (isPositiveInt(options.partIndex)) headers['X-Part-Index'] = String(options.partIndex)
+    if (isPositiveInt(options.partTotal)) headers['X-Part-Total'] = String(options.partTotal)
+  }
   const response = await fetch(`${API_BASE_URL}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    headers,
     body: JSON.stringify(body),
     ...(options.signal ? { signal: options.signal } : {}),
   })
   return readStream(response, options)
+}
+
+/** 是不是**有效正整数**（`undefined` / `0` / 负数 / `NaN` 都不算）。 */
+function isPositiveInt(value: number | undefined): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
 }
 
 /**
