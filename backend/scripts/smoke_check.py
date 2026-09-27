@@ -83,7 +83,15 @@ def _outcome_wiring_report() -> str | None:
             return f"{path} 没有创建 StreamOutcome"
         if "outcome=outcome" not in source:
             return f"{path} 没有把 outcome 传给服务层"
-        if all(s not in source for s in ("_make_sse_generator(stream, outcome)", "_make_stage_sse_generator(events, outcome)")):
+        # 前缀匹配：包装调用现在还带 `run_type="..."`（观测用）。
+        # 这条断言只关心「有没有把 outcome 交出去」，不该被后面的参数绑死。
+        if all(
+            s not in source
+            for s in (
+                "_make_sse_generator(stream, outcome",
+                "_make_stage_sse_generator(events, outcome",
+            )
+        ):
             return f"{path} 没有把 outcome 交给 _make_sse_generator"
 
     # 7 = 对话 2 条 + 文档 5 条（PRD、从摘要生成 PRD、接口文档、套件、单节修订）；
@@ -1732,6 +1740,428 @@ def main() -> int:
         import shutil as _shutil2
 
         _shutil2.rmtree(BACKEND_DIR / "_tmp_plans_smoke", ignore_errors=True)
+
+    # ---------- LLM 观测链路（纯本地：假模型 + TestClient，不调真实模型） ----------
+    import json as _json
+    import logging as _logging
+
+    from langchain_core.messages import AIMessage, AIMessageChunk
+
+    from services.llm_factory import TrackedChatModel, track
+    from services.llm_metrics import (
+        LlmStep,
+        RunMetrics,
+        RunMetricsCollector,
+        RunMetricsStore,
+        StepMetrics,
+        extract_tokens,
+        finalize_run,
+        record_step,
+        run_store,
+    )
+
+    steps = [s.value for s in LlmStep]
+    check(
+        "step 枚举齐全且是 snake_case（禁止业务里写字面量）",
+        len(steps) == 11 and len(set(steps)) == 11 and all(s == s.lower() and " " not in s for s in steps),
+        "、".join(steps),
+    )
+
+    check(
+        "token 提取同时认 usage_metadata 与 token_usage（流式取不到时记 0）",
+        extract_tokens({"usage_metadata": {"input_tokens": 3, "output_tokens": 4}})[0] == 3
+        if False
+        else extract_tokens(type("R", (), {"usage_metadata": {"input_tokens": 3, "output_tokens": 4}})())[1] == 4
+        and extract_tokens(
+            type("R", (), {"response_metadata": {"token_usage": {"prompt_tokens": 7, "completion_tokens": 9}}})()
+        )
+        == (7, 9)
+        and extract_tokens(None) == (0, 0),
+        "3/4 与 7/9 两种形态",
+    )
+
+    class _Fake:
+        model_name = "smoke-fake"
+
+        async def ainvoke(self, messages, **kwargs):
+            return AIMessage(content="ok", usage_metadata={"input_tokens": 1, "output_tokens": 2, "total_tokens": 3})
+
+        def astream(self, messages, **kwargs):
+            async def gen():
+                yield AIMessageChunk(content="x", usage_metadata={"input_tokens": 5, "output_tokens": 6, "total_tokens": 11})
+
+            return gen()
+
+    class _Boom:
+        model_name = "smoke-boom"
+
+        async def ainvoke(self, messages, **kwargs):
+            raise RuntimeError("模型炸了")
+
+    run = RunMetricsCollector.start("smoke_run", request_id="req_smoke")
+    import asyncio as _asyncio
+
+    tracked = track(_Fake(), LlmStep.PRD_WRITER)
+    _asyncio.run(tracked.ainvoke([], step=None) if False else tracked.ainvoke([]))
+    check(
+        "包装层记一次账：进总账 + 带 step/model/token/耗时",
+        len(run.step_names) == 1 and run.step_names[0] == "prd_writer" and run._steps[0].input_tokens == 1,
+        f"{run.step_names} input={run._steps[0].input_tokens}",
+    )
+
+    raised = False
+    try:
+        _asyncio.run(track(_Boom(), LlmStep.PRD_WRITER).ainvoke([]))
+    except RuntimeError:
+        raised = True
+    failed = run._steps[-1]
+    check(
+        "失败也记账且**原样抛回**（观测不改业务行为）",
+        raised and failed.status == "error" and "RuntimeError" in failed.error,
+        f"status={failed.status}",
+    )
+    summary = run.finish()
+    check(
+        "finish() 汇总：次数/耗时/明细齐全，且收集器已摘掉",
+        summary.llm_call_count == 2
+        and summary.total_duration_ms >= 0
+        and RunMetricsCollector.current() is None
+        # 6 个摘要字段 + 分片归属（part_index/part_total）：brief 白名单漏一个，
+        # SSE 里就少一项，而前端拿不到时不会报错，只会显示成 0
+        and len(summary.to_dict(brief=True)["steps"][0]) == 8,
+        f"calls={summary.llm_call_count}",
+    )
+
+    raw_calls: list[str] = []
+    for _path in sorted((BACKEND_DIR / "services").glob("*.py")):
+        _src = _path.read_text(encoding="utf-8")
+        for _n, _line in enumerate(_src.splitlines(), start=1):
+            if "self.model.ainvoke(" in _line or "self.model.astream(" in _line or "self.review_model.ainvoke(" in _line:
+                raw_calls.append(f"{_path.name}:{_n}")
+    check(
+        "所有 LLM 调用点都已换成 tracked 版本（无裸调用残留）",
+        not raw_calls,
+        "、".join(raw_calls) if raw_calls else "0 处残留",
+    )
+
+    conv_src = (BACKEND_DIR / "api" / "conversation.py").read_text(encoding="utf-8")
+    check(
+        "两类 SSE 生成器都接观测、且都在 done 之前发 run_summary",
+        conv_src.count('_sse_event("run_summary"') == 4  # 普通/阶段 各两处：成功与失败
+        and conv_src.count("RunMetricsCollector.start(run_type)") == 2
+        and '"request_id": get_request_id()' in conv_src,
+        f"run_summary 出现 {conv_src.count('_sse_event(chr(34) + chr(34))')} 次",
+    )
+    check(
+        "每个流式路由都带 run_type（7 条 + review 分支 1 条）",
+        conv_src.count('run_type="') == 8,
+        f"{conv_src.count('run_type=' + chr(34))} 处",
+    )
+    check(
+        "四个收尾点都走 finalize_run（分片合并的唯一出口，成功/失败各两处）",
+        conv_src.count("summary = finalize_run(run)") == 4 and "run.finish()" not in conv_src,
+        f"finalize_run {conv_src.count('summary = finalize_run(run)')} 处",
+    )
+
+    from fastapi.testclient import TestClient as _TestClient
+
+    with _TestClient(create_app(Settings(_env_file=None))) as _client:
+        _health = _client.get("/health", headers={"X-Request-ID": "req_smoke_header"})
+        check(
+            "中间件回传 X-Request-ID（前端可拿它查日志）",
+            _health.headers.get("X-Request-ID") == "req_smoke_header",
+            str(_health.headers.get("X-Request-ID")),
+        )
+
+    # ---------- 跨分片合并：一份产物 = 一个 run ----------
+    # 前端按分片计划循环发 3 次请求，此前 run_summary 是"每请求一份"——界面显示的是
+    # **最后一片**的统计，按 request_id 查日志只能查到 1/3 的 llm_step。
+    # 这一组守的就是"一个产物 = 一个 run"：合并口径、幂等、非法的头、日志贯通。
+    import time as _time  # noqa: PLC0415
+
+    from core.request_context import normalize_part_number, normalize_run_id  # noqa: PLC0415
+
+    def _fake_part(
+        request_id: str,
+        *,
+        start: float,
+        end: float,
+        input_tokens: int,
+        output_tokens: int,
+        part_index: int,
+    ) -> RunMetrics:
+        """造一份"某一片"的 `finish()` 产物。
+
+        时刻**自己指定**（真实路径用 monotonic 取）：这样"并集跨度"能被精确断言，
+        不必靠 sleep 去凑一个时间窗口 —— 靠 sleep 的测试要么慢、要么偶发。
+        """
+        return RunMetrics(
+            request_id=request_id,
+            run_type="smoke_parts",
+            total_input_tokens=input_tokens,
+            total_output_tokens=output_tokens,
+            total_duration_ms=int((end - start) * 1000),
+            llm_call_count=1,
+            steps=[
+                StepMetrics(
+                    step="api_docs_generate",
+                    model="smoke-fake",
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    duration_ms=int((end - start) * 1000),
+                    part_index=part_index,
+                    part_total=3,
+                )
+            ],
+            started_at=start,
+            ended_at=end,
+        )
+
+    # 三片的时间窗**刻意留空档**：并集跨度 = 110.4-100.0 = 10.4s，而各片相加只有 2.9s。
+    # 两者差得多，断言才能真的区分"并集"和"相加"。
+    part_store = RunMetricsStore(ttl_seconds=1800.0, max_runs=8)
+    p1 = _fake_part("req_p1", start=100.0, end=101.0, input_tokens=10, output_tokens=20, part_index=1)
+    p2 = _fake_part("req_p2", start=105.0, end=106.5, input_tokens=30, output_tokens=40, part_index=2)
+    p3 = _fake_part("req_p3", start=110.0, end=110.4, input_tokens=50, output_tokens=60, part_index=3)
+    m1 = part_store.merge(p1, run_id="run_smoke_parts", part_index=1, part_total=3)
+    m2 = part_store.merge(p2, run_id="run_smoke_parts", part_index=2, part_total=3)
+    m3 = part_store.merge(p3, run_id="run_smoke_parts", part_index=3, part_total=3)
+    check(
+        "合并：三片 tokens/调用次数**求和**，request_ids 按分片序号",
+        m3.total_input_tokens == 90
+        and m3.total_output_tokens == 120
+        and m3.llm_call_count == 3
+        and m3.request_ids == ["req_p1", "req_p2", "req_p3"],
+        f"in={m3.total_input_tokens} out={m3.total_output_tokens} "
+        f"calls={m3.llm_call_count} ids={m3.request_ids}",
+    )
+    check(
+        "合并：墙钟是各片的**并集跨度**（10400ms），不是各片相加（2900ms）",
+        m3.total_duration_ms == 10400,
+        f"total={m3.total_duration_ms}ms（相加会是 1000+1500+400=2900ms）",
+    )
+    check(
+        "合并：part_duration_ms 只算**本片**（整份耗时与单片耗时不会互相冒充）",
+        m3.part_duration_ms == 400 and m1.part_duration_ms == 1000,
+        f"第 3 片={m3.part_duration_ms}ms 第 1 片={m1.part_duration_ms}ms",
+    )
+    check(
+        "合并：parts_seen/complete 随片数推进（2 片时未完成，3 片时才完成）",
+        (m1.parts_seen, m1.complete) == (1, False)
+        and (m2.parts_seen, m2.complete) == (2, False)
+        and (m3.parts_seen, m3.complete) == (3, True),
+        f"1→{m1.parts_seen}/{m1.complete} 2→{m2.parts_seen}/{m2.complete} "
+        f"3→{m3.parts_seen}/{m3.complete}",
+    )
+    check(
+        "合并：steps 按分片序号拼接（哪一步属于哪一片看得出来）",
+        [item.step for item in m3.steps] == ["api_docs_generate"] * 3
+        and [item.part_index for item in m3.steps] == [1, 2, 3],
+        f"{[item.part_index for item in m3.steps]}",
+    )
+    # 幂等：重试/断线重连会让同一片被上报两次，累加会让 tokens 直接翻倍
+    # （那种数字比没有数字更糟 —— 看起来像"模型多花了一倍的钱"）
+    replay = part_store.merge(p2, run_id="run_smoke_parts", part_index=2, part_total=3)
+    check(
+        "合并：同一 request_id 重复上报是**替换**而不是累加",
+        replay.total_input_tokens == 90
+        and replay.total_output_tokens == 120
+        and replay.llm_call_count == 3
+        and replay.parts_seen == 3
+        and part_store.run_count() == 1,
+        f"in={replay.total_input_tokens} calls={replay.llm_call_count} "
+        f"seen={replay.parts_seen} runs={part_store.run_count()}",
+    )
+
+    # 淘汰：一个卡住的 run（前端崩了、只发了 1/3 片）会永远等不到 complete，
+    # 必须有条兜底把它清掉，否则进程内存只增不减。
+    ttl_store = RunMetricsStore(ttl_seconds=0.01, max_runs=8)
+    ttl_store.merge(p1, run_id="run_ttl", part_index=1, part_total=3)
+    _time.sleep(0.05)
+    check("淘汰：超过 TTL 的 run 被清掉（不需要外部触发）", ttl_store.run_count() == 0, "TTL=0.01s")
+    cap_store = RunMetricsStore(ttl_seconds=1800.0, max_runs=2)
+    for index, req in enumerate(("req_cap_1", "req_cap_2", "req_cap_3"), start=1):
+        cap_store.merge(
+            _fake_part(req, start=200.0, end=201.0, input_tokens=1, output_tokens=1, part_index=1),
+            run_id=f"run_cap_{index}",
+            part_index=1,
+            part_total=3,
+        )
+    revived = cap_store.merge(p1, run_id="run_cap_1", part_index=1, part_total=3)
+    check(
+        "淘汰：超过 max_runs 时按 last_at 淘汰最旧的（最老的 run 被清掉后重新从 1 片开始）",
+        cap_store.run_count() == 2 and revived.parts_seen == 1,
+        f"runs={cap_store.run_count()} 最旧 run 的 parts_seen={revived.parts_seen}",
+    )
+
+    check(
+        "非法 X-Run-ID / 分片值被当成「没给」（观测头写错不该让请求失败）",
+        normalize_run_id("ok-run_1") == "ok-run_1"
+        and normalize_run_id("带空格 的") is None
+        and normalize_run_id("x" * 65) is None
+        and normalize_run_id("") is None
+        and normalize_run_id(None) is None
+        and normalize_part_number("3") == 3
+        and normalize_part_number("0") is None
+        and normalize_part_number("-1") is None
+        and normalize_part_number("a") is None,
+        "只收 [A-Za-z0-9_-]{1,64} 与正整数",
+    )
+
+    # ---------- 分片合并走**真实 SSE 生成器**（假模型 + TestClient，不调真实模型）----------
+    from api.deps import get_document_service  # noqa: PLC0415
+
+    class _JsonCapture(_logging.Handler):
+        """抓观测 JSON 行：`llm_step` / `run_summary` 都是 stdout 单行 JSON。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.lines: list[dict] = []
+
+        def emit(self, record: _logging.LogRecord) -> None:
+            text = record.getMessage()
+            if not text.startswith("{"):
+                return
+            try:
+                self.lines.append(json.loads(text))
+            except json.JSONDecodeError:
+                pass
+
+    def _summary_payload(text: str) -> dict:
+        """取该响应的最后一个 `run_summary` 帧的 payload。"""
+        payload: dict = {}
+        for block in text.split("\n\n"):
+            if block.startswith("event: run_summary"):
+                payload = json.loads(block.split("data: ", 1)[1])
+        return payload
+
+    RUN_PARTS = "smoke_run_parts_1"
+    parts_app = create_app(Settings(_env_file=None))
+    # 只替换模型，**不动路由与 SSE 生成器**：观测接线（run_type/run_summary/分片头）
+    # 全都要走真实代码，否则这一段的结论跟线上没关系。
+    parts_app.dependency_overrides[get_document_service] = lambda: ds.DocumentService(model=_Fake())
+    capture = _JsonCapture()
+    _logging.getLogger("harnessprd.llm").addHandler(capture)
+    runs_before = run_store.run_count()
+    try:
+        with _TestClient(parts_app) as parts_client:
+            def post_part(request_id: str, index: int, total: int, run_id: str = RUN_PARTS):
+                return parts_client.post(
+                    "/api/v1/conversation/generate-prd-stream",
+                    json={"form": {"product_name": "分片探针"}},
+                    headers={
+                        "X-Request-ID": request_id,
+                        "X-Run-ID": run_id,
+                        "X-Part-Index": str(index),
+                        "X-Part-Total": str(total),
+                    },
+                )
+
+            # 非法 run id：必须当成「没给」（单片 run），且**不能**往合并存储里塞记录。
+            # 用 ASCII 的非法值（空格 + `!`）：HTTP 头本身就装不下非 ASCII，
+            # 拿中文当"非法值"会在 httpx 里先炸，测不到中间件这条路径。
+            illegal = post_part("req_smoke_bad_run", 1, 3, run_id="bad run id!")
+            illegal_summary = _summary_payload(illegal.text)
+            check(
+                "非法 X-Run-ID 被忽略：请求照常完成、不回显该头、run_id 退化成 request_id",
+                illegal.status_code == 200
+                and illegal.headers.get("X-Run-ID") is None
+                and illegal_summary.get("run_id") == "req_smoke_bad_run"
+                and illegal_summary.get("parts_seen") == 1
+                and illegal_summary.get("complete") is True,
+                f"status={illegal.status_code} echo={illegal.headers.get('X-Run-ID')} "
+                f"run_id={illegal_summary.get('run_id')}",
+            )
+            check(
+                "非法 X-Run-ID 不写合并存储（聊天这类单片请求不该把 store 撑爆）",
+                run_store.run_count() == runs_before,
+                f"runs {runs_before} → {run_store.run_count()}",
+            )
+
+            first = post_part("req_smoke_part1", 1, 2)
+            check(
+                "分片请求回显 X-Run-ID（前端据此确认合并身份）",
+                first.headers.get("X-Run-ID") == RUN_PARTS,
+                str(first.headers.get("X-Run-ID")),
+            )
+            first_summary = _summary_payload(first.text)
+            second = post_part("req_smoke_part2", 2, 2)
+            second_summary = _summary_payload(second.text)
+    finally:
+        _logging.getLogger("harnessprd.llm").removeHandler(capture)
+
+    check(
+        "SSE：第 1 片只报本片（1/2，未完成）",
+        first_summary.get("part_index") == 1
+        and first_summary.get("part_total") == 2
+        and first_summary.get("parts_seen") == 1
+        and first_summary.get("complete") is False
+        and first_summary.get("total_input_tokens") == 5,
+        f"seen={first_summary.get('parts_seen')} complete={first_summary.get('complete')} "
+        f"in={first_summary.get('total_input_tokens')}",
+    )
+    check(
+        "SSE：第 2 片的 run_summary 是**两片之和**（本次修复的核心）",
+        second_summary.get("total_input_tokens") == 10
+        and second_summary.get("total_output_tokens") == 12
+        and second_summary.get("llm_call_count") == 2,
+        f"in={second_summary.get('total_input_tokens')} out={second_summary.get('total_output_tokens')} "
+        f"calls={second_summary.get('llm_call_count')}（单片是 5/6/1）",
+    )
+    check(
+        "SSE：第 2 片 complete=true、request_ids 两元素且按序",
+        second_summary.get("parts_seen") == 2
+        and second_summary.get("complete") is True
+        and second_summary.get("request_ids") == ["req_smoke_part1", "req_smoke_part2"]
+        and len(second_summary.get("steps") or []) == 2,
+        f"seen={second_summary.get('parts_seen')} ids={second_summary.get('request_ids')}",
+    )
+    check(
+        "SSE：既有字段一个都没少（done 帧与 run_summary 的顺序也不变）",
+        {"chunks", "chars"} <= set(json.loads(second.text.split("event: done\ndata: ", 1)[1]))
+        and second.text.index("event: run_summary") < second.text.index("event: done")
+        and "request_id" in second_summary
+        and "run_type" in second_summary,
+        "run_summary → done",
+    )
+
+    # 日志贯通：这是维护者唯一能用的检索入口（界面只显示汇总，明细在 app.log）
+    steps_logged = [
+        item
+        for item in capture.lines
+        if item.get("event") == "llm_step" and item.get("run_id") == RUN_PARTS
+    ]
+    check(
+        "日志：两次请求的 llm_step 带**同一个 run_id**，各带自己的 part（1/2、2/2）",
+        [item.get("part") for item in steps_logged] == ["1/2", "2/2"],
+        f"{[(item.get('part'), item.get('request_id')) for item in steps_logged]}",
+    )
+    illegal_steps = [
+        item
+        for item in capture.lines
+        if item.get("event") == "llm_step" and item.get("request_id") == "req_smoke_bad_run"
+    ]
+    check(
+        "非法 X-Run-ID 的那次请求：分片头也一并忽略（只报单片 1/1，两行不自相矛盾）",
+        len(illegal_steps) == 1
+        and illegal_steps[0].get("part") == "1/1"
+        and illegal_steps[0].get("part_index") is None,
+        f"{[(item.get('part'), item.get('part_index')) for item in illegal_steps]}",
+    )
+    summaries_logged = [
+        item
+        for item in capture.lines
+        if item.get("event") == "run_summary" and item.get("run_id") == RUN_PARTS
+    ]
+    check(
+        "日志：run_summary 行带上整份字段（parts_seen/complete/request_ids 都在）",
+        len(summaries_logged) == 2
+        and summaries_logged[-1].get("parts_seen") == 2
+        and summaries_logged[-1].get("complete") is True
+        and summaries_logged[-1].get("request_ids")
+        == ["req_smoke_part1", "req_smoke_part2"],
+        f"共 {len(summaries_logged)} 行",
+    )
 
     print()
     if FAILURES:

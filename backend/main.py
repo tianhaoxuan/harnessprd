@@ -42,6 +42,11 @@ from api.session import router as session_router
 from api.session import session_not_found_handler
 from core.config import Settings, get_settings
 from core.logging import configure_logging
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from services.token_estimator import BudgetExceededError
+
+from middleware.request_id import REQUEST_ID_HEADER, RUN_ID_HEADER, RequestIdMiddleware
 from services.session_service import SessionNotFound, SessionService
 
 logger = logging.getLogger(__name__)
@@ -109,12 +114,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # （测试就是这么用的），模块级单例会让它们共用一条库文件。
     app.state.session_service = SessionService(settings)
 
+    # 请求工号：先于业务中间件注册，让**所有**响应都带上 X-Request-ID，
+    # 并让后续任意深度的 LLM 调用都能从上下文读到它。
+    app.add_middleware(RequestIdMiddleware)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
+        # `*` = 放行预检里 `Access-Control-Request-Headers` 列出的**所有**头，
+        # 所以分片观测头 `X-Run-ID` / `X-Part-Index` / `X-Part-Total` 不会被预检拦掉。
+        # ⚠️ 改成白名单时**必须**把这三个头加进去：浏览器对自定义请求头的预检失败
+        # 表现为"请求根本没发出去"，而服务端日志里一个字都不会有。
         allow_headers=["*"],
+        # 浏览器默认**读不到**自定义响应头：不暴露的话前端拿不到回显的工号
+        # （`X-Request-ID` / `X-Run-ID` 都在响应头里，供用户报错时给我们查日志）。
+        expose_headers=[REQUEST_ID_HEADER, RUN_ID_HEADER],
     )
 
     # 带版本号的业务接口
@@ -127,6 +143,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 会话不存在的语义是 **404**。异常处理器只能挂在 app 上（挂不到 router 上），
     # 所以在这里注册；路由函数因此保持"纯转发"，不必每条都写 try/except。
     app.add_exception_handler(SessionNotFound, session_not_found_handler)
+
+    async def budget_exceeded_handler(_: Request, exc: Exception) -> JSONResponse:
+        """JSON 接口超预算统一 **422**（SSE 走 error 事件，见 api/conversation.py）。"""
+        check = getattr(exc, "check", None)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": check.message if check is not None else str(exc),
+                "type": "TOKEN_BUDGET_EXCEEDED",
+                "context_usage": check.to_context_usage() if check is not None else None,
+            },
+        )
+
+    app.add_exception_handler(BudgetExceededError, budget_exceeded_handler)
 
     # 根路径 /health：探针/负载均衡用的稳定路径（不带版本号）。
     # 复用 api.health 里同一个 handler，不复制实现，避免两份逻辑随时间长歪。

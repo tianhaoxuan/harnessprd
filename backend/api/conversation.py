@@ -117,7 +117,10 @@ def _rag_corpus_size() -> int:
     """参与检索的块数（排查"为什么没召回"时先看它是不是 0：语料文件缺失会退化成 0）。"""
     chunks, _ = _rag_index()
     return len(chunks)
+from core.request_context import get_request_id
 from services.llm import LlmConfigError, StreamOutcome
+from services.llm_metrics import RunMetricsCollector, finalize_run, log_run_summary
+from services.token_estimator import BudgetExceededError
 from services.state import DocKind
 
 logger = logging.getLogger(__name__)
@@ -157,6 +160,7 @@ def _sse_event(event: str, data: Mapping[str, Any]) -> str:
 async def _make_sse_generator(
     source: AsyncIterator[str],
     outcome: StreamOutcome | None = None,
+    run_type: str | None = None,
 ) -> AsyncIterator[str]:
     """把**裸文本片段**的异步迭代器包装成 SSE 事件流。
 
@@ -177,6 +181,9 @@ async def _make_sse_generator(
     """
     chunks = 0
     chars = 0
+    # 这一趟流程的总账。在 generator 体内 start：它会随当前 asyncio 任务
+    # 传播给下游 service 里的 LLM 包装层（同一执行上下文）。
+    run = RunMetricsCollector.start(run_type) if run_type else None
     try:
         async for piece in source:
             if not piece:
@@ -186,7 +193,17 @@ async def _make_sse_generator(
             yield _sse_event("chunk", {"text": piece})
     except Exception as exc:  # noqa: BLE001 - 流里任何异常都要转成可读事件
         logger.exception("SSE 流中途失败")
-        yield _sse_event("error", {"type": type(exc).__name__, "message": str(exc)})
+        yield _sse_event(
+            "error",
+            _budget_error_payload(exc)
+            or {"type": type(exc).__name__, "message": str(exc), "request_id": get_request_id()},
+        )
+        # 失败也交账：否则「出错那趟调了几次模型」就查不到。
+        # `finalize_run` 会把这一片并进同一 `X-Run-ID` 的整份账里（没带就是单片）。
+        if run is not None:
+            summary = finalize_run(run)
+            log_run_summary(summary)
+            yield _sse_event("run_summary", summary.to_dict(brief=True))
     else:
         payload: dict[str, Any] = {"chunks": chunks, "chars": chars}
         if outcome is not None:
@@ -201,12 +218,34 @@ async def _make_sse_generator(
                 chunks,
                 chars,
             )
+        # 汇总在 done **之前**发（需求：SSE 在 [DONE] 前有 run_summary）
+        # finalize_run 内部会 finish()（摘掉收集器），先把上下文占用取出来
+        run_context_usage = run.context_usage if run is not None else None
+        if run is not None:
+            summary = finalize_run(run)
+            log_run_summary(summary)
+            yield _sse_event("run_summary", summary.to_dict(brief=True))
+            if run_context_usage is not None:
+                payload["context_usage"] = run_context_usage
         yield _sse_event("done", payload)
+
+
+def _budget_error_payload(exc: Exception) -> dict[str, Any] | None:
+    """超预算的 error 帧：type 可编程判定，且带 request_id 与 context_usage。"""
+    if not isinstance(exc, BudgetExceededError):
+        return None
+    return {
+        "type": "TOKEN_BUDGET_EXCEEDED",
+        "message": exc.check.message,
+        "request_id": get_request_id(),
+        "context_usage": exc.check.to_context_usage(),
+    }
 
 
 async def _make_stage_sse_generator(
     events: AsyncIterator[tuple[str, Any]],
     outcome: StreamOutcome | None = None,
+    run_type: str | None = None,
 ) -> AsyncIterator[str]:
     """把**「阶段 + 正文」事件流**包装成 SSE 事件流（双智能体 PRD 专用）。
 
@@ -221,6 +260,8 @@ async def _make_stage_sse_generator(
     """
     chunks = 0
     chars = 0
+    # 与 `_make_sse_generator` 同源：这趟流程的总账（review 路径走的是这个生成器）
+    run = RunMetricsCollector.start(run_type) if run_type else None
     try:
         async for kind, payload in events:
             if kind == "stage":
@@ -233,7 +274,15 @@ async def _make_stage_sse_generator(
             yield _sse_event("chunk", {"text": payload})
     except Exception as exc:  # noqa: BLE001 - 流里任何异常都要转成可读事件
         logger.exception("SSE（双智能体）流中途失败")
-        yield _sse_event("error", {"type": type(exc).__name__, "message": str(exc)})
+        yield _sse_event(
+            "error",
+            _budget_error_payload(exc)
+            or {"type": type(exc).__name__, "message": str(exc), "request_id": get_request_id()},
+        )
+        if run is not None:
+            summary = finalize_run(run)
+            log_run_summary(summary)
+            yield _sse_event("run_summary", summary.to_dict(brief=True))
     else:
         payload: dict[str, Any] = {"chunks": chunks, "chars": chars}
         if outcome is not None:
@@ -246,6 +295,15 @@ async def _make_stage_sse_generator(
                 chunks,
                 chars,
             )
+        # 汇总在 done 之前发（与普通生成器口径一致）
+        # finalize_run 内部会 finish()（摘掉收集器），先把上下文占用取出来
+        run_context_usage = run.context_usage if run is not None else None
+        if run is not None:
+            summary = finalize_run(run)
+            log_run_summary(summary)
+            yield _sse_event("run_summary", summary.to_dict(brief=True))
+            if run_context_usage is not None:
+                payload["context_usage"] = run_context_usage
         yield _sse_event("done", payload)
 
 
@@ -315,7 +373,7 @@ async def start_stream(
         outcome=outcome,
     )
     return StreamingResponse(
-        _make_sse_generator(stream, outcome), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
+        _make_sse_generator(stream, outcome, run_type="chat_start"), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
     )
 
 
@@ -350,7 +408,7 @@ async def continue_stream(
         outcome=outcome,
     )
     return StreamingResponse(
-        _make_sse_generator(stream, outcome), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
+        _make_sse_generator(stream, outcome, run_type="chat_continue"), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
     )
 
 
@@ -459,7 +517,7 @@ async def generate_prd_from_summary_stream(
             summary=payload.summary, history=history, outcome=outcome
         )
         return StreamingResponse(
-            _make_stage_sse_generator(events, outcome),
+            _make_stage_sse_generator(events, outcome, run_type="generate_prd_from_summary"),
             media_type=SSE_MEDIA_TYPE,
             headers=SSE_HEADERS,
         )
@@ -467,7 +525,7 @@ async def generate_prd_from_summary_stream(
         summary=payload.summary, history=history, outcome=outcome
     )
     return StreamingResponse(
-        _make_sse_generator(stream, outcome), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
+        _make_sse_generator(stream, outcome, run_type="generate_prd_from_summary"), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
     )
 
 # ---------------------------------------------------------------- 产物生成 / 修订
@@ -520,7 +578,7 @@ async def generate_prd_stream(
     outcome = StreamOutcome()
     stream = service.generate_prd_stream(**payload.generation_kwargs(), outcome=outcome)
     return StreamingResponse(
-        _make_sse_generator(stream, outcome), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
+        _make_sse_generator(stream, outcome, run_type="generate_prd"), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
     )
 
 
@@ -543,7 +601,7 @@ async def generate_api_docs_stream(
         **payload.generation_kwargs(), prd_content=payload.prd_content, outcome=outcome
     )
     return StreamingResponse(
-        _make_sse_generator(stream, outcome), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
+        _make_sse_generator(stream, outcome, run_type="generate_api_docs"), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
     )
 
 
@@ -571,7 +629,7 @@ async def generate_prompts_stream(
         outcome=outcome,
     )
     return StreamingResponse(
-        _make_sse_generator(stream, outcome), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
+        _make_sse_generator(stream, outcome, run_type="generate_prompts"), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
     )
 
 
@@ -610,5 +668,5 @@ async def optimize_document_stream(
     outcome = StreamOutcome()
     stream = service.optimize_document_stream(**payload.optimize_kwargs(), outcome=outcome)
     return StreamingResponse(
-        _make_sse_generator(stream, outcome), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
+        _make_sse_generator(stream, outcome, run_type="optimize_document"), media_type=SSE_MEDIA_TYPE, headers=SSE_HEADERS
     )

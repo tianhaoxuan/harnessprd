@@ -40,7 +40,8 @@ from core.config import Settings, get_settings
 from core.prompts import build_system_prompt
 from core.questions import Question, load_questions
 from services.llm import StreamOutcome, finish_reason_of
-from services.llm_factory import get_llm
+from services.llm_factory import get_llm, track
+from services.llm_metrics import LlmStep
 from services.state import DialogueStage
 
 logger = logging.getLogger(__name__)
@@ -354,7 +355,7 @@ class ConversationService:
             history=(),
             user_input=START_HUMAN_TRIGGER,
         )
-        async for chunk in self._astream_text(messages, outcome=outcome):
+        async for chunk in self._astream_text(messages, outcome=outcome, step=LlmStep.CHAT_START):
             yield chunk
 
     async def continue_conversation_stream(
@@ -401,7 +402,7 @@ class ConversationService:
             history=history,
             user_input=user_input,
         )
-        async for chunk in self._astream_text(messages, outcome=outcome):
+        async for chunk in self._astream_text(messages, outcome=outcome, step=LlmStep.CHAT_CONTINUE):
             yield chunk
 
     # ------------------------------------------------------------ 内部
@@ -410,6 +411,9 @@ class ConversationService:
         self,
         messages: Sequence[BaseMessage],
         outcome: StreamOutcome | None = None,
+        # 观测用的步骤标签：首轮是 chat_start、接续是 chat_continue，
+        # 由两个调用方显式传入（默认值只是为了不破坏既有调用）。
+        step: LlmStep = LlmStep.CHAT_CONTINUE,
     ) -> AsyncIterator[str]:
         """用 `astream` 逐段取文本；空白片段不产出（避免前端收到空帧）。
 
@@ -417,7 +421,7 @@ class ConversationService:
         （一段结构化 JSON 被切断，前端只能拿到半截语法），而这件事在文本里看不出来。
         判据与文档侧完全一致，用的是同一份 `finish_reason_of`。
         """
-        async for chunk in self.model.astream(list(messages)):
+        async for chunk in track(self.model, step).astream(list(messages)):
             if outcome is not None:
                 reason = finish_reason_of(chunk)
                 # 只有拿到才覆盖：中间分片通常没有这个键，用 `or` 会把最后那个真值抹掉

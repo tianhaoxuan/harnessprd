@@ -72,7 +72,14 @@ from core.prompts import (
 from core.questions import load_questions
 from services.conversation_service import format_form_data, message_text
 from services.llm import LlmConfigError, StreamOutcome, finish_reason_of, is_truncated
-from services.llm_factory import get_llm
+from services.llm_factory import get_llm, track
+from services.llm_metrics import LlmStep
+
+_DEFAULT_STEP_BY_KIND: dict[str, LlmStep] = {
+    "prd": LlmStep.PRD_WRITER,
+    "api": LlmStep.API_DOCS_GENERATE,
+    "prompts": LlmStep.PROMPTS_GENERATE,
+}
 from services.prompts import (
     API_DOCS_GENERATION_PROMPT,
     OPTIMIZE_DOCUMENT_PROMPT_TEMPLATE,
@@ -1087,7 +1094,8 @@ class DocumentService:
             HumanMessage(content=render_prompt_text(SYNC_SUMMARY_HUMAN_TEMPLATE, values)),
         ]
 
-        response = await self.model.ainvoke(messages)
+        # 摘要回填单独一个 step，便于在 run_summary 里和生成类调用区分
+        response = await track(self.model, LlmStep.SUMMARY_SYNC).ainvoke(messages)
         text = message_text(response)
         reason = finish_reason_of(response)
         truncated = is_truncated(reason)
@@ -1243,7 +1251,12 @@ class DocumentService:
 
             parts: list[str] = []
             async for chunk in self._stream_document(
-                "prd", values, system=system, human=human, outcome=outcome
+                "prd",
+                values,
+                system=system,
+                human=human,
+                outcome=outcome,
+                step=LlmStep.PRD_WRITER if first else LlmStep.PRD_REWRITE,
             ):
                 parts.append(chunk)
                 yield ("chunk", chunk)
@@ -1307,7 +1320,7 @@ class DocumentService:
             ),
         ]
         # 走 `review_model`（默认就是写手那个模型；配了开关才是第二双眼睛）
-        response = await self.review_model.ainvoke(messages)
+        response = await track(self.review_model, LlmStep.PRD_REVIEW).ainvoke(messages)
         try:
             verdict = _extract_json_object(message_text(response))
         except SummarySyncError as exc:
@@ -1402,7 +1415,9 @@ class DocumentService:
                 "current_content": current_content,
             },
         )
-        async for chunk in self._stream_document(kind, values, human=human, outcome=outcome):
+        async for chunk in self._stream_document(
+            kind, values, human=human, outcome=outcome, step=LlmStep.DOCUMENT_OPTIMIZE
+        ):
             yield chunk
 
     # ------------------------------------------------------------ 会话级入口（未实现）
@@ -1448,6 +1463,7 @@ class DocumentService:
         human: str | None = None,
         system: str | None = None,
         outcome: StreamOutcome | None = None,
+        step: LlmStep | None = None,
     ) -> AsyncIterator[str]:
         """组装 system + human，用 `astream` 逐段产出文本。
 
@@ -1484,7 +1500,10 @@ class DocumentService:
             # 顺序固定：SystemMessage → HumanMessage。反了模型会读成"用户先说完 AI 再复述"。
             HumanMessage(content=human if human is not None else self.render_human_prompt(values)),
         ]
-        async for chunk in self.model.astream(messages):
+        # 缺省按产物类型推断；只有「改写」与「文档优化」显式传入不同的 step
+        if step is None:
+            step = _DEFAULT_STEP_BY_KIND[kind]
+        async for chunk in track(self.model, step).astream(messages):
             if outcome is not None:
                 reason = finish_reason_of(chunk)
                 # 只有拿到才覆盖：中间分片的 metadata 里这个键通常不存在（是 None），

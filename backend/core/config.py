@@ -64,6 +64,32 @@ class Settings(BaseSettings):
     environment: Environment = "local"
     debug: bool = True
     log_level: str = "INFO"
+    # 逐步 LLM 观测日志（每次模型调用一行 JSON）。
+    # 关掉时**仍会**打整趟的 run_summary、也**仍会**在 SSE 里发 run_summary
+    # （前端还能看到汇总），只是不打逐步的 `event=llm_step`。
+    # ⚠️ 失败的调用**永远记**（即使这个开关是 false）——出错的账不能因为开关而丢。
+    log_llm_metrics: bool = Field(default=True, validation_alias="LOG_LLM_METRICS")
+
+    # ---------- 跨分片观测（一份产物 = 一个 run）----------
+    # 一份产物由前端按分片计划循环发多次 SSE 请求，各片的账按 `X-Run-ID` 在**进程内**
+    # 合并（见 services/llm_metrics.py）。这份合并结果只活在一次产物生成的窗口里，
+    # 所以给 TTL 与容量上限：丢了只是少一份合并汇总，每片的 llm_step 日志仍在。
+    # TTL 默认 30 分钟：正常一次产物生成是分钟级，够覆盖"用户中途去接杯水"；
+    # 上限默认 256：一个 run 常驻内存极小（几十个步骤对象），但客户端崩了会留下
+    # 永远等不到 complete 的 run，得有条兜底把它们清掉（按最后上报时间淘汰最旧）。
+    run_metrics_ttl_seconds: float = Field(
+        default=1800.0, validation_alias="RUN_METRICS_TTL_SECONDS"
+    )
+    run_metrics_max_runs: int = Field(default=256, validation_alias="RUN_METRICS_MAX_RUNS")
+
+    # ---------- Token 预算（业务策略 cap）----------
+    # 有效 input 上限 = min(这里的 cap, 模型物理顶)；物理顶来自 config/models.yaml。
+    # 输出上限**不在 .env**：只来自注册表，否则换模型不跟着变、还会把 PRD 截断。
+    context_budget_tokens: int = Field(default=120000, validation_alias="CONTEXT_BUDGET_TOKENS")
+    chat_history_budget: int = Field(default=60000, validation_alias="CHAT_HISTORY_BUDGET")
+    single_call_input_budget: int = Field(default=100000, validation_alias="SINGLE_CALL_INPUT_BUDGET")
+    token_budget_mode: str = Field(default="warn", validation_alias="TOKEN_BUDGET_MODE")
+    token_estimator: str = Field(default="tiktoken", validation_alias="TOKEN_ESTIMATOR")
 
     # ---------- 服务 ----------
     # 0.0.0.0 = 监听所有网卡（容器/局域网可访问）；仅本机自用建议改 127.0.0.1

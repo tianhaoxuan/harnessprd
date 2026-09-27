@@ -250,6 +250,52 @@ data: {"type": "TimeoutError", "message": "…"}
 - `503` —— 服务端未就绪（如未配置 API Key），不是调用方的错
 - `502` —— 上游 LLM 调用失败（网络 / 超时 / 鉴权被拒）
 
+### 观测：一次产物生成 = 一个 run
+
+**为什么有这层**：接口文档与提示词套件是**分片生成**的（各 3 片，`GET /api/v1/conversation/document-plan`），
+前端按计划**逐片发请求** —— 一份产物 = 3 次 SSE 请求。而 `run_summary` 原本是"每请求一份"，
+于是界面上显示的耗时 / token / 调用次数**只有最后一片**（提示词套件最后一片只有 1 个文件，
+用户等了两分钟看到 `12s`），并且 `request_id` 只覆盖 1/3 —— 维护者按它检索日志，只能复盘三分之一。
+
+**契约**（请求头都可选，只有产物生成需要带；澄清聊天不带）：
+
+| 头 | 含义 |
+| --- | --- |
+| `X-Run-ID` | 一次产物生成 = 一个 run。同一次生成的**每一片都带同一个值**（前端 `newRunId()` 生成） |
+| `X-Part-Index` / `X-Part-Total` | 1 基的分片序号与总片数（取自分片计划）。缺席按 `1/1` 单片处理 |
+| 响应头 `X-Run-ID` | 原样回显 |
+
+`run_summary`（仍在 `done` **之前**发；失败时 `error → run_summary`）在原有字段上增加：
+`run_id`、`request_ids[]`、`part_index` / `part_total` / `parts_seen` / `complete`、
+`part_duration_ms`（本片）、`total_duration_ms`（**整份墙钟**）、tokens 与 `llm_call_count`（整份求和）、
+`steps[]`（各片按序拼接）。`done` 里的 `context_usage` 保持**本片**语义 —— 上下文占用本来就是
+"这一片这次调用的输入大小"，合并它没有意义。
+
+几条刻意的取舍：
+
+- **合并按 `request_id` 幂等**：同一片重放（重试 / 断线重连）是**替换**不是累加 —— 累加会让 token 翻倍，
+  那种数字比没有数字更糟（看着像"模型多花了钱"）。
+- **墙钟取水位跨度**（见过的最早开始 → 最晚结束，只增不减），**不是各片相加**（相加会把片与片之间的
+  等待重复计一遍），也不是"从现存各片现算"（重放会覆盖那片的原始区间，跨度会**缩短**）。
+  计时用 `time.perf_counter()`，**不是 `time.monotonic()`** —— Windows 上后者是 `GetTickCount64`，
+  粒度 15.6ms，几毫秒的请求起止会落在同一刻度上，窗口退化成 0（实测踩到）。
+- **store 只存统计，不存正文**，进程内、惰性清理，默认 TTL 30 分钟 / 最多 256 个 run
+  （`RUN_METRICS_TTL_SECONDS` / `RUN_METRICS_MAX_RUNS`）。**没有 `X-Run-ID` 时一个字节都不写**：
+  澄清聊天每轮一个请求，塞进去只会把内存撑爆，而且永远等不到 `complete`。
+  多实例部署时换掉 `RunMetricsStore` 一处即可（`services/llm_metrics.py`）。
+- 缺 `X-Run-ID` 时 run id 退化成 `request_id`、按 `1/1 complete=true` 上报 —— 单片路径（PRD、聊天）
+  的界面口径因此与多片一致。
+
+**日志**：`event=llm_step` 每行带 `run_id` 与 `part`（形如 `"2/3"`），`event=run_summary` 带整份字段，
+所以**一条 grep 就能查全整份生成**：
+
+```bash
+grep '"run_id":"live_run_e2e_0001"' app.log   # 该 run 的全部 llm_step + 每片的 run_summary
+```
+
+**验证**：`python scripts/verify_run_agg.py`（在 `backend/` 下跑）—— 用假模型驱动**真实 SSE 生成器**，
+断言第二片是整份合计、重放幂等、CORS 预检放行、日志贯通；不调真实模型、不花钱。
+
 ## 配置
 
 全部环境变量见 `.env.example`。几个容易踩的点：

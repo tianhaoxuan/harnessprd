@@ -1,0 +1,39 @@
+# 模型物理参数（**人工维护**，不在运行时拉 API）
+#
+# 为什么不调 `/v1/models` 自动拉：多数厂商的该接口**不返回**可靠的 context_window /
+# max_output_tokens 字段，拿不到就得回退，结果是有时准有时不准 —— 不如人工维护一份、
+# 改模型时改这里（`HANDOFF.md` 里"清单只有一份真相"的同一思路）。
+#
+# ⚠️ 改这个文件**同时**影响两件事：传给厂商的 `max_tokens`、以及 budget 的物理 input 顶
+# （`hardware_input_cap = context_window - max_output_tokens - SAFETY_MARGIN`）。
+models:
+  # 默认模型：窗口 1M、输出顶 384K（数据按需求给定，人工维护）
+  deepseek-v4-flash:
+    provider: openai_compatible
+    context_window: 1000000
+    max_output_tokens: 384000
+    encoding: cl100k_base
+
+  # ⚠️ 真值，**不是**别名：`max_tokens` 现在由注册表提供给厂商，
+  # 指向 1M/384K 的条目会让真机调用被 API 直接 400。这里用贴近厂商的参数。
+  deepseek-chat:
+    provider: openai_compatible
+    context_window: 131072
+    max_output_tokens: 8192
+    encoding: cl100k_base
+
+  # ⚠️ **真实 DeepSeek API 的 deepseek-chat 输出上限远小于 384K**（默认 8K）。
+  # 为了让"用真实模型跑一遍"不会被厂商直接 400，这里给它一份贴近厂商的参数，
+  # 并且**不**走别名。要跑真机验证请用 `DEFAULT_LLM_MODEL=deepseek-chat`。
+  deepseek-reasoner:
+    provider: openai_compatible
+    context_window: 131072
+    max_output_tokens: 65536
+    encoding: cl100k_base
+
+  # 未知模型名的保守兜底：宁可低估窗口（多 warn），也不要高估（撞 API 报错）
+  default:
+    provider: openai_compatible
+    context_window: 32768
+    max_output_tokens: 4096
+    encoding: cl100k_base
