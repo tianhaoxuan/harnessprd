@@ -45,6 +45,15 @@ dist/
 .DS_Store
 Thumbs.db
 
+# ---------- 本地数据（绝不要提交）----------
+# SQLite 方案库：应用启动时会在 backend/ 下自动建 `harnessprd.db`。
+# `-wal` / `-shm` 是 WAL 模式的附属文件，跟主库同生共死，必须一起忽略。
+*.db
+*.db-wal
+*.db-shm
+# smoke / 临时自检用的库目录（正常跑完会自己删；崩了也不该进仓库）
+backend/_tmp_plans_smoke/
+
 # ---------- 部署 ----------
 # Basic Auth 密码文件：**绝不能提交**（它本身就是一份可用凭据）
 deploy/.htpasswd

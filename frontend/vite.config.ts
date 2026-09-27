@@ -25,5 +25,14 @@ export default defineConfig({
         changeOrigin: true,
       },
     },
+
+    // ⚠️ **忽略工具链的临时文件**。有些写入方式（编辑器、脚本、AI 工具）不是原地改文件，
+    // 而是"写一个临时文件 → 改名覆盖"，临时目录形如 `.App.tsx.1234.abc.tmpdir/`。
+    // Vite 会去 watch 这些路径，而它们**转瞬即逝且可能仍被占用** —— Windows 上会抛
+    // `EBUSY: resource busy or locked, watch ...`，**整个 dev server 直接退出**
+    // （实测：一次正常的文件写入就把 5173 打死了，看起来像"改代码把服务改崩了"）。
+    watch: {
+      ignored: ['**/.*.tmpdir/**', '**/.*.tmp', '**/*.tmp'],
+    },
   },
 })

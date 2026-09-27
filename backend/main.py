@@ -18,9 +18,13 @@
     /                        服务自述
     /health                  健康检查（根路径，给探针 / 负载均衡用）
     /api/v1/health           同上，带版本号的正式路径
-    /api/v1/conversation/*   对话阶段：题目下发（**已实现**）、流式回复（占位，501）
+    /api/v1/conversation/*   对话阶段：题目下发（**已实现**）、流式回复与产物生成（**已实现**）
     /api/v1/sessions/*       会话生命周期 / 表单草稿 / 事件（唯一变更入口）/ 文档 / 对话历史（占位，501）
+    /api/session/*           会话**快照存储**：list / {id} / save / delete（**已实现**，4 条）
     /api/v1/config           运行配置（占位，501）
+
+⚠️ `/api/session/*` **刻意不带版本前缀**：路径是需求给定的，而它与 `/api/v1/sessions/*`
+那组不是一回事（一组是"存整份工作台快照"，一组是设计里的状态机接口面）。见 `api/session.py`。
 """
 
 from __future__ import annotations
@@ -34,8 +38,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.health import router as health_router
 from api.router import api_router
+from api.session import router as session_router
+from api.session import session_not_found_handler
 from core.config import Settings, get_settings
 from core.logging import configure_logging
+from services.session_service import SessionNotFound, SessionService
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +68,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.active_llm_model,
         settings.llm_configured,
     )
+    # 方案库/会话库（同一个 SQLite 文件）：**启动即建表**，幂等。
+    #
+    # 为什么放在 lifespan 而不是 `create_app()`：`create_app()` 在**导入期**也会被调用
+    # （模块末尾那句 `app = create_app()`），导入时就往磁盘落一个库文件不合适 ——
+    # 测试导入、打包、只读环境都会碰到它。lifespan 只在"进程真的要开始服务"时跑。
+    session_service: SessionService = app.state.session_service
+    session_service.ensure_ready()
     if not settings.llm_configured:
         # 明确告知"能起来但调不通"，避免把 503 误判成代码 bug
         logger.warning(
@@ -90,6 +104,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ),
     )
     app.state.settings = settings
+    # 会话业务层（API 直接调它）。建表在 lifespan 里做，见上面的说明。
+    # 挂在 `app.state` 上而不是模块级单例：`create_app(settings)` 可以造多个独立实例
+    # （测试就是这么用的），模块级单例会让它们共用一条库文件。
+    app.state.session_service = SessionService(settings)
 
     app.add_middleware(
         CORSMiddleware,
@@ -101,6 +119,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # 带版本号的业务接口
     app.include_router(api_router, prefix=API_PREFIX)
+
+    # 会话快照存储（4 条）——**路径不在 /api/v1 下**，router 自带 `/api/session` 前缀。
+    # 原因见 `api/session.py`：它与 `/api/v1/sessions/*` 那组占位接口不是一回事。
+    app.include_router(session_router)
+
+    # 会话不存在的语义是 **404**。异常处理器只能挂在 app 上（挂不到 router 上），
+    # 所以在这里注册；路由函数因此保持"纯转发"，不必每条都写 try/except。
+    app.add_exception_handler(SessionNotFound, session_not_found_handler)
 
     # 根路径 /health：探针/负载均衡用的稳定路径（不带版本号）。
     # 复用 api.health 里同一个 handler，不复制实现，避免两份逻辑随时间长歪。

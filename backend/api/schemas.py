@@ -29,6 +29,13 @@ from services.conversation_service import DEFAULT_MAX_ROUNDS
 # 那样 `DocumentScopeView` → `DocumentScope` 的转换就会变成两份契约的同步工作。
 from services.document_service import DocumentScope
 
+# ⚠️ **必须起别名**：本文件第 215 行已经有一个同名的 `SessionSummary`（给占位接口
+# `/api/v1/sessions` 用的状态机版契约：`state: SessionPhase` + `datetime` 时间）。
+# 直接 `import SessionSummary` 会被后面那个类定义**遮蔽** —— 于是
+# `SessionStoreListView` 的注解解析到另一个类，Service 返回的对象校验不过，
+# 报错还是一句很难懂的"Input should be a valid ... instance of SessionSummary"（已实测踩到）。
+from services.session_models import SessionSummary as StoredSessionSummary
+
 __all__ = [
     # 枚举（定义在 services/state.py，此处复用）
     "DialogueStage",
@@ -623,3 +630,60 @@ class DocumentPlanView(BaseModel):
                 for part in plan.parts
             ],
         )
+
+
+# ---------------------------------------------------------------- 会话存储（/api/session/*）
+#
+# ⚠️ **实体形状不在这里重定义**：列表项直接复用 `services.session_models.SessionSummary`
+# （下面以 `StoredSessionSummary` 的名字引用），详情用 `SessionLoad`（在 `api/session.py`
+# 里当 `response_model`）—— API 契约与业务模型同源。再抄一份字段清单必然漂移：
+# 前端加字段、后端那份悄悄过期，而且不会有任何报错。
+#
+# ⚠️ 与上面那个同名的 `SessionSummary`（第 215 行）**是两个不同的东西，不要合并**：
+#
+# | | 本区的 `StoredSessionSummary` | 上面的 `SessionSummary` |
+# | --- | --- | --- |
+# | 服务谁 | `/api/session/*`（**已实现**的快照存储） | `/api/v1/sessions`（**占位 501**） |
+# | 阶段字段 | `entry_mode` + `current_stage` + `status`（字符串，与工作台一一对应） | `state: SessionPhase`（状态机版） |
+# | 时间 | `str`（ISO8601 原文，直接透传） | `datetime`（由 pydantic 解析） |
+#
+# 本区只放**传输层才需要**的三样：请求体、列表信封、删除回执。
+
+
+class SessionSaveRequest(BaseModel):
+    """`POST /api/session/save` 的请求体。"""
+
+    id: str | None = Field(
+        default=None,
+        description="留空 = 新建（返回新 id）；给出 = 更新该记录（返回同一个 id）",
+    )
+    session_data: dict[str, Any] | str = Field(
+        description=(
+            "工作台 state 快照。对象或 JSON 原文都收 —— 原文会**逐字节**存下来"
+            "（不重排键、不改空白），所以前端能拿回它自己写进去的那一份。"
+        )
+    )
+
+
+class SessionSaveResponse(BaseModel):
+    """`POST /api/session/save` 的响应：新建与更新**统一**只回这两项。"""
+
+    id: str
+    title: str = Field(
+        description="落库后的标题。更新已有记录时它是原值（标题不随更新改写）"
+    )
+
+
+class SessionDeleteResponse(BaseModel):
+    """`DELETE /api/session/{id}` 的响应。"""
+
+    ok: bool = True
+
+
+class SessionStoreListView(BaseModel):
+    """`GET /api/session/list` 的信封：`{items: [...]}`。"""
+
+    items: list[StoredSessionSummary] = Field(
+        default_factory=list,
+        description="摘要列表，按 updated_at 倒序；**不含 session_data**",
+    )

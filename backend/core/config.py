@@ -21,6 +21,8 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 # backend/ 目录（本文件位于 backend/core/）
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 ENV_FILE = BACKEND_DIR / ".env"
+DEFAULT_PLANS_DB_FILE = "harnessprd.db"
+"""方案库（SQLite）默认文件名，落在 `backend/` 下。`.gitignore` 里有 `*.db`。"""
 
 # 让直接读 os.environ 的第三方库（langchain-openai 等）也能拿到 .env 的值。
 # override=False：真实环境变量优先于 .env 文件。
@@ -73,6 +75,18 @@ class Settings(BaseSettings):
     cors_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:5173"]
     )
+
+    # ---------- 数据层：SQLite（方案库） ----------
+    # 方案（工作台快照 JSON）落在这个文件里。**默认放在 backend/ 下** —— 与 .env 同级：
+    # 整个后端目录拷走就能跑，`.gitignore` 也只要一条 `*.db` 就够。
+    #
+    # ⚠️ 留空（或写 `SQLITE_PATH=`）等于"用默认值"，而不是"没有数据库" ——
+    # 所以类型是可选的 `Path | None`，真正的默认值在 `plans_db_path` 里给。
+    # 测试/多实例请显式传一个临时路径，别共用默认文件（否则并发跑测试会互相看到数据）。
+    sqlite_path: Path | None = Field(default=None, validation_alias="SQLITE_PATH")
+    # SQLite 的写锁是**库级**的：并发写会返回 SQLITE_BUSY。这里是等待毫秒数（不是重试次数）。
+    # 5 秒足够单机单进程的写入排队；真出现持续 BUSY 说明该换库了，而不是该调大这个值。
+    sqlite_busy_timeout_ms: int = 5000
 
     # ---------- LLM ----------
     llm_provider: LlmProvider = Field(
@@ -168,6 +182,7 @@ class Settings(BaseSettings):
     @field_validator(
         "llm_model",
         "review_llm_model",
+        "sqlite_path",
         "anthropic_api_key",
         "openai_api_key",
         "deepseek_api_key",
@@ -213,6 +228,17 @@ class Settings(BaseSettings):
     def llm_configured(self) -> bool:
         """当前 provider 是否具备调用条件（只检查配置，不检查连通性）。"""
         return self.active_llm_api_key is not None
+
+    @property
+    def plans_db_path(self) -> Path:
+        """方案库（SQLite）的实际路径：显式配置优先，否则 `backend/harnessprd.db`。
+
+        派生而不是字段默认值，是为了让 `SQLITE_PATH=`（空值）等价于"没配"而不是
+        "路径为空字符串" —— 后者会在建表时抛一个很难懂的 `Path('')` 错误。
+        放进 `BACKEND_DIR` 而不是当前工作目录：uvicorn 可以从仓库根目录启动
+        （`--app-dir backend`），按 cwd 解析会让"同一个应用、两个库文件"。
+        """
+        return self.sqlite_path or (BACKEND_DIR / DEFAULT_PLANS_DB_FILE)
 
     @property
     def review_llm_settings(self) -> Settings:

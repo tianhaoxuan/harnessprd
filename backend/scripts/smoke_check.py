@@ -1162,6 +1162,10 @@ def main() -> int:
         "/api/v1/sessions/{session_id}/documents/{kind}",
         "/api/v1/sessions/{session_id}/messages",
         "/api/v1/config",
+        # 会话快照存储：**3 条路径**（GET 与 DELETE 共用 `/{id}`），路径参数就叫 `id`
+        "/api/session/list",
+        "/api/session/{id}",
+        "/api/session/save",
     }
     missing = expected - paths
     check("路由注册齐全", not missing, "缺失：" + "、".join(sorted(missing)) if missing else f"共 {len(paths)} 条")
@@ -1203,6 +1207,10 @@ def main() -> int:
         "/api/v1/conversation/optimize-document-stream",
         "/api/v1/conversation/sync-summary-from-conversation",
         "/api/v1/conversation/retrieve-api-docs-rag",
+        # 会话快照存储 4 条（已实现，所以必须声明 200 而不是 501）
+        "/api/session/list",
+        "/api/session/{id}",
+        "/api/session/save",
     }
     placeholders = {
         f"{method.upper()} {path}": operation.get("responses", {})
@@ -1323,6 +1331,407 @@ def main() -> int:
         "第 15 章" in fallback_system,
         f"{len(fallback_system)} 字符",
     )
+
+    # ---------- 方案库（SQLite，纯本地文件，不联网） ----------
+    # 用**仓库内的临时目录**而不是系统 TEMP：SQLite 要在同目录建 `-wal`/`-shm`，
+    # 而受限环境下系统临时目录可能不允许建文件（实测踩到 `unable to open database file`）。
+    # 跑完删掉；`.gitignore` 里也备了一条，崩了也不会进仓库。
+    plans_dir = BACKEND_DIR / "_tmp_plans_smoke"
+    try:
+        import shutil  # 局部 import：只为这一段的清理，不值得进文件头
+
+        from services.plan_models import ENTRY_MODES, STAGES, STATUSES, PlanCreate, PlanUpdate
+        from services.plan_repository import PlanStorageError, TABLE_NAME  # noqa: F401
+        from services.plan_service import PlanService, PlanValidationError
+
+        shutil.rmtree(plans_dir, ignore_errors=True)
+        service = PlanService(Settings(sqlite_path=plans_dir / "plans.db", sqlite_busy_timeout_ms=1000))
+        service.ensure_ready()
+        service.ensure_ready()  # 幂等
+        check(
+            "方案库建表幂等且文件落在指定路径",
+            (plans_dir / "plans.db").exists(),
+            f"{TABLE_NAME} @ {plans_dir.name}",
+        )
+
+        raw = '{"sessionId":"s1","viewState":"review-prd","form":{"product_name":"群聊周报助手"}}'
+        created = service.create(
+            PlanCreate(snapshot=raw, entry_mode="prd-shortcut", current_stage="review-prd")
+        )
+        check(
+            "快照按**原文**往返（不重排键、不改空白）",
+            service.get(created.id).snapshot == raw,
+            "字节一致",
+        )
+        check(
+            "标题留空时从快照里尽力取产品名",
+            created.title == "群聊周报助手",
+            created.title,
+        )
+        mapped = service.create(
+            PlanCreate(snapshot={"form": {"productName": "中文名"}}, status="active")
+        )
+        check(
+            "映射快照落成 JSON 对象且中文不被转义",
+            '"中文名"' in service.get(mapped.id).snapshot,
+            service.get(mapped.id).snapshot[:40],
+        )
+        summaries = service.list(limit=1)
+        check(
+            "列表按 updated_at 倒序、且**不读快照**（后写入的在前）",
+            len(summaries) == 1 and summaries[0].id == mapped.id and not hasattr(summaries[0], "snapshot"),
+            f"共 {service.count()} 条",
+        )
+        before = service.get(created.id).updated_at
+        touched = service.update(created.id, PlanUpdate(status="archived"))
+        check(
+            "更新推进 updated_at、且不动没提到的快照",
+            touched.updated_at > before and touched.snapshot == raw and touched.status == "archived",
+            f"{before} → {touched.updated_at}",
+        )
+        check(
+            "按入口/状态过滤生效",
+            len(service.list(entry_mode="structured")) == 1
+            and len(service.list(status="archived")) == 1,
+            "structured=1 / archived=1",
+        )
+        check(
+            "删除返回真假、取不存在的记录返回 None",
+            service.delete(mapped.id) is True
+            and service.delete(mapped.id) is False
+            and service.get(mapped.id) is None
+            and service.update("missing", PlanUpdate(status="active")) is None,
+            f"剩余 {service.count()} 条",
+        )
+        rejected: list[str] = []
+        for label, payload in (
+            ("空", ""),
+            ("坏 JSON", "{不是 json"),
+            ("数组", "[1,2,3]"),
+        ):
+            try:
+                service.create(PlanCreate(snapshot=payload))
+            except PlanValidationError:
+                rejected.append(label)
+        check(
+            "快照必须是 JSON **对象**（空/坏 JSON/数组都要被拒）",
+            len(rejected) == 3,
+            "、".join(rejected),
+        )
+        try:
+            service.create(PlanCreate(snapshot="{}", status="bogus"))  # type: ignore[arg-type]
+        except ValueError as exc:
+            check("非法枚举在进库前就被挡（pydantic/Service 两层之一）", True, type(exc).__name__)
+        else:
+            check("非法枚举在进库前就被挡（pydantic/Service 两层之一）", False, "居然通过了")
+
+        import sqlite3
+
+        ddl = service.repository.table_sql()
+        missing = [value for value in (*ENTRY_MODES, *STAGES, *STATUSES) if f"'{value}'" not in ddl]
+        check(
+            "数据库 CHECK 与 plan_models 的枚举取值完全一致（防两处漂移）",
+            not missing,
+            f"覆盖 {len(ENTRY_MODES) + len(STAGES) + len(STATUSES)} 个取值" if not missing else f"缺 {missing}",
+        )
+        try:
+            service.repository.insert(
+                {
+                    "id": "raw",
+                    "title": "t",
+                    "entry_mode": "structured",
+                    "current_stage": "form",
+                    "status": "bogus",
+                    "snapshot": "{}",
+                    "created_at": "x",
+                    "updated_at": "x",
+                }
+            )
+        except sqlite3.IntegrityError:
+            check("绕过 Service 直写仓储时，数据库 CHECK 仍拦得住", True, "IntegrityError")
+        else:
+            check("绕过 Service 直写仓储时，数据库 CHECK 仍拦得住", False, "CHECK 没生效")
+
+        live = sqlite3.connect(str(plans_dir / "plans.db"))
+        version = live.execute("PRAGMA user_version").fetchone()[0]
+        journal = live.execute("PRAGMA journal_mode").fetchone()[0]
+        live.close()
+        check(
+            "库版本号与 WAL 模式已设置",
+            version == 1 and str(journal).lower() == "wal",
+            f"user_version={version}, journal_mode={journal}",
+        )
+        check(
+            "默认库路径落在 backend/ 下（不跟随 cwd）",
+            Settings(_env_file=None).plans_db_path.parent == BACKEND_DIR,
+            Settings(_env_file=None).plans_db_path.name,
+        )
+    finally:
+        import shutil as _shutil
+
+        _shutil.rmtree(plans_dir, ignore_errors=True)
+
+    # ---------- 会话业务层（同一张表，纯本地，不联网） ----------
+    sessions_dir = BACKEND_DIR / "_tmp_plans_smoke"
+    try:
+        import shutil
+
+        from services.session_models import SessionLoad
+        from services.session_service import (
+            SessionNotFound,
+            SessionService,
+            downgrade_view_state,
+            parse_prd_title,
+        )
+
+        shutil.rmtree(sessions_dir, ignore_errors=True)
+        sessions = SessionService(Settings(sqlite_path=sessions_dir / "sessions.db"))
+        sessions.ensure_ready()
+
+        def snap(**over: object) -> dict:
+            base: dict = {
+                "sessionId": "s1",
+                "formVersion": "1.2",
+                "form": {"product_name": "表单里的名字"},
+                "messages": [{"role": "user", "content": "你好"}],
+                "roundIndex": 1,
+                "documents": {},
+                "viewState": "review-prd",
+                "updatedAt": "2026-09-28T00:00:00.000+00:00",
+            }
+            base.update(over)
+            return base
+
+        made = sessions.save_session(
+            snap(documents={"prd": {"content": "# 群聊周报助手\n\n## 1. 产品概述\n"}})
+        )
+        check(
+            "save_session 无 id → 新建，并用 PRD 一级标题命名",
+            made.created is True and len(made.id) == 32 and made.title == "群聊周报助手",
+            f"id={made.id[:8]} title={made.title}",
+        )
+        by_name = sessions.save_session(
+            snap(documents={"prd": {"content": "## 2. 功能需求\n\n产品名称：次级来源\n"}})
+        )
+        check(
+            "标题优先级：`##` 不算一级标题 → 退到「产品名称：xxx」",
+            by_name.title == "次级来源",
+            by_name.title,
+        )
+        no_title = sessions.save_session(snap(form={}, documents={}))
+        check(
+            "标题都取不到（正文与表单都没有）→ 用记录 id（不留空标题）",
+            no_title.title == no_title.id,
+            no_title.title[:8],
+        )
+        by_form = sessions.save_session(snap(documents={}))
+        check(
+            "没有 PRD 正文时，标题退到表单里的产品名（新建方案在开始对话时就落库）",
+            by_form.title == "表单里的名字",
+            by_form.title,
+        )
+        by_body = sessions.save_session(
+            snap(documents={"prd": {"content": "# 正文标题\n"}})
+        )
+        check(
+            "有 PRD 正文时，正文一级标题优先于表单产品名",
+            by_body.title == "正文标题",
+            by_body.title,
+        )
+        again = sessions.save_session(
+            snap(documents={"prd": {"content": "# 换了个名字\n"}}, viewState="done"),
+            session_id=made.id,
+        )
+        check(
+            "save_session 有 id → 更新，且**不改标题**（正文换了标题也不改）",
+            again.created is False and again.id == made.id and again.title == "群聊周报助手",
+            f"title={again.title}",
+        )
+        sessions.save_session(snap(viewState="generating-api-docs"), session_id=made.id)
+        check(
+            "写入前降级：库里不出现 generating-*",
+            "generating" not in str(sessions.plans.get(made.id).snapshot)
+            and sessions.plans.get(made.id).current_stage == "review-api-docs",
+            "库内 viewState=review-api-docs",
+        )
+        sessions.plans.repository.insert(
+            {
+                "id": "legacy",
+                "title": "旧记录",
+                "entry_mode": "structured",
+                "current_stage": "generating-prompts",
+                "status": "draft",
+                "snapshot": json.dumps(snap(viewState="generating-prompts"), ensure_ascii=False),
+                "created_at": "2026-09-27T00:00:00.000+00:00",
+                "updated_at": "2026-09-27T00:00:00.000+00:00",
+            }
+        )
+        loaded = sessions.get_session("legacy")
+        check(
+            "get_session 读到 generating-* 时先降级，并报出被打断的产物",
+            isinstance(loaded, SessionLoad)
+            and json.loads(loaded.session_data)["viewState"] == "review-prompts"
+            and loaded.downgraded_from == "generating-prompts"
+            and loaded.interrupted_kind == "prompts",
+            f"{loaded.downgraded_from} → review-prompts（kind={loaded.interrupted_kind}）",
+        )
+        check(
+            "降级**不回写**（读操作不该改数据）",
+            json.loads(sessions.plans.get("legacy").snapshot)["viewState"] == "generating-prompts",
+            "库内仍是 generating-prompts",
+        )
+        raw = json.dumps(snap(viewState="review-prd"), ensure_ascii=False, separators=(",", ":"))
+        sessions.save_session(raw, session_id=made.id)
+        check(
+            "无需降级时快照**字节一致**（不重排键、不改空白）",
+            sessions.get_session(made.id).session_data == raw,
+            "原样往返",
+        )
+        rows = sessions.list_sessions()
+        check(
+            "list_sessions 按 updated_at 倒序且**不含 session_data**",
+            len(rows) >= 2 and not hasattr(rows[0], "session_data") and rows[0].id == made.id,
+            f"共 {len(rows)} 条，首条={rows[0].title}",
+        )
+        sessions.delete_session("legacy")
+        raised = 0
+        for action in (
+            lambda: sessions.get_session("legacy"),
+            lambda: sessions.delete_session("legacy"),
+            lambda: sessions.save_session(snap(), session_id="legacy"),
+        ):
+            try:
+                action()
+            except SessionNotFound:
+                raised += 1
+        check(
+            "delete_session 后 get/delete/save 三个操作都抛 SessionNotFound（HTTP → 404）",
+            raised == 3,
+            f"{raised}/3",
+        )
+        check(
+            "纯函数：降级表与标题兜底",
+            downgrade_view_state("review-prd") == ("review-prd", None)
+            and downgrade_view_state("generating-prd") == ("review-prd", "prd")
+            and parse_prd_title("{}", "fallback") == "fallback",
+            "generating-prd → review-prd / fallback",
+        )
+    finally:
+        import shutil as _shutil
+
+        _shutil.rmtree(sessions_dir, ignore_errors=True)
+
+    # ---------- 会话存储 HTTP 接口（4 条，TestClient 真打，临时库） ----------
+    try:
+        import shutil
+
+        from fastapi.testclient import TestClient
+
+        from main import create_app
+
+        api_dir = BACKEND_DIR / "_tmp_plans_smoke"
+        shutil.rmtree(api_dir, ignore_errors=True)
+        # 记一下默认库的条数：接口**必须**用注入的临时库（依赖注入若绕过 app.state，
+        # 就会写进 backend/harnessprd.db —— 测试之间互相污染，且极难发现）
+        from services.plan_service import PlanService as _PlanService
+
+        try:
+            default_before: int | None = _PlanService(Settings(_env_file=None)).count()
+        except Exception:  # noqa: BLE001 - 默认库读不了不影响本段结论
+            default_before = None
+
+        session_app = create_app(
+            Settings(_env_file=None, sqlite_path=api_dir / "api.db", sqlite_busy_timeout_ms=1000)
+        )
+        with TestClient(session_app) as client:
+            empty = client.get("/api/session/list")
+            check(
+                "GET /api/session/list 回 {items: []} 信封",
+                empty.status_code == 200 and empty.json() == {"items": []},
+                f"{empty.status_code} {empty.json()}",
+            )
+            made = client.post(
+                "/api/session/save",
+                json={
+                    "session_data": {
+                        "sessionId": "s1",
+                        "viewState": "review-prd",
+                        "documents": {"prd": {"content": "# 群聊周报助手\n"}},
+                    }
+                },
+            )
+            made_body = made.json()
+            plan_id = made_body.get("id", "")
+            check(
+                "POST /api/session/save 新建 → 统一回 {id, title}",
+                made.status_code == 200
+                and set(made_body) == {"id", "title"}
+                and made_body.get("title") == "群聊周报助手",
+                f"{made_body}",
+            )
+            items = client.get("/api/session/list").json().get("items", [])
+            check(
+                "列表项只有摘要字段（无 session_data）",
+                len(items) == 1 and "session_data" not in items[0],
+                "、".join(sorted(items[0])) if items else "空",
+            )
+            detail = client.get(f"/api/session/{plan_id}")
+            detail_body = detail.json()
+            check(
+                "GET /api/session/{id} 带完整快照与降级信息",
+                detail.status_code == 200
+                and bool(detail_body.get("session_data"))
+                and "downgraded_from" in detail_body
+                and "interrupted_kind" in detail_body,
+                f"{detail.status_code} 字段 {len(detail_body)} 个",
+            )
+            again = client.post(
+                "/api/session/save",
+                json={
+                    "id": plan_id,
+                    "session_data": {
+                        "sessionId": "s1",
+                        "viewState": "generating-prd",
+                        "documents": {"prd": {"content": "# 换了个名字\n"}},
+                    },
+                },
+            )
+            check(
+                "POST /save 带 id → 更新同一条、标题不变、写入前已降级",
+                again.json().get("id") == plan_id
+                and again.json().get("title") == "群聊周报助手"
+                and '"viewState":"review-prd"' in client.get(f"/api/session/{plan_id}").json()["session_data"],
+                f"{again.json()}",
+            )
+            check(
+                "查询与删除不存在的 id 都是 404",
+                client.get("/api/session/nope").status_code == 404
+                and client.delete("/api/session/nope").status_code == 404,
+                "GET/DELETE → 404",
+            )
+            deleted = client.delete(f"/api/session/{plan_id}")
+            check(
+                "DELETE 存在 → {ok: true}，且之后列表为空",
+                deleted.status_code == 200
+                and deleted.json() == {"ok": True}
+                and client.get("/api/session/list").json() == {"items": []},
+                f"{deleted.status_code} {deleted.json()}",
+            )
+            check(
+                "请求体类型不合法 → 422（Pydantic 拦在业务层之前）",
+                client.post("/api/session/save", json={"session_data": 123}).status_code == 422,
+                "session_data=123",
+            )
+        if default_before is not None:
+            check(
+                "接口用的是注入的库，没写进默认库（依赖注入没绕过 app.state）",
+                _PlanService(Settings(_env_file=None)).count() == default_before,
+                f"默认库仍为 {default_before} 条",
+            )
+    finally:
+        import shutil as _shutil2
+
+        _shutil2.rmtree(BACKEND_DIR / "_tmp_plans_smoke", ignore_errors=True)
 
     print()
     if FAILURES:

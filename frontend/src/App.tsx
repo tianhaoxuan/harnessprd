@@ -57,6 +57,15 @@ import {
   writeLocal,
 } from './services/storage'
 import { downloadBlob, downloadFile, safeFileName } from './services/download'
+// ⚠️ 必须起别名：本文件自己有 `loadSession()`（读**本地存储**的那份，还导出了）。
+// 直接同名导入会撞车（TS2440），而且更阴的是——`loaded` 会被推断成本地那个类型，
+// 于是 `loaded.title` / `loaded.interruptedKind` 报"属性不存在"，看不出真正原因。
+import {
+  debouncedSaveSession,
+  flushPendingSave,
+  loadSession as loadRemoteSession,
+  saveSession as saveRemoteSession,
+} from './services/sessionService'
 import { buildZip, splitPromptSuite, type ZipEntry } from './services/zip'
 import {
   STEPS,
@@ -224,6 +233,15 @@ export interface SessionData {
    * 所以"存视图状态"与"不能显示假的生成中"这两件事是不冲突的 —— **前提是降级一定要做**。
    */
   viewState: ViewState
+  /**
+   * **上次离开页面时正在生成**的那份产物（`prd` / `api` / `prompts`）。
+   *
+   * 为什么需要它：服务端按规格在**写入前**就把 `generating-*` 降级成了 `review-*`，
+   * 所以「被打断」这件事在库里看不出来 —— 恢复时就没法提示用户，
+   * 而他会把半份正文当成完整产物。这个字段归前端所有（快照形状本来就是我们的），
+   * 由 `pagehide` 写入、恢复时读取，之后的保存不再带它（自然消失）。
+   */
+  interruptedKind?: DocKind
   updatedAt: string
 }
 
@@ -554,7 +572,25 @@ const DONE_NOTE = {
   source: 'docs/状态机设计.md',
 } as const
 
-export default function App() {
+/**
+ * V2 编辑态通过它传入"要加载哪一条方案"（见 `pages/V2Workbench.tsx`）。
+ *
+ * ⚠️ **不传 = 与之前完全一样**：V1（路由 `/`）就是这么用的，
+ * 所以这条改动对 V1 没有行为影响 —— 新增的只有"传了 id 就去服务端取回来"这一条路径。
+ */
+export interface AppProps {
+  /** 服务端方案 id。`null`/不传 = 新建。 */
+  sessionId?: string | null
+  /**
+   * 首次保存成功后的回调（V2 外壳据此把地址**替换**成 `/v2/{id}`）。
+   *
+   * 为什么由外壳跳转、而不是 `App` 自己 navigate：V1（`/`）也渲染同一个组件，
+   * 那里没有 `/v2/:id` 这条路由 —— 把路由知识塞进 `App` 会让 V1 多出一个不成立的跳转。
+   */
+  onSessionSaved?: (id: string) => void
+}
+
+export default function App({ sessionId = null, onSessionSaved }: AppProps = {}) {
   /**
    * 当前渲染哪一屏。
    *
@@ -611,6 +647,19 @@ export default function App() {
   const [entryMode, setEntryMode] = useState<EntryMode>('structured')
   /** 快捷入口里粘贴进来的 PRD 正文（确认后写进 `prd` 产物）。 */
   const [importedPrd, setImportedPrd] = useState('')
+  /**
+   * 服务端方案 id。首次保存成功前为 `null`（`/v2` 新建态）。
+   *
+   * 与 `savedIdRef` 成对：state 用于渲染（按钮禁用），ref 给不在依赖数组里的
+   * effect/回调读 —— 否则为了一个 id 要去改一堆 deps，改漏一处就是过期闭包。
+   */
+  const [savedId, setSavedId] = useState<string | null>(sessionId)
+  const savedIdRef = useRef<string | null>(sessionId)
+  /** 首次保存进行中：相关按钮禁用，避免连点创建出两条方案（需求测试 8）。 */
+  const [saveBusy, setSaveBusy] = useState(false)
+  const saveBusyRef = useRef(false)
+  /** 上一次把「已收到的部分正文」写进产物的时间（节流用，见 `onChunk`）。 */
+  const lastPartialWriteRef = useRef(0)
   /** 这份 PRD 是否已作为基准被接受 —— 只影响面板的显示与按钮态，不参与生成逻辑。 */
   const [baselineAccepted, setBaselineAccepted] = useState(false)
   /**
@@ -839,6 +888,98 @@ export default function App() {
     setChatHydrated(true)
   }, [load.status])
 
+  /**
+   * V2 编辑态：把服务端那条方案取回来灌进工作台。
+   *
+   * 几个刻意的决定：
+   * - **只在传了 `sessionId` 时才跑**：V1 与 `/v2`（新建）完全不受影响。
+   * - **它排在本地恢复之后执行，并且以服务端为准**：本地那份是"这台机器上次没关的会话"，
+   *   而编辑一条指定方案时，用户要的显然是那一条。
+   * - **`documents` 逐份写回**（`writeDoc`）：产物正文可能有上万字符，它们是工作台的既有状态，
+   *   不走新的一套存储，避免出现"两处都能改正文"的第二份真相。
+   * - **降级已经由服务端做过**：`loadSession()` 返回的 `viewState` 保证不是 `generating-*`，
+   *   这里的 `interruptedKind` 只用来提示"上次生成被打断了"（与 `loadSession()` 的约定一致）。
+   */
+  useEffect(() => {
+    if (load.status !== 'ok' || !sessionId) return
+    let cancelled = false
+    void (async () => {
+      const loaded = await loadRemoteSession(sessionId)
+      if (cancelled) return
+      if (!loaded) {
+        setNotice({
+          text: `没能加载方案 ${sessionId}（可能已被删除）—— 当前是新建状态。`,
+          warn: true,
+        })
+        return
+      }
+      const data = loaded.data
+      const form = data.form ?? {}
+      setValues(form)
+      setSubmitted(Object.keys(form).length > 0 ? form : null)
+      setFormVersion(data.formVersion ?? '')
+      setConversationId(data.sessionId ?? sessionId)
+      setRoundIndex(data.roundIndex ?? 1)
+      setMessages(
+        (data.messages ?? []).map((message) => ({
+          id: message.id,
+          role: message.role,
+          content: message.content,
+        })),
+      )
+      for (const kind of DOC_ORDER) {
+        const doc = data.documents?.[kind]
+        if (doc?.content) writeDoc(kind, doc.content)
+      }
+      setApprovedDocs({
+        prd: Boolean(data.documents?.prd?.approved),
+        api: Boolean(data.documents?.api?.approved),
+        prompts: Boolean(data.documents?.prompts?.approved),
+      })
+      setTruncatedDocs({
+        prd: Boolean(data.documents?.prd?.truncated),
+        api: Boolean(data.documents?.api?.truncated),
+        prompts: Boolean(data.documents?.prompts?.truncated),
+      })
+      // 落地哪一屏：**别把用户丢在一个空产物页上**。
+      //
+      // 为什么需要这条：生成是被刷新打断的，流式正文从没写进产物（它只在结束时落盘），
+      // 而服务端把 `generating-prd` 降级成了 `review-prd` —— 于是刷新后停在
+      // 「PRD（空的）待审核」，对话还在库里却看不见。用户的描述就是「内容全被清空」（实测）。
+      // 规则：目标屏对应的产物没有正文时，退回**对话**（有消息）或**表单**（没消息）。
+      const targetView = data.viewState ?? 'form'
+      // 「被打断」有两个来源：服务端读取时降级报出的（旧数据），以及前端
+      // 自己在 `pagehide` 里记下的（新数据 —— 服务端写入前已降级，只能这样留痕）。
+      const interruptedKind = loaded.interruptedKind ?? data.interruptedKind ?? null
+      const emptyTarget = DOC_ORDER.find(
+        (kind) =>
+          (DOC_META[kind].review === targetView || DOC_META[kind].generating === targetView) &&
+          !(data.documents?.[kind]?.content ?? '').trim(),
+      )
+      // 落地哪一屏：**留在快照记录的那一步**。
+      //
+      // 刻意**不**因为「那份产物是空的」就退回对话页：用户上一秒在 PRD 步，把她踢回澄清页
+      // 会让人以为流程被重置了（实测反馈：「直接退回到了 AI 澄清页面」）。留在原步 + 说清
+      // 「上次被打断、这是部分内容」，用户点一下「生成」就能接着做。
+      setViewState(targetView)
+      setNotice({
+        text: emptyTarget
+          ? `已加载方案「${loaded.title}」，但${DOC_META[emptyTarget].title}还没生成完 —— 上次生成被打断了，` +
+            `下面是当时已经收到的部分内容，点「生成」可以重新来一遍。`
+          : interruptedKind
+            ? `已加载方案「${loaded.title}」；上次生成${DOC_META[interruptedKind].title}时被打断，` +
+              `下面是当时已经收到的部分内容，点「生成」可以重新来一遍。`
+            : `已加载方案「${loaded.title}」。`,
+        warn: Boolean(emptyTarget) || interruptedKind !== null,
+      })
+      setHydrated(true)
+      setChatHydrated(true)
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [load.status, sessionId, writeDoc])
+
   // 防抖写回本地草稿。**不做逐键写入** —— 文档 §2 说 localStorage 是同步 API、
   // 会阻塞主线程，只该在关键节点读写。
   useEffect(() => {
@@ -860,25 +1001,18 @@ export default function App() {
     return () => window.clearTimeout(timer)
   }, [values, hydrated, structuredSummary, structuredExtras])
 
-  // 每完成一轮落一次本地。
-  // **不是每收一个 chunk 写一次** —— 流式期间 `messages` 不变（增量在 `streamingContent`），
-  // 所以这个 effect 根本不会被触发，localStorage 的同步写不会卡住流式渲染。
-  // 状态一变就把整份会话落本地（**防抖**，见 `SESSION_DEBOUNCE_MS` 的说明）。
-  //
-  // 一次写整份而不是增量：会话是一个整体，"对话在、产物没了"这种半份状态没有意义
-  // （也正因如此键才合并成一个）。流式期间不会触发 —— 增量在 `streamingContent` /
-  // `streamingDoc` 这两个**不参与本 effect** 的 state 里。
-  useEffect(() => {
-    if (!chatHydrated || !conversationId || !submitted) return
-    // 「防抖 + 最长等待」：正常情况等安静 800ms 再写；但连续变化时不能无限推迟，
-    // 从第一次待写算起最多 2000ms 就强制写一次（见 `SESSION_MAX_WAIT_MS` 的说明）。
-    const now = Date.now()
-    if (sessionPendingSince.current === null) sessionPendingSince.current = now
-    const waited = now - sessionPendingSince.current
-    const delay = Math.max(0, Math.min(SESSION_DEBOUNCE_MS, SESSION_MAX_WAIT_MS - waited))
-
-    const timer = window.setTimeout(() => {
-      sessionPendingSince.current = null
+  /**
+   * 组装一份工作台快照。本地保存与 V2 服务端保存**共用这一份组装逻辑**：
+   * 两处各写一遍必然漂移（一处加了 `truncated` 另一处没加，就成了「本地有、服务端没有」）。
+   *
+   * `formOverride` 给「表单刚提交、state 还没生效」的那一刻用（开始对话时的首次保存）；
+   * 不传就用 `submitted`。不这么做的话首次保存存下的是空表单，标题会退成记录 id。
+   */
+  const buildSnapshot = useCallback(
+    (
+      formOverride?: Record<string, string>,
+      inFlightDoc?: { kind: DocKind; content: string },
+    ): SessionData => {
       // 只存**完整的一轮**（user + 一条成功的 ai）。
       //
       // ⚠️ 光按 `!error` 过滤是不够的：失败那一轮里**用户消息身上没有 error 标记**
@@ -894,38 +1028,205 @@ export default function App() {
         })
         .map(({ id, role, content }) => ({ id, role, content }))
 
-      // 只落**有内容**的产物；空的不写 —— 写空串会让"没生成过"和"生成出来是空的"分不清，
-      // 而且 `loadSession` 会把空 content 当成没有（两边保持一致）。
-      const now = new Date().toISOString()
+      // 只落**有内容**的产物；空的不写 —— 写空串会让「没生成过」和「生成出来是空的」分不清。
+      const stamped = new Date().toISOString()
       const documents: SessionData['documents'] = {}
       for (const kind of DOC_ORDER) {
-        const content = readDoc(kind)
+        // 正在生成的那一份，用**内存里最新的**流式正文（`docPartialRef`）覆盖产物存储 ——
+        // 否则会丢"最后一个 1.5 秒节流窗口"里收到的内容（`onChunk` 每 1.5 秒才写一次产物）。
+        const content = inFlightDoc?.kind === kind ? inFlightDoc.content : readDoc(kind)
         // `trim()` 而不是直接判空：**只有空白**的产物与没有产物是一回事。
-        // 不 trim 的话它会以"有内容"的身份通过 `loadSession` 的校验，界面上显示一个空壳文档
-        // 却是"待审核"状态。两边必须用同一个判据。
         if (!content.trim()) continue
         documents[kind] = {
           content,
           approved: approvedDocs[kind],
-          updatedAt: now,
-          // 截断标记跟着正文一起落盘（它是"这正文是残的"这件事的唯一记录）
+          updatedAt: stamped,
+          // 截断标记跟着正文一起落盘（它是「这正文是残的」这件事的唯一记录）
           truncated: truncatedDocs[kind],
         }
       }
 
-      saveSession({
-        sessionId: conversationId,
+      return {
+        sessionId: conversationId ?? savedIdRef.current ?? '',
         formVersion,
-        form: submitted,
+        // `submitted` 为空时退到 `values`：首存常由「生成 / PRD 入口」触发，
+        // 那一刻 `submitted` 还没生效，只认它会让快照表单是空的 → 标题退成记录 id（实测踩到）。
+        form: formOverride ?? submitted ?? values,
         messages: persistable,
         roundIndex,
         documents,
-        // ⚠️ 存进去是**允许**的，因为 `loadSession` 会把 `generating-*` 降级成 `review-*`
-        // 并报出 `interrupted` —— 那正是 §7.4 的孤儿生成态处理。**这两件事必须成对存在**：
-        // 只存不降级，刷新后就会显示一个根本没在跑的"生成中"。
+        // ⚠️ `generating-*` 存进去是**允许**的：服务端在写入前会把它降级成 `review-*`
+        // （需求测试 6 盯的就是这条：生成途中刷新不许卡在 generating）。
         viewState,
-        updatedAt: now,
-      })
+        updatedAt: stamped,
+      }
+    },
+    [
+      messages,
+      submitted,
+      values,
+      formVersion,
+      roundIndex,
+      conversationId,
+      viewState,
+      approvedDocs,
+      truncatedDocs,
+      readDoc,
+    ],
+  )
+
+  /**
+   * **首次保存**：没有 id 时立刻建一条并记下 id；已有 id 时只刷防抖队列（不重复创建）。
+   * 返回 id；失败返回 `null`。
+   *
+   * 三个刻意的点：
+   * 1. **加锁**：`saveBusyRef` 挡住并发（连点按钮、或「开始对话」与「生成」几乎同时触发），
+   *    否则会创建出两条方案（需求测试 8 盯的就是这个）。
+   * 2. **失败不挡主流程**：只提示一句，用户照样能继续生成（本地那份还在）——
+   *    把「存不上」升级成「用不了」是更糟的失败模式。
+   * 3. **表单值可显式传入**：`handleSubmit` 那一刻 `submitted` 还没生效。
+   *
+   * ⚠️ 声明位置必须**早于**所有引用它的 useCallback 依赖数组（依赖数组是渲染时求值的）。
+   */
+  const ensureSessionSaved = useCallback(
+    async (formOverride?: Record<string, string>): Promise<string | null> => {
+      const existing = savedIdRef.current
+      if (existing) {
+        await flushPendingSave()
+        return existing
+      }
+      if (saveBusyRef.current) return null
+      saveBusyRef.current = true
+      setSaveBusy(true)
+      try {
+        const result = await saveRemoteSession(buildSnapshot(formOverride))
+        if (!result) {
+          setNotice({
+            text: '方案没能存到服务端 —— 后续改动不会入库（详见浏览器控制台）。',
+            warn: true,
+          })
+          return null
+        }
+        savedIdRef.current = result.id
+        setSavedId(result.id)
+        onSessionSaved?.(result.id)
+        return result.id
+      } finally {
+        saveBusyRef.current = false
+        setSaveBusy(false)
+      }
+    },
+    [buildSnapshot, onSessionSaved],
+  )
+
+  /**
+   * 产物正文变化 → 也自动保存。
+   *
+   * 主保存 effect 的依赖是**对话侧**状态（messages/submitted/...），正文变化它不重跑；
+   * 而生成途中每 1.5 秒会写一次部分正文（见 `onChunk`）—— 没有这条，那些部分正文
+   * 只会留在内存里，刷新照样丢。顺带也让「手改产物正文」能自动入库。
+   */
+  useEffect(() => {
+    if (!savedIdRef.current) return
+    const timer = window.setTimeout(() => {
+      const id = savedIdRef.current
+      if (id) debouncedSaveSession(buildSnapshot(), id)
+    }, 800)
+    return () => window.clearTimeout(timer)
+  }, [prdContent, apiDocsContent, promptsContent, buildSnapshot])
+
+  /**
+   * 视图 / 生成状态变化 → 也要自动保存。
+   *
+   * ⚠️ **这条是「生成中途刷新能回到 PRD 步」的关键。** 生成 PRD 时 `viewState` 变成
+   * `generating-prd`，而主保存 effect 的依赖是对话侧状态（messages / submitted / ...）——
+   * 生成期间它们不变，于是**库里记的仍是上一屏**（`chatting`）。刷新后按库里的状态恢复，
+   * 用户就被退回了澄清页（实测反馈：刷新依旧退回前置页面）。
+   *
+   * 存下 `generating-*` 之后，服务端在**写入前**会把它降级成 `review-*`，
+   * 所以刷新是落回 PRD 步，而不是"卡在生成中"。
+   */
+  useEffect(() => {
+    if (!savedIdRef.current) return
+    const timer = window.setTimeout(() => {
+      const current = savedIdRef.current
+      if (current) debouncedSaveSession(buildSnapshot(), current)
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [viewState, isGenerating, buildSnapshot])
+
+  /**
+   * `pagehide` / 页面隐藏 → **立刻把当前状态落库**（需求第 4 条）。
+   *
+   * 为什么必须做：刷新、关标签页、跳到别的站点时，浏览器**不会等你**那 1 秒防抖。
+   * 这里做两件事：
+   * ① 用**此刻的状态**覆盖防抖队列里那份旧快照 —— 特别是生成途中「已经收到但还没到
+   *    1.5 秒节流点」的部分正文（通过 `inFlightDoc` 传进去，而不是等 `writeDoc` 生效）；
+   * ② 马上 flush，请求带 `keepalive`，页面卸载后仍能发完。
+   *
+   * 只做在有 id 之后：`/v2` 新建、还没 id 时**不创建方案**（与需求测试 1 一致）。
+   */
+  useEffect(() => {
+    const leave = () => {
+      const id = savedIdRef.current
+      if (!id) return
+      const partial = docPartialRef.current
+      const inFlightDoc =
+        isGenerating && generatingKind && partial
+          ? { kind: generatingKind, content: partial }
+          : undefined
+      const snapshot = buildSnapshot(undefined, inFlightDoc)
+      // 记下「此刻正在生成哪一份」：下一屏要据此提示用户
+      // （服务端会把 generating-* 降级，库里留不下这个信息）
+      if (isGenerating && generatingKind) snapshot.interruptedKind = generatingKind
+      debouncedSaveSession(snapshot, id)
+      void flushPendingSave()
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') leave()
+    }
+    window.addEventListener('pagehide', leave)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      window.removeEventListener('pagehide', leave)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [buildSnapshot, isGenerating, generatingKind])
+
+  // 每完成一轮落一次本地。
+  // **不是每收一个 chunk 写一次** —— 流式期间 `messages` 不变（增量在 `streamingContent`），
+  // 所以这个 effect 根本不会被触发，localStorage 的同步写不会卡住流式渲染。
+  // 状态一变就把整份会话落本地（**防抖**，见 `SESSION_DEBOUNCE_MS` 的说明）。
+  //
+  // 一次写整份而不是增量：会话是一个整体，"对话在、产物没了"这种半份状态没有意义
+  // （也正因如此键才合并成一个）。流式期间不会触发 —— 增量在 `streamingContent` /
+  // `streamingDoc` 这两个**不参与本 effect** 的 state 里。
+  useEffect(() => {
+    // 本地那份要求会话已经起来（它靠 conversationId 做键）；
+    // 服务端那份只要求**有 id** —— 例如只贴了 PRD 的快捷入口，对话还没开始也要能存。
+    const localReady = Boolean(chatHydrated && conversationId && submitted)
+    const remoteId = savedIdRef.current
+    if (!localReady && !remoteId) return
+    // 「防抖 + 最长等待」：正常情况等安静 800ms 再写；但连续变化时不能无限推迟，
+    // 从第一次待写算起最多 2000ms 就强制写一次（见 `SESSION_MAX_WAIT_MS` 的说明）。
+    const now = Date.now()
+    if (sessionPendingSince.current === null) sessionPendingSince.current = now
+    const waited = now - sessionPendingSince.current
+    const delay = Math.max(0, Math.min(SESSION_DEBOUNCE_MS, SESSION_MAX_WAIT_MS - waited))
+
+    const timer = window.setTimeout(() => {
+      sessionPendingSince.current = null
+      // 只存**完整的一轮**（user + 一条成功的 ai）。
+      //
+      // ⚠️ 光按 `!error` 过滤是不够的：失败那一轮里**用户消息身上没有 error 标记**
+      // （错在 AI 那条上），于是会存下一条永远等不到回复的提问 —— 下次接续时模型
+      // 会以为这句已经被回应过了。所以用户消息必须检查它后面那条回复。
+      // 首条 AI 开场本来就没有前置用户消息，所以对 `ai` 不做配对要求。
+      const snapshot = buildSnapshot()
+      if (localReady) saveSession(snapshot)
+      // V2：**有 id 才自动保存**。`/v2` 新建、还没 id 时这里什么都不做 ——
+      // 需求测试 1 盯的就是这条：只填表单、不点关键动作，网络面板里不该出现 save。
+      if (remoteId) debouncedSaveSession(snapshot, remoteId)
     }, delay)
     return () => window.clearTimeout(timer)
   }, [
@@ -1051,9 +1352,19 @@ export default function App() {
   const handleSubmit = useCallback(
     (formValues: FormValues) => {
       if (load.status !== 'ok') return
-      void handleStartConversation(formValues, load.config)
+      void (async () => {
+        // 首存进行中：**整个动作忽略**，不只是跳过第二次保存。
+        // 不这么做的话，快速双击「开始澄清对话」会开两路对话流（方案只有一条，但对话是两份）——
+        // 保存锁只保证"不重复创建方案"，管不了"动作被触发两次"。
+        if (saveBusyRef.current) return
+        // 「开始澄清对话」= 关键动作之一：先落库（首次保存），再开对话。
+        // 传 `formValues`：此刻 `submitted` 还没被 set 上去（同一事件里 setState 是异步的），
+        // 不传的话首次保存存的是空表单，列表里会显示记录 id。
+        await ensureSessionSaved(formValues)
+        void handleStartConversation(formValues, load.config)
+      })()
     },
-    [load, handleStartConversation],
+    [load, handleStartConversation, ensureSessionSaved],
   )
 
   /**
@@ -1435,6 +1746,16 @@ export default function App() {
         onChunk: (_piece: string, fullText: string) => {
           docPartialRef.current = fullText
           setStreamingDoc(fullText)
+          // 每 ~1.5 秒把**已经收到的部分正文**写进产物。
+          //
+          // 为什么需要：流式正文原先只在生成**结束时**才落盘，刷新/断电时一个字都不剩 ——
+          // 界面表现就是「PRD 页空的、内容全没了」（实测反馈）。
+          // ⚠️ 只落「已收到的内容」，**不动生成逻辑**：请求、分片、提示词、审核一律没变。
+          const stamp = Date.now()
+          if (stamp - lastPartialWriteRef.current > 1500) {
+            lastPartialWriteRef.current = stamp
+            writeDoc(kind, fullText)
+          }
         },
         /**
          * ⚠️ **截断必须在这里收下。** 它在正文里看不出来（末尾就是半行表格），
@@ -1690,6 +2011,16 @@ export default function App() {
         onChunk: (_piece: string, fullText: string) => {
           docPartialRef.current = fullText
           setStreamingDoc(fullText)
+          // 每 ~1.5 秒把**已经收到的部分正文**写进产物。
+          //
+          // 为什么需要：流式正文原先只在生成**结束时**才落盘，刷新/断电时一个字都不剩 ——
+          // 界面表现就是「PRD 页空的、内容全没了」（实测反馈）。
+          // ⚠️ 只落「已收到的内容」，**不动生成逻辑**：请求、分片、提示词、审核一律没变。
+          const stamp = Date.now()
+          if (stamp - lastPartialWriteRef.current > 1500) {
+            lastPartialWriteRef.current = stamp
+            writeDoc(kind, fullText)
+          }
         },
         // ⚠️ **优化不碰 `truncatedDocs`**（与 `handleGenerateDocument` 刻意不同）：
         // 那个标记说的是「**整份**正文被截断过」，而优化只重写一节 ——
@@ -2124,11 +2455,17 @@ export default function App() {
         label: hasContent ? '重新生成' : DOC_META[kind].generateLabel,
         variant: 'secondary',
         // 生成也受链条约束（后端缺 prd_content 会 422）—— 这里只做说明，拦截在 handleGenerateDocument
-        disabled: !upstreamReady,
+        disabled: !upstreamReady || saveBusy,
         title: upstreamReady
           ? '重新生成会覆盖当前内容 —— 想保住手改的部分，请改用上面的「AI 优化」'
           : `需要先生成${DOC_META[stage.upstream as DocKind].title}`,
-        onClick: () => void handleGenerateDocument(kind),
+        // 「生成 / 重新生成」也是关键动作：首次保存 + 保存中禁用（需求测试 8）
+        onClick: () => {
+          void (async () => {
+            await ensureSessionSaved()
+            void handleGenerateDocument(kind)
+          })()
+        },
       })
 
       // 只有**已通过**才给"下一步"：这是有序性的关键（见上面的说明）
@@ -2214,6 +2551,13 @@ export default function App() {
           生成 PRD 有两个入口（对话步按钮 / 产物页「重新生成」），只挂一处必然有看不到的时候。 */}
       {prdStatusBadges}
 
+      {/* V2：方案已经落库的可视证据 —— 测试 2/3/5 里不用翻 Network 也看得到它在 */}
+      {savedId ? (
+        <p data-testid="session-saved" className="text-xs text-slate-400">
+          方案已保存到服务端 · {savedId.slice(0, 8)}
+        </p>
+      ) : null}
+
       {/* 三个入口。放在**所有屏之上**：随时可切，且切换时把视图带到该入口的第一步。 */}
       <div
         data-testid="entry-mode-bar"
@@ -2225,7 +2569,13 @@ export default function App() {
             key={mode.id}
             type="button"
             data-testid={`entry-mode-${mode.id}`}
-            onClick={() => chooseEntryMode(mode.id)}
+            onClick={() => {
+              chooseEntryMode(mode.id)
+              // 「PRD 入口」= 关键动作：进这个入口就落库（需求测试 3 的首次 save）。
+              // 放在 onClick 而不是 chooseEntryMode 内部：那两者声明位置相邻，
+              // 在依赖数组里互相引用容易命中 const 的 TDZ（本仓库注释里踩过同一类）。
+              if (mode.id === 'prd-shortcut') void ensureSessionSaved()
+            }}
             title={mode.hint}
             className={[
               'rounded-md border px-2.5 py-1 text-xs transition',
@@ -2402,7 +2752,9 @@ export default function App() {
                 type="button"
                 data-testid="start-prd"
                 onClick={() => void handleGeneratePrdWithSync()}
-                disabled={!canStartPrd || summarySyncBusy || pendingSummary !== null}
+                disabled={
+                  !canStartPrd || summarySyncBusy || pendingSummary !== null || saveBusy
+                }
                 className="inline-flex items-center gap-1.5 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-primary-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 disabled:cursor-not-allowed disabled:bg-slate-300"
               >
                 {summarySyncBusy ? (
