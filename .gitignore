@@ -53,6 +53,11 @@ Thumbs.db
 *.db-shm
 # smoke / 临时自检用的库目录（正常跑完会自己删；崩了也不该进仓库）
 backend/_tmp_plans_smoke/
+backend/_tmp_jobs_check/
+# tiktoken 的 BPE 词表缓存（第一次算 token 预算时下载，约 1.6 MB）。
+# 正常落在系统临时目录；在受限环境里 `tempfile.gettempdir()` 会解析成相对路径，
+# 于是它出现在跑服务时的工作目录下（`backend/`）。纯缓存，不该进仓库。
+backend/data-gym-cache/
 
 # ---------- 部署 ----------
 # Basic Auth 密码文件：**绝不能提交**（它本身就是一份可用凭据）

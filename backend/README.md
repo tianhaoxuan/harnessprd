@@ -11,8 +11,10 @@
 设计阶段已完成（见 [`../docs/`](../docs/)），**业务代码部分实现**。
 
 - **已实现**：对话侧 3 条接口（题目下发 + 首轮/接续流式对话）、澄清阶段编排、
-  三份产物的生成与修订（`services/document_service.py`，`astream` 流式）
-- **未实现**：会话状态机（`SessionStore` / `apply_event`）、后台生成任务、
+  三份产物的生成与修订（`services/document_service.py`，`astream` 流式）、
+  会话快照存储（`/api/session/*`，SQLite）、
+  **生成任务（Generation Job，`/api/jobs/*`）—— 生成不再绑在 SSE 连接上**
+- **未实现**：会话状态机（`SessionStore` / `apply_event`）、
   M8 产物审核与质检、数据层接入 —— 所以 `/sessions/*` 那 8 条仍是 501
 - `main.py` / `api/` 的分层外壳是**设计之前就有的骨架**，但已按新设计改造过
   （旧接口面按 HANDOFF §7 删除），现在可以当作实现基础 —— 见 HANDOFF.md §0
@@ -31,9 +33,10 @@ backend/
 │   ├── schemas.py          请求/响应模型（对外契约；枚举复用 services.state）
 │   ├── health.py           GET  /health、/api/v1/health
 │   ├── sessions.py         /sessions：创建/列表/快照/表单草稿/事件/文档/对话历史（占位，501）
-│   ├── conversation.py     /conversation：题目下发 + 首轮/接续对话 + 产物生成/修订（**7 条均已实现**，SSE）
+│   ├── conversation.py     /conversation：题目下发 + 首轮/接续对话 + 产物生成/修订（SSE；**generate-* 已弃用**）
+│   ├── jobs.py             /api/jobs：创建任务 + 查快照 + 订阅进度（SSE，**已实现**）
 │   ├── config.py           运行配置接口（占位，501）
-│   └── deps.py             依赖注入（Settings / ConversationService / DocumentService）
+│   └── deps.py             依赖注入（Settings / Conversation / Document / Session / Job）
 ├── core/                   配置与静态资源
 │   ├── config.py           环境变量唯一入口（pydantic-settings）
 │   ├── logging.py          日志配置
@@ -48,14 +51,23 @@ backend/
 │   ├── state.py            会话状态的**内部**契约（枚举）
 │   ├── conversation_service.py  澄清阶段对话编排（`astream` 流式；**缺口见模块 docstring**）
 │   ├── document_service.py      三份产物的**生成 / 优化**（已实现）+ 审核/质检（占位）
-│   └── document_plan.py         **分片计划**：从提示词文件解析章节/文件清单并分批（不调模型）
+│   ├── document_plan.py         **分片计划**：从提示词文件解析章节/文件清单并分批（不调模型）
+│   ├── stitch.py                分片拼接（任务与 split_check 共用一份实现）
+│   ├── plan_models.py / plan_repository.py / plan_service.py   方案表（plans）与快照存储
+│   ├── session_models.py / session_service.py                  会话层：降级规则 + 任务同步
+│   ├── job_models.py            Generation Job 的枚举 / 映射 / payload 白名单
+│   ├── job_repository.py        generation_jobs 表的 SQL
+│   ├── job_service.py           任务 CRUD + 同产物唯一 / payload 过滤 / 草稿节流
+│   ├── job_bus.py               同进程订阅广播（**退订不影响任务**）
+│   └── job_runner.py            后台 runner：复用生成器，写库 + 发事件 + 同步会话
 ├── scripts/
 │   ├── smoke_check.py      离线自检：配置 / 提示词 / 模型构造 / 路由 / 分片计划
 │   ├── http_check.py       对着运行中的服务打真实 HTTP
 │   ├── gen_form_schema.py  从 questions_config.json 生成 form_submission.schema.json
 │   ├── validate_prompts.py 真实 LLM 验证提示词（会花钱；`--recheck` 免费）
 │   ├── e2e_flow.py         全流程端到端验收（真实浏览器 + 真实模型；`all` 一次跑完）
-│   └── split_check.py      分片生成验收（真实模型 6 次调用；证明不再被截断）
+│   ├── split_check.py      分片生成验收（真实模型 6 次调用；证明不再被截断）
+│   └── job_check.py        Generation Job 验收（默认离线假模型；`--live` 真模型三种产物）
 ├── validation_out/         验证留档（17 个文件：11 份分片留档 + 3 份端到端 + 2 份分片结果 + README）
 └── validation_out_deepseek-flash/  换模型实验证据（7 份，见 HANDOFF §4 坑 #14）
 ```
@@ -185,10 +197,14 @@ $env:PYTHONIOENCODING = 'utf-8'
 | GET | `/api/v1/conversation/document-plan` | **已实现** — **分片计划**（`?kind=prd\|api\|prompts`）。**不调模型**，解析提示词文件得出；前端据此逐片生成再拼接。整份接口文档必被输出上限截断，所以这份计划是产物完整性的前提（HANDOFF §4 坑 #20） |
 | POST | `/api/v1/conversation/start-stream` | **已实现** — 首轮流式对话（SSE） |
 | POST | `/api/v1/conversation/continue-stream` | **已实现** — 接续流式对话（SSE） |
-| POST | `/api/v1/conversation/generate-prd-stream` | **已实现** — 生成 PRD（SSE，`scope` 可选；PRD 整份装得下） |
-| POST | `/api/v1/conversation/generate-api-docs-stream` | **已实现** — 从 PRD 生成接口文档（SSE，**应传 `scope` 按计划分片**） |
-| POST | `/api/v1/conversation/generate-prompts-stream` | **已实现** — 从 PRD 生成提示词套件（SSE，**应传 `scope` 按计划分片**） |
-| POST | `/api/v1/conversation/optimize-document-stream` | **已实现** — 按反馈修订文档某一节（SSE，F8.6） |
+| POST | `/api/v1/conversation/generate-prd-stream` | **已弃用** — 生成 PRD（前台流式）。正式入口改走 `/api/jobs`，见下方「Generation Job」 |
+| POST | `/api/v1/conversation/generate-prd-from-summary-stream` | **已弃用** — 从摘要生成 PRD（同上；回归脚本仍在用它的裸文本契约） |
+| POST | `/api/v1/conversation/generate-api-docs-stream` | **已弃用** — 从 PRD 生成接口文档（同上） |
+| POST | `/api/v1/conversation/generate-prompts-stream` | **已弃用** — 从 PRD 生成提示词套件（同上） |
+| POST | `/api/v1/conversation/optimize-document-stream` | **已实现** — 按反馈修订文档某一节（SSE，F8.6）；**仍是前台流式**，优化任务见后续篇 |
+| POST | `/api/jobs` | **已实现** — 创建生成任务（**立刻返回 `job_id`**，不等生成） |
+| GET | `/api/jobs/{job_id}` | **已实现** — 任务快照（刷新时先调它，页面不空白） |
+| GET | `/api/jobs/{job_id}/stream` | **已实现** — 订阅任务进度（SSE，GET 无 body；断开不影响任务） |
 | POST | `/api/v1/sessions` | **占位** — 创建会话 |
 | GET | `/api/v1/sessions` | **占位** — 会话列表（`states` / `limit` / `cursor`） |
 | GET | `/api/v1/sessions/{id}` | **占位** — 会话快照（含 `actions`） |
@@ -212,11 +228,121 @@ $env:PYTHONIOENCODING = 'utf-8'
 > （`form` / `known_info` / `prd_content`……），而设计要求「服务端 `state` 是真相」。
 > 会话层落地后这些都要改形，见 `api/conversation.py` 的模块 docstring。
 >
-> ⚠️ 其中 4 个生成接口**没有满足「生成必须是后台任务」**（`会话持久化方案` §7.1）：
-> 它们是前台流式，请求断了这一轮就没了。**只能当进度/预览通道，不能当产物的权威写入路径。**
+> ✅ **四个 `generate-*` 已被 `/api/jobs` 取代**（标了 `deprecated=True`）：它们是前台流式，
+> 请求断了这一轮就没了。**生成任务才是产物的权威写入路径**，见下一节。
 
 占位接口一律返回 **501 Not Implemented**，不返回 200 假数据——假数据会被误当成"已实现"。
 `/health` 与 `/api/v1/health` 复用同一个 handler，不是两份实现。
+
+### Generation Job：生成不再绑在 SSE 连接上
+
+**为什么有这层**：`docs/会话持久化方案.md` §7.1 要求「生成不绑在 HTTP 请求上」。
+前台流式那套的后果很具体：刷新页面 = 丢掉这一轮；关掉标签页 = 模型白烧；
+`/conversation/*` 的 4 个生成接口因此**只能当预览通道**，产物落库没有归宿。
+
+**现在**：`POST /api/jobs` 只登记任务并**立刻返回 `job_id`**，执行在一个后台 `asyncio.Task`
+里跑（`services/job_runner.py`），状态与草稿落 `generation_jobs` 表，
+进度通过进程内广播（`services/job_bus.py`）推给**当前订阅中**的客户端。
+
+| 文件 | 职责 |
+| --- | --- |
+| `services/job_models.py` | 枚举（artifact / status / phase）、映射表、**冲突组**、payload 白名单、`JobRecord` |
+| `services/job_repository.py` | `generation_jobs` 表的 SQL（与方案表同一个库文件，共用连接与 PRAGMA）+ **旧表迁移** |
+| `services/job_service.py` | 任务 CRUD + 三条规则（冲突组只跑一个 / payload 过滤 / 草稿节流 500ms） |
+| `services/job_bus.py` | 同进程订阅广播；**退订不碰任务** |
+| `services/job_runner.py` | 复用 `document_service` 的生成器与优化器；写库、发事件、收尾同步会话 |
+| `services/section_edit.py` | **按标题替换一节**（优化收尾把模型输出拼回整篇；TS 那份的镜像） |
+| `api/jobs.py` | 3 条路由（创建 / 快照 / 订阅 SSE） |
+
+**六种 artifact，两种动作**（`job_models.JOB_ARTIFACTS`）：
+
+| 动作 | artifact | runner 调用 | 会话 `viewState` |
+| --- | --- | --- | --- |
+| 整篇生成 | `prd` / `api-docs` / `prompts` | `generate_prd_with_review_events` / `generate_api_docs_stream` / `generate_prompts_stream` | 跑时 `generating-*`，收尾 `review-*` |
+| **按指令优化一节**（F8.6） | `optimize-prd` / `optimize-api-docs` / `optimize-prompts` | `optimize_document_stream` | **全程 `review-*`**（用户就停在审阅页） |
+
+优化任务的 payload（**五项缺一不可**）：
+
+```json
+{ "doc_type": "prd", "section": "## 2. 功能需求",
+  "current_content": "<该节的现有正文>", "document_content": "<优化前的整篇>",
+  "instruction": "把功能需求写细一点", "context": { "prd_content": "…" } }
+```
+
+⚠️ 三处与生成任务不同、且都是踩过才知道的：
+
+1. **`draft_content` 是"那一节"，不是整篇**。模型只回一节（`generate_scope` 被强制对齐到
+   `section`），拼接在收尾做（`section_edit.replace_section` → `result_json.content` = 整篇）。
+   所以 `GET /api/jobs/{id}` 与 SSE 首帧都带 `section` —— 客户端要靠它把这一节拼回整篇显示；
+   少了它，界面上只有一节片段，用户会以为整篇被替换了（实测踩到）。
+2. **失败时也不能把那一节直接写进产物的 `*Content`**：那是把整篇换成一段话（数据丢失）。
+   能拼就拼回整篇（`_optimize_partial`），拼不了就一个字都不动。
+3. **优化不写 `truncated`、不清 `prdReviewResult`**：前者说的是"整篇被截断过"，改一节不代表
+   末尾补全了；后者是审查结论，没重新审稿就不能抹掉。
+
+**冲突规则**（`job_models.ARTIFACT_CONFLICT_GROUP`）：**同一份文档**不能同时"整篇生成"与
+"按指令优化"（两者写同一个 `documents.<kind>.content`，谁后写完谁赢）→ **409**；
+**不同文档之间不冲突**（`prd` 在跑时接口文档照样能生成）。
+
+**SSE 事件**（与 `/conversation/*` 那套**不是**同一套帧名，别混）：
+
+```
+event: snapshot     data: {status, phase, artifact, draft_content, review, section?, doc_type?}   ← 订阅建立时第一条
+event: phase        data: {phase: writer_started|review_started|rewrite_started|done, round, issues}   ← 仅生成（PRD）
+event: text_delta   data: {content}                                          ← 增量文字（优化时是"那一节"的增量）
+event: review       data: {content: {passed, issues, review_model, review_skipped, round}}   ← 仅生成（PRD）
+event: run_summary  data: {…耗时 / token / 调用次数…}                          ← 与 conversation 一致：在 done 之前
+event: done         data: {artifact, content, final_prd?, review, revision_applied, truncated, finish_reason, section?}
+event: error        data: {message, request_id}
+data: [DONE]                                                                 ← 流结束
+```
+
+几条刻意的取舍：
+
+- **断开订阅不 cancel 任务**。`unsubscribe` 只摘掉那一条队列，后台 `asyncio.Task` 与这条
+  HTTP 请求没有任何关系。已实测：订阅到第 5 帧时主动断开，任务照样跑完（`job_check.py --live`）。
+- **刷新后的正确顺序**：`GET /api/session/{id}` 拿 `activeJobId` → `GET /api/jobs/{id}` 填草稿
+  → 订阅 `/stream`。所以快照接口必须在订阅**之前**就能给出全文草稿，页面才不会空白一下。
+- **有任务真在跑时，`generating-*` 不再被降级**（`session_service.downgrade_session_data` 的
+  `running_job_ids`）。降级的本意是"孤儿生成态"，而服务端有 `status=running` 的行时它是**活的** ——
+  降级会让前端不去重连，用户把半截草稿当终稿。
+- **同会话 + 同**一份文档**同时只允许一个 running 任务**（否则连点两次就是两个 runner 写同一份产物）。
+  重复创建 → **409**，且 `pending` 也算"在跑"（创建与调度之间有个极短的窗口）。
+  判重走的是**冲突组**而不是 artifact 字符串：`prd` 与 `optimize-prd` 写同一个字段，
+  只比字符串会放它们一起进来（见上面的"冲突规则"）。
+- **服务重启**：`asyncio.create_task` 活不过重启，所以启动时扫描 `pending`/`running` 一律标
+  `failed` + `error="服务重启，任务中断"`（不自动续跑，草稿留在 `draft_content` 里给用户）。
+- **表结构变更靠"检测 + 重建"**：SQLite 改不了 CHECK 约束，而 `CREATE TABLE IF NOT EXISTS`
+  对已存在的表什么也不做。加了 optimize artifact 之后，旧库上插入优化任务会抛
+  `CHECK constraint failed`（报错点离原因很远），所以 `job_repository.ensure_schema()` 会
+  检测旧 CHECK → **复制数据**重建表（不 `DROP`，库里可能正躺着用户等了几分钟的任务）。
+- **接口文档 / 提示词套件在任务里仍然分片**（`document_plan` + `services/stitch.py`）：
+  实测整份必然被输出上限截断（HANDOFF §4 坑 #18/#20）。退回单次调用等于把已修好的 bug
+  引回来，而这次是后台任务，用户拿到的是一份"看起来完整、其实缺了几章"的文档。
+- **`done` 事件是 runner 组装的**，不是生成器给的：生成器正常返回 = 成功，
+  抛异常 = 失败。生成器自己不产出"终稿"事件。
+
+**验收**：
+
+```powershell
+cd backend
+.venv\Scripts\python scripts\job_check.py             # 离线：66 项，假模型，不花钱
+.venv\Scripts\python scripts\job_check.py --live      # 在线：3 种产物各一个真任务（会花钱）
+.venv\Scripts\python scripts\job_check.py --live --only prompts   # 只重跑其中一种
+```
+
+离线段覆盖（除表结构 / 路由 / 广播外）：`section_edit.replace_section` 的五条边界
+（同级替换、标题匹配不上原样返回、低一级标题补回原标题、代码围栏里的 `#` 不算标题、
+其它章节不动）、冲突组（同文档互斥 + 跨文档放行）、优化 runner 的收尾（整篇拼接 /
+`viewState` 留 `review-*` / 不动 `truncated` / 保留 `prdReviewResult` / snapshot 带 `section`）、
+以及优化失败时"半成品那一节拼回整篇"。
+
+在线段实测（deepseek-chat，本机）：PRD 1751 字符 / 审核通过；接口文档 3 片拼成
+**27217 字符未截断**；提示词套件 3 片拼成 **19537 字符未截断**；三者都验到
+"订阅断开后任务仍 completed"与"重连重放 `run_summary + done + [DONE]`"。
+优化任务实测（同一台机器）：PRD 一节 2-4 秒、提示词一节 6 秒；刷新时后端日志能看到
+`GET /api/session/{id}` → `GET /api/jobs/{id}` → `GET /api/jobs/{id}/stream` 的重连三连，
+而任务在没有任何订阅者的情况下照常跑完。
 
 ### SSE 协议（两个 `*-stream` 端点）
 
@@ -336,12 +462,12 @@ DeepSeek 走 OpenAI 兼容协议（`langchain-openai` + `base_url`）。
 
 - 数据层（Postgres 16 / Redis 7）已由根目录 `docker-compose.yml` 提供，但**代码尚未接入**；
   `/health` 刻意不探测它们
-- 表单（前端）、对话（S0–S5 流式）、三份产物的**生成与修订**都已有 HTTP 入口
-  （`/conversation/*` 的 4 条 SSE）；
-  **会话状态机、后台生成任务、产物审核/质检（M8）仍均未实现** ——
-  所以 `/sessions/*` 那 8 条仍是 501。
-  ⚠️ 但这 4 条入口**不是**产物的权威写入路径：它们是前台流式，请求断了这一轮就没了，
-  而设计要求生成是后台任务（`会话持久化方案` §7.1）。产物落库要先有 `SessionStore`。
+- 表单（前端）、对话（S0–S5 流式）、三份产物的**生成与修订**都已有 HTTP 入口；
+  ✅ **生成已经是后台任务**（`/api/jobs/*` + `services/job_runner.py`）：
+  任务状态落库、断开 SSE 不 cancel、刷新可恢复、收尾同步会话。
+  ⚠️ 旧的 `/conversation/generate-*-stream` 是前台流式，**已标 deprecated**，不要再用
+- **仍未实现**：会话状态机 `SessionStore` / `apply_event`（`/api/v1/sessions/*` 那 8 条仍是 501）、
+  产物审核/质检（M8）、文档**优化**的后台任务（本次只做了三种产物的生成任务）。
   见 HANDOFF.md §5 的建议动手顺序
 - `scripts/validate_prompts.py` 验证的是**提示词设计假设**，不是代码正确性；
   且它只跑 S0/S1/S2/S4 四个澄清阶段，**S3、S5 从未验证过**，脚本里也没有对应分支

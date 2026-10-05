@@ -8,13 +8,20 @@
 ## 当前状态
 
 表单、对话、三份产物的生成与审核修订，整条链路都已经接进 `App.tsx`。
+**四条链路（三份产物的生成 + AI 优化）都走 Generation Job（后台任务）**，见下一节。
 
 | 文件 | 内容 |
 | --- | --- |
 | `src/types/index.ts` | 类型镜像（`QuestionConfig` / `QuestionsConfig`）、视图状态（`ViewState` / `STEPS` / `VIEW_TO_STEP`）、对话消息（`ChatMessage`，含 `content` / `display` 拆分）、产物状态（`DocStatus`，镜像 `backend/services/state.py`） |
-| `src/services/api.ts` | axios 实例、`getQuestions()`、`describeApiError()`、`readStream` 与 6 个流式函数（2 个对话 + 4 个产物）、`extractStreamingMessage()` |
+| `src/services/api.ts` | axios 实例、`getQuestions()`、`describeApiError()`、`readStream` 与 6 个流式函数（2 个对话 + 4 个产物）、`extractStreamingMessage()`。⚠️ 产物那 4 个（`generate-*-stream` / `optimize-document-stream`）**前端已不再调用**（改走 Generation Job），后端保留兼容并标了 `deprecated`，这里也留着是为了"要找旧实现时知道它在哪" |
 | `src/services/storage.ts` | localStorage 封装（按 `会话持久化方案` §4.1、§4.2、§8.2 的 key 与信封约定）与会话键 |
 | `src/services/download.ts` | `downloadFile()`、`safeFileName()`，Blob 下载与文件名清洗 |
+| `src/services/jobApi.ts` | **Generation Job 的 HTTP**：`createJob()`、`getJob()`（前缀 `/api/jobs`，**不在 `/api/v1` 下**） |
+| `src/utils/jobStream.ts` | **Job 的 SSE 读取器** `readJobStream()`：`snapshot` / `text_delta` / `phase` / `review` / `run_summary` / `done` / `error` / `[DONE]` |
+| `src/utils/jobViews.ts` | Job 的 `artifact` ↔ 产物 kind / 视图（`api-docs` ↔ `api` 的映射只有这一处） |
+| `src/utils/docMeta.ts` | `DOC_META` / `DOC_ORDER` / `DOC_RUN_TYPES`（从 `App.tsx` 搬出来的**唯一来源**，`jobViews` 也要用） |
+| `src/hooks/useGenerationJob.ts` | **四条链路的编排**：`startPrd` / `startApiDocs` / `startPrompts` / `startOptimize`、订阅、刷新重连、abort |
+| `src/types/job.ts` | Job 的前端类型（与后端 `api/jobs.py` 契约一一对应） |
 | `scripts/check-plain-text.mjs` | 离线守卫：拦住"在 JSX 文本里写 `**加粗**`" |
 | `src/components/FormStep.tsx` | 20 题表单：按 `type` 渲染四种控件、必答红星号、高级题折叠、前端校验（`validateForm` 导出给 App 复用） |
 | `src/components/StepProgress.tsx` | 顶部步骤条，5 格，由 `ViewState` 投影 |
@@ -24,7 +31,98 @@
 | `src/components/DocumentReview.tsx` | 产物审核面板：生成中只读预览、生成后可编辑、AI 优化（F8.6）、一键复制、底部自定义操作按钮 |
 | `src/App.tsx` | 视图切换、取题目、表单双向绑定、草稿、对话编排、产物编排（3 个生成 + 优化 + 通过 / 重新生成、落本地、刷新恢复） |
 
-### 产物编排
+### Generation Job（已接入）
+
+**四条链路**（PRD / 接口文档 / 提示词套件 的生成，以及**按指令优化一节**）
+**不再绑在浏览器的那条 SSE 连接上**：点生成/优化 = 创建后台任务 → 订阅它的进度。
+刷新页面、关标签页都不影响后端那趟生成。
+
+```
+点「生成」 ──> useGenerationJob.startPrd/startApiDocs/startPrompts
+                  ├─ POST /api/jobs            创建任务（立刻返回 job_id）
+                  └─ GET  /api/jobs/{id}/stream 订阅（首帧 snapshot 就是"已有全文"）
+
+点「优化这一节」──> useGenerationJob.startOptimize（artifact = optimize-*）
+                  ├─ POST /api/jobs            带上 section / current_content / document_content
+                  └─ GET  /api/jobs/{id}/stream 首帧 snapshot 给的是**那一节**的进度 + section
+
+刷新 ──> 读会话快照里的 activeJobId ──> GET /api/jobs/{id}
+            ├─ running   → 订阅（snapshot 补全文，后续增量接着打）
+            ├─ completed → 直接按 result 落地（不订阅）
+            └─ failed    → 显示错误 + 把草稿留在产物里
+```
+
+**分层**（页面里一行 Job 细节都没有）：
+
+| 层 | 管什么 |
+| --- | --- |
+| `services/jobApi.ts` | HTTP：创建任务、查快照（失败**抛异常**，与 `sessionService` 的"失败不抛"刻意相反） |
+| `utils/jobStream.ts` | 解析 GET SSE（复用 `api.ts` 的 `parseFrame`；终止信号是 `[DONE]`） |
+| `utils/jobViews.ts` | `artifact` → 产物 kind / 视图（`api-docs` ↔ `api` 是最容易写错的一处；判"是不是优化"只有 `isOptimizeArtifact` 一处） |
+| `hooks/useGenerationObservability` | 步骤条 / 计时器 / `run_summary`（**沿用**，没有第二套） |
+| `hooks/useGenerationJob.ts` | `createJob` + 订阅 + 刷新重连 + 错误收束 + `AbortController` |
+| `App.tsx` | 传会话上下文、调 `start*`、把 hook 写回的状态渲染出来 |
+
+**优化（`optimize-*`）与生成的三处差别**（都由 hook 兜住，页面不重复实现）：
+
+| | 生成 | 优化 |
+| --- | --- | --- |
+| `viewState` | 跑时切 `generating-*` | **全程 `review-*`**（用户就停在审阅页，切走会像整篇在重生成） |
+| 等待态 | Stepper（起草 / 审核 / 改写） | **无 Stepper**，只有 `beginOptimizeGeneration()` 的一行 hint |
+| `streamingContent` | 直接是增量拼起来的全文 | 增量是**那一节**，用 `replaceSection(基准整篇, section, 增量)` 拼出来显示 |
+
+⚠️ 优化的显示基准是**会话里的整篇**（`readDoc(kind)`），而且 `section` 只能从
+`snapshot.section` / `result.section` 拿 —— 这两个字段是**必须**的，缺了就只能显示一节片段。
+
+四个容易踩的点（都实测过）：
+
+1. **收到 `snapshot` 不要重播打字机**。它可能是上万字的已有草稿；正确做法是立刻整篇显示，
+   之后只把新到的 `text_delta` 追加在后面。
+2. **生成中 `DocumentReview` 只看 `streamingContent`**（`displayText = isGenerating ?
+   streamingContent : content`）。所以快照与增量都要写进 `streamingContent` ——
+   只写 `content` 的话，重连后界面是**空的**（快照那部分没人显示）。
+3. **`run_summary` 要"认领" run id**：Job 的 `run_id` 是**后端**生成的（POST /jobs 那个请求的
+   工号），而 `handleRunSummary` 会按 `run_id` 过滤 —— 不先 `obs.startRun(summary.run_id)`
+   认领，整份汇总会被自己丢掉（面板上永远没有"本次生成"的数字）。
+   优化尤其依赖这一条：它的 `run_type` 是 `optimize_document`，**不在** `DOC_RUN_TYPES` 的
+   兜底匹配表里，认领 run id 是让面板显示出来的唯一途径。
+4. **`rewrite_started` 要清空客户端累积的正文**：后端那一刻已经把草稿清零、开始写第二稿；
+   不清就会把两稿拼在一起，而拼起来的文档**看起来是完整的**（没有语法错误，只是前后矛盾）。
+   v1 并没有丢，它在后端的 `previous_draft` 里。
+
+另外两处与旧链路的差别（都是刻意的）：
+
+- **没有"第 N/M 片"进度行**：分片现在由后端在任务内部做，而 Job 的 SSE 协议不发分片级事件。
+  用户看到的是 Stepper + 「正在分片生成…可能需要一两分钟」的 hint。
+- **PRD 必须有结构化摘要**：Job 接口只吃技能包 8 字段摘要（表单版的 `generate-prd-stream`
+  没有 Job 版本）。摘要在内存或本机草稿里都没有时，界面**明确报错**，不偷偷退回没有审核的路径。
+
+验收（真浏览器 + 真模型，本机实测）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 生成 PRD，不刷新 | Stepper + 打字机 + 阶段徽标（写→审）+ 完成后落审核页、审查结论入快照 |
+| 写入阶段刷新 | 全文立刻出现（快照），后续继续出字，仍在 `generating-*` |
+| **审查阶段刷新** | 仍在生成中、Stepper 显示「机器审查」+ 审查 hint、全文在、**没有**被弹回澄清页 |
+| 接口文档 / 提示词各一次 + 刷新 | 刷新后首帧就有 5555 / 5976 字符（不是从 0 重播），并继续增长到 14900 / 21221 字符、`truncated=false` |
+| 完成后刷新 | `review-*` 静态全文，无 Stepper、无流式光标 |
+| 页面里的 Job 逻辑 | `readJobStream` 0 处、`createJob` 0 处（仅注释）、重连 effect 0 处 |
+| **AI 优化（PRD，不刷新）** | 优化中仍停在 `review-prd`（步骤条没动、没有 Stepper）、正文是**整篇**（实测 1724 字符，后面章节都在）+ 该节在长；完成后整篇 2460 字符、其它 5 章一个字没少、`prdReviewResult` 保留 |
+| **AI 优化（提示词套件，不刷新）** | 优化中显示整篇 11718 → 11943 字符（含其它 `=== FILE` 文件） |
+| **AI 优化（接口文档）** | 优化中显示整篇 11386 字符；完成后 15599 字符、`truncated` 未被改写、会话 `viewState=review-api-docs` |
+| **优化过程中刷新** | 后端日志可见重连三连：`GET /api/session/{id}` → `GET /api/jobs/{id}` → `GET /api/jobs/{id}/stream`；任务在**没有任何订阅者**的情况下照常跑完（3-6 秒） |
+| 优化完成后刷新 | `review-*` 静态全文（15599 字符）、无光标、优化入口照常可用 |
+| 生成与优化互斥 | 同一份文档在跑生成时再开优化 → 后端 **409**（`JOB_ALREADY_RUNNING` + 挡路那个 job id）；换一份文档 → 200。前端另有一道守卫：生成中不显示优化面板 |
+
+### 产物编排（本节其余部分：显示规则与历史实现）
+
+> ✅ **2026-09-30 起：三条生成链路改走 Generation Job（后台任务）；
+> 2026-10-05 起 AI 优化（F8.6）也一样。**
+> 所以本节下面提到的"前台流式"已经**全部**没有了 —— 页面里没有 `optimizeDocumentStream`、
+> 没有客户端分片循环、没有产物流的 `AbortController`（`docAbortRef` / `docPartialRef` /
+> `lastPartialWriteRef` 与 `buildSnapshot` 的 `inFlightDoc` 参数都删掉了）。
+> 新链路见上一节「Generation Job（已接入）」；本节保留下来是因为它记录了
+> 产物页为什么有"生成中只读预览 / 流式光标"这些**显示规则**（那部分没变）。
 
 `App.tsx` 里的状态是 `prdContent`、`apiDocsContent`、`promptsContent`（三份正文）、
 `isGenerating` 与 `generatingKind`（在飞的是哪一份）、`approvedDocs`、`docFailure`、`streamingDoc`。

@@ -4,7 +4,6 @@ import { AlertCircle, ArrowLeft, Download, Eraser, FileText, Loader2, RefreshCw,
 import ChatInput from './components/ChatInput'
 import DocumentReview, {
   countContentChars,
-  replaceSection,
   type DocumentAction,
   type OptimizeRequest,
 } from './components/DocumentReview'
@@ -32,28 +31,23 @@ import GenerationStepper from './components/GenerationStepper'
 import RunSummaryPanel from './components/RunSummaryPanel'
 import StreamErrorBanner from './components/StreamErrorBanner'
 import { useGenerationObservability } from './hooks/useGenerationObservability'
+// Generation Job 编排：**四条产物链路（PRD / 接口文档 / 提示词套件 的生成，以及 AI 优化）
+// 都从这里出去**。页面里不再有 createJob / SSE handler / 重连 effect / AbortController。
+import { useGenerationJob } from './hooks/useGenerationJob'
 import {
   continueConversationStream,
   describeApiError,
   extractStreamingMessage,
-  generateApiDocsStream,
-  generatePrdWithReviewStream,
-  type PrdGenerationStage,
-  generatePrdStream,
-  generatePromptsStream,
-  getDocumentPlan,
+  // ⚠️ 四个 `generate*-Stream` / `optimize-document-stream` 与 `getDocumentPlan`
+  // **都已经不在这里用了**：产物生成与 AI 优化都改走 `POST /api/jobs`（后台任务）。
+  // 那几个前台接口后端仍保留（标了 deprecated），但前端不再调用。
   getQuestions,
-  // 观测（04）：一次产物生成 = 一次 run，run id 只在编排层生成一次（样式见 `newRunId` 的说明）
-  newRunId,
-  optimizeDocumentStream,
   readDialogueStageStatus,
   startConversationStream,
   retrieveApiDocsRag,
   syncSummaryFromConversation,
+  type PrdGenerationStage,
   type RagHit,
-  type StreamChunkMeta,
-  type StreamHandlers,
-  type StreamOptions,
 } from './services/api'
 import {
   clearFormDraft,
@@ -80,6 +74,10 @@ import {
   saveSession as saveRemoteSession,
 } from './services/sessionService'
 import { buildZip, splitPromptSuite, type ZipEntry } from './services/zip'
+// 三份产物的元信息表（`DOC_META` / `DOC_ORDER` / `DOC_RUN_TYPES`）已搬到 `utils/docMeta`：
+// `utils/jobViews` 也要用它把 Job 的 artifact 映射成视图，而它 import 本文件就成环了。
+import { DOC_META, DOC_ORDER, DOC_RUN_TYPES } from './utils/docMeta'
+import type { JobReview } from './types/job'
 import {
   STEPS,
   type ChatMessage,
@@ -101,78 +99,8 @@ type LoadState =
 /** 产物类型。与后端 `services/state.py` 的 `DocKind` 一致。 */
 type DocKind = 'prd' | 'api' | 'prompts'
 
-/**
- * 三份产物的元信息。
- *
- * 把「哪种产物 ↔ 哪两个视图 ↔ 哪个标题」收在一张表里，是因为 App 里到处都要按 kind
- * 分支（生成、优化、状态推导、恢复）。散成七八处 `if (kind === 'prd')` 之后，
- * 加第四个产物就会漏掉其中一两处。
- */
-const DOC_META: Record<
-  DocKind,
-  {
-    title: string
-    /** 生成中的视图（进度条与"正在生成…"用） */
-    generating: ViewState
-    /** 产出后的审核视图 */
-    review: ViewState
-    /** 生成按钮文案 */
-    generateLabel: string
-    /** 它依赖哪些上游（用于按钮禁用提示与错误文案） */
-    requiresPrd: boolean
-    /**
-     * 下载时的文件名主干（不含扩展名）。实际文件名是 `{产品名}-{主干}.md`。
-     *
-     * 刻意**不用 `title`**：那个带全角括号与"（产品需求文档）"这种说明，拼出来是
-     * `群聊周报助手-PRD（产品需求文档）.md`，长且啰嗦。
-     */
-    fileStem: string
-  }
-> = {
-  prd: {
-    title: 'PRD（产品需求文档）',
-    generating: 'generating-prd',
-    review: 'review-prd',
-    generateLabel: '生成 PRD',
-    requiresPrd: false,
-    fileStem: 'PRD',
-  },
-  api: {
-    title: '接口文档',
-    generating: 'generating-api-docs',
-    review: 'review-api-docs',
-    generateLabel: '生成接口文档',
-    requiresPrd: true,
-    fileStem: '接口文档',
-  },
-  prompts: {
-    title: '提示词套件',
-    generating: 'generating-prompts',
-    review: 'review-prompts',
-    generateLabel: '生成提示词套件',
-    requiresPrd: true,
-    fileStem: '提示词套件',
-  },
-}
-
-/** 链条顺序：PRD 是唯一源头，接口文档从 PRD 推导，套件消费前两者（`HANDOFF.md` §1）。 */
-const DOC_ORDER: DocKind[] = ['prd', 'api', 'prompts']
-
-/**
- * `run_summary.run_type` → 它属于哪一份产物（03）。
- *
- * ⚠️ **必须有这张表。** `run_summary` 是**一份共享 state**，而澄清流与三份产物都会往里写；
- * 不按 `run_type` 过滤的话，聊完天切到 PRD 页就会看到"澄清那一轮"的统计挂在 PRD 正文下面
- * —— 数字是真的、但说的是别的事。
- *
- * 取值来自后端 `api/conversation.py` 里那 8 处 `run_type=`（PRD 有两个入口：
- * 带双智能体审核的 `generate_prd_from_summary` 与表单路径的 `generate_prd`）。
- */
-const DOC_RUN_TYPES: Record<DocKind, readonly string[]> = {
-  prd: ['generate_prd', 'generate_prd_from_summary'],
-  api: ['generate_api_docs'],
-  prompts: ['generate_prompts'],
-}
+// `DOC_META` / `DOC_ORDER` / `DOC_RUN_TYPES` 见 `utils/docMeta.ts`（唯一来源，
+// 接入 Generation Job 之后 `utils/jobViews` 与 `hooks/useGenerationJob` 也要用它们）。
 
 /**
  * **每个审核阶段的操作配置。**
@@ -271,6 +199,24 @@ export interface SessionData {
    * 由 `pagehide` 写入、恢复时读取，之后的保存不再带它（自然消失）。
    */
   interruptedKind?: DocKind
+  /**
+   * **正在进行的生成任务 id**（Generation Job）。
+   *
+   * 它的唯一用途是**刷新后自动重连**：`loadSession` 读到它 → `GET /api/jobs/{id}`
+   * → 还在跑就订阅进度、已收尾就按结论落地（见 `hooks/useGenerationJob` 的重连 effect）。
+   *
+   * ⚠️ **必须由前端写进快照**（`buildSnapshot`）。后端在任务开始时也会往同一个键写
+   * （`session_service.sync_job_started`），但前端每次自动保存都是**整份覆盖** ——
+   * 快照里不带它，下一次自动保存就会把后端写的那份抹掉，刷新后便无从重连。
+   */
+  activeJobId?: string | null
+  /**
+   * PRD 的**审查结论**（双智能体的 Reviewer 给的）。
+   *
+   * 同样要由前端写进快照：刷新之后 `prdStage`（内存态）没了，而顶部那排徽标
+   * （"审核通过" / "还有 N 条意见没改完" / "这次没审核"）正是从这里复原的。
+   */
+  prdReviewResult?: JobReview | null
   updatedAt: string
 }
 
@@ -512,9 +458,9 @@ const MAX_ROUNDS = 4
 const CHAT_TRUNCATED_NOTICE =
   '模型这一轮的回复撞上了单次输出上限，内容是断的（解析不出下一轮要问什么）。可以直接重试；若反复出现，把表单里最长的两项写短一些。'
 
-// `stitchParts` 已挪到 `services/stitch.ts`：AppV2 的分步流程也要用它，
-// 而让 V2 反向 import 本文件会把整个旧界面拖进打包结果。
-import { stitchParts } from './services/stitch'
+// 生成任务化（05）之后这里**不再拼接分片**：分片由后端在任务内部做
+// （`services/job_runner._consume_sharded`），拼接走 `services/stitch.py`。
+// 前端这一层只收 `text_delta` 与终稿，不再自己循环、自己 stitch。
 
 /** 本地会话 id。服务端 `/sessions` 还是 501，所以先自己生成 —— 它同时是本地存储的分片键。 */
 function newConversationId(): string {
@@ -687,8 +633,6 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
   /** 首次保存进行中：相关按钮禁用，避免连点创建出两条方案（需求测试 8）。 */
   const [saveBusy, setSaveBusy] = useState(false)
   const saveBusyRef = useRef(false)
-  /** 上一次把「已收到的部分正文」写进产物的时间（节流用，见 `onChunk`）。 */
-  const lastPartialWriteRef = useRef(0)
   /** 这份 PRD 是否已作为基准被接受 —— 只影响面板的显示与按钮态，不参与生成逻辑。 */
   const [baselineAccepted, setBaselineAccepted] = useState(false)
   /**
@@ -789,27 +733,44 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
   /** 正在流式接收的产物正文（与 `content` 分开，理由同对话侧的 `streamingContent`）。 */
   const [streamingDoc, setStreamingDoc] = useState('')
   /**
-   * 分片生成的进度（`null` = 没在分片生成）。
+   * 当前正在跑的**生成任务 id**（Generation Job）。
    *
-   * 整份接口文档要分 3 片、每片几十秒 —— 不显示"第 2/3 片"的话，
-   * 用户看到的就是一个长时间不动的"生成中"，会以为卡死了。
+   * - 开始生成时由 hook 写入（`onActiveJobIdChange`）；
+   * - 收到 `done` / `error`、或重连时发现任务已收尾 → 清回 `null`；
+   * - 它会被写进会话快照（见 `buildSnapshot`），刷新后据此重连。
+   *
+   * ⚠️ 与 `isGenerating` **不是一回事**：`isGenerating` 还包含「AI 优化」那条前台流式
+   * （它没有任务、也就没有 job id）。判断"能不能再开一个任务"用 `isGenerating`，
+   * 判断"要不要重连"用 `activeJobId`。
    */
-  const [docProgress, setDocProgress] = useState<{
-    kind: DocKind
-    part: number
-    total: number
-    label: string
-  } | null>(null)
-  /** 单独一个取消句柄：产物流与对话流互不干扰（清空时要两个都 abort）。 */
-  const docAbortRef = useRef<AbortController | null>(null)
+  const [activeJobId, setActiveJobId] = useState<string | null>(null)
+  /**
+   * `activeJobId` 的 **ref 镜像**（与 `savedIdRef` 同一个理由）。
+   *
+   * 为什么必须有：会话快照是**整份覆盖**写入的，而 `buildSnapshot` 被几个防抖 effect 调用。
+   * 只用 state 的话有一条真实的窗口 —— 点「生成」之后、`setActiveJobId` 生效之前，
+   * 那些 effect 会用一份**没有 job id** 的快照把后端刚写进去的 `activeJobId` 抹掉
+   * （实测在日志里抓到过 `保存会话时把 generating-prd 降级后再写入`），
+   * 于是那次刷新就接不上任务了。ref 在创建任务那一刻就写好，与渲染时机无关。
+   */
+  const activeJobIdRef = useRef<string | null>(null)
+  /** 同时写 ref 与 state —— 清空（`handleRestart`）、恢复（读快照）、开始任务都走它。 */
+  const applyActiveJobId = useCallback((jobId: string | null) => {
+    activeJobIdRef.current = jobId
+    setActiveJobId(jobId)
+  }, [])
+  /** PRD 的审查结论（落快照，刷新后仍能显示审核徽标）。 */
+  const [prdReviewResult, setPrdReviewResult] = useState<JobReview | null>(null)
   /**
    * 会话"第一次待写"的时刻（`null` = 当前没有待写）。
    *
    * 配合 `SESSION_MAX_WAIT_MS` 防止防抖被连续变化饿死；落盘后重置为 `null`。
    */
   const sessionPendingSince = useRef<number | null>(null)
-  /** 同上：产物流失败时也要能拿到已收到的部分。 */
-  const docPartialRef = useRef('')
+  // ⚠️ 这里原本还有 `docAbortRef` / `docPartialRef` / `lastPartialWriteRef` 三个 ref，
+  // 服务于"前台流式的产物生成 / 优化"。四条链路都任务化之后它们没有任何写入者了，
+  // 于是成对删掉：产物流的取消与部分正文落盘现在都在 `useGenerationJob` 里
+  // （它有自己的 AbortController 与 1.5 秒节流写库）。
 
   /**
    * 观测（03）：步骤条 / 秒表 / `run_summary` / 上下文占用 / 失败的请求 ID。
@@ -821,6 +782,11 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
    * `generationElapsed`），所以它们**不能**出现在任何 effect 的依赖里 —— 现在没有，
    * 加 effect 时要留意。
    */
+  /**
+   * 整份观测对象也要留一个引用：`useGenerationJob` 需要它（步骤条 / 秒表 / 汇总
+   * 都由那一层驱动），下面的解构只是页面自己要用到的那些。
+   */
+  const obs = useGenerationObservability()
   const {
     runSummary,
     contextUsage,
@@ -834,21 +800,14 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     resetGeneration,
     resetErrorMeta,
     resetClarification,
-    startRun,
-    startTimer,
     stopTimer,
-    beginPrdGeneration,
-    beginApiDocsGeneration,
-    beginPromptsGeneration,
-    beginOptimizeGeneration,
-    captureStreamError,
     copyErrorRequestId,
-    createPrdHandlers,
-    createApiDocsHandlers,
-    createPromptsHandlers,
-    createOptimizeHandlers,
     createClarificationHandlers,
-  } = useGenerationObservability()
+  } = obs
+  // ⚠️ `startRun` / `startTimer` / `beginOptimizeGeneration` / `captureStreamError` /
+  // `createOptimizeHandlers` 这几个页面自己的代码**已经不用了**（也没有解构出来）：
+  // 它们现在由 `useGenerationJob` 通过 `obs` 直接在内部调用 ——
+  // run id 由后端给、优化用 `beginOptimizeGeneration`、错误走 `captureStreamError`。
 
   const readDoc = useCallback(
     (kind: DocKind): string =>
@@ -880,6 +839,77 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     },
     [isGenerating, generatingKind, docFailure, approvedDocs, readDoc],
   )
+
+  /**
+   * **Generation Job 的编排**（三条生成链路都从这里出去）。
+   *
+   * 页面这一层只做三件事：传会话上下文、把 hook 返回的 `start*` 接到按钮上、
+   * 把 hook 写回的状态渲染出来。`createJob` / SSE handler / 重连 effect /
+   * AbortController **一行都不在页面里**（见 `hooks/useGenerationJob.ts`）。
+   *
+   * 下面三个 `useCallback` 适配器是**有意的**：hook 需要的是
+   * `(kind, x) => void` 这样的写入器，而页面持有的是 `setState` 的 updater 形式。
+   * 写成内联箭头函数会让它们每次渲染都换身份，进而让 hook 里的 `useCallback`
+   * 与重连 effect 反复重建 —— 那类问题只在刷新时才暴露，很难查。
+   */
+  const setTruncatedFor = useCallback((kind: DocKind, truncated: boolean) => {
+    setTruncatedDocs((prev) => ({ ...prev, [kind]: truncated }))
+  }, [])
+  const clearApprovedFor = useCallback((kind: DocKind) => {
+    setApprovedDocs((prev) => ({ ...prev, [kind]: false }))
+  }, [])
+
+  /**
+   * 从快照恢复 PRD 的审查结论。
+   *
+   * 为什么要单独一个函数：`prdStage`（驱动顶部徽标）是**内存态**，刷新就没了；
+   * 而 `prdReviewResult` 是**落快照**的那份事实。恢复时必须**两处一起写** ——
+   * 只写后者的话，刷新后徽标不见了（而用户刚看到过"审核通过"），
+   * 这种"东西悄悄消失"的表现比一开始就没有更让人怀疑。
+   */
+  const restorePrdReview = useCallback((review: JobReview | null | undefined) => {
+    setPrdReviewResult(review ?? null)
+    setPrdStage(
+      review
+        ? {
+            stage: 'done',
+            round: review.round ?? undefined,
+            issues: review.issues,
+            review_model: review.review_model ?? undefined,
+            review_skipped: review.review_skipped ?? false,
+          }
+        : null,
+    )
+  }, [])
+
+  const jobGen = useGenerationJob({
+    // 任务的 `session_id` 必须是**服务端已存在**的那条（后端会 404）：
+    // `savedId` 在首次保存成功之前是 `null`，那时 hook 会给出明确的失败提示。
+    sessionId: savedId,
+    activeJobId,
+    // ⚠️ 传的是 **ref + state 一起写**的那个 setter（见 `applyActiveJobId` 的说明）：
+    // 只写 state 时，"任务已创建"到"下一次保存"之间有一份不带 job id 的快照，
+    // 整份覆盖会把后端的 `activeJobId` 抹掉。
+    onActiveJobIdChange: applyActiveJobId,
+    conversationMessages: messages.map((message) => ({
+      role: message.role,
+      content: message.content,
+    })),
+    obs,
+    writeDoc,
+    // ⚠️ 优化要**读**：优化流的正文是"那一节"，需要拿会话里的**整篇**当基准才能拼回显示
+    // （见 `hooks/useGenerationJob` 的 optimize 分支）。
+    readDoc,
+    setStreamingDoc,
+    setViewState,
+    setPrdStage,
+    setPrdReviewResult,
+    setDocFailure,
+    setTruncated: setTruncatedFor,
+    clearApproved: clearApprovedFor,
+    setIsGenerating,
+    setGeneratingKind,
+  })
 
   const loadQuestions = useCallback(async () => {
     setLoad({ status: 'loading' })
@@ -932,15 +962,23 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       // 恢复哪一屏直接用它存下来的值 —— 比"按内容猜"准，且 `done` / `chatting` 也能还原。
       setViewState(data.viewState)
 
+      // 生成任务化（05）：**本地快照里也可能有未收尾的任务**（关标签页/刷新时正在生成）。
+      // 把它恢复出来，`useGenerationJob` 的重连 effect 会据此接上后端那条还在跑的流 ——
+      // 这正是"刷新即重连"的入口（本机自用那条路；V2 编辑态走下面那个远程加载 effect）。
+      applyActiveJobId(data.activeJobId ?? null)
+      restorePrdReview(data.prdReviewResult)
+
       // 被刷新/关页面打断的生成必须**说出来**：只降级不提示的话，
       // 用户会把上一版内容当成刚刚生成出来的（§7.4 那条孤儿生成态的本意就在此）。
       setNotice(
-        interrupted
-          ? {
-              text: `上次生成${DOC_META[interrupted].title}时被刷新打断了，当前显示的是上一次的版本 —— 重试请用底部操作按钮。`,
-              warn: true,
-            }
-          : { text: '已恢复上次的会话（本地记录，服务端还没有会话接口）', warn: false },
+        data.activeJobId
+          ? { text: '检测到上次有一条生成任务还没结束，正在重新接上它的进度…', warn: false }
+          : interrupted
+            ? {
+                text: `上次生成${DOC_META[interrupted].title}时被刷新打断了，当前显示的是上一次的版本 —— 重试请用底部操作按钮。`,
+                warn: true,
+              }
+            : { text: '已恢复上次的会话（本地记录，服务端还没有会话接口）', warn: false },
       )
     }
 
@@ -963,7 +1001,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
 
     setHydrated(true)
     setChatHydrated(true)
-  }, [load.status])
+  }, [load.status, applyActiveJobId, restorePrdReview])
 
   /**
    * V2 编辑态：把服务端那条方案取回来灌进工作台。
@@ -1033,29 +1071,48 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
           (DOC_META[kind].review === targetView || DOC_META[kind].generating === targetView) &&
           !(data.documents?.[kind]?.content ?? '').trim(),
       )
+      // 生成任务化（05）：**刷新重连的入口就在这两行**。
+      //
+      // 服务端把任务 id 写在快照的 `activeJobId` 上（`session_service.sync_job_started`），
+      // 而读取时**有任务在跑就不降级** `generating-*` —— 所以这里能同时拿到
+      // "停在哪一屏（生成中）"与"接哪个任务"。恢复出 id 之后，
+      // `useGenerationJob` 的重连 effect 会 `GET /api/jobs/{id}`：
+      // 还在跑就订阅（首帧 `snapshot` 把已有全文交出来）、已收尾就按结论落地。
+      //
+      // ⚠️ 顺序无所谓（effect 只看 `activeJobId` 有没有值），但**不能漏**：
+      // 漏了它，刷新后会停在一个永远不动的"生成中"。
+      applyActiveJobId(data.activeJobId ?? null)
+      restorePrdReview(data.prdReviewResult)
       // 落地哪一屏：**留在快照记录的那一步**。
       //
       // 刻意**不**因为「那份产物是空的」就退回对话页：用户上一秒在 PRD 步，把她踢回澄清页
       // 会让人以为流程被重置了（实测反馈：「直接退回到了 AI 澄清页面」）。留在原步 + 说清
       // 「上次被打断、这是部分内容」，用户点一下「生成」就能接着做。
       setViewState(targetView)
-      setNotice({
-        text: emptyTarget
-          ? `已加载方案「${loaded.title}」，但${DOC_META[emptyTarget].title}还没生成完 —— 上次生成被打断了，` +
-            `下面是当时已经收到的部分内容，点「生成」可以重新来一遍。`
-          : interruptedKind
-            ? `已加载方案「${loaded.title}」；上次生成${DOC_META[interruptedKind].title}时被打断，` +
-              `下面是当时已经收到的部分内容，点「生成」可以重新来一遍。`
-            : `已加载方案「${loaded.title}」。`,
-        warn: Boolean(emptyTarget) || interruptedKind !== null,
-      })
+      setNotice(
+        data.activeJobId
+          ? { text: '检测到这条方案还有一个生成任务没结束，正在重新接上它的进度…', warn: false }
+          : emptyTarget
+            ? {
+                text: `已加载方案「${loaded.title}」，但${DOC_META[emptyTarget].title}还没生成完 —— 上次生成被打断了，` +
+                  `下面是当时已经收到的部分内容，点「生成」可以重新来一遍。`,
+                warn: true,
+              }
+            : interruptedKind
+              ? {
+                  text: `已加载方案「${loaded.title}」；上次生成${DOC_META[interruptedKind].title}时被打断，` +
+                    `下面是当时已经收到的部分内容，点「生成」可以重新来一遍。`,
+                  warn: true,
+                }
+              : { text: `已加载方案「${loaded.title}」。`, warn: false },
+      )
       setHydrated(true)
       setChatHydrated(true)
     })()
     return () => {
       cancelled = true
     }
-  }, [load.status, sessionId, writeDoc])
+  }, [load.status, sessionId, writeDoc, applyActiveJobId, restorePrdReview])
 
   // 防抖写回本地草稿。**不做逐键写入** —— 文档 §2 说 localStorage 是同步 API、
   // 会阻塞主线程，只该在关键节点读写。
@@ -1086,10 +1143,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
    * 不传就用 `submitted`。不这么做的话首次保存存下的是空表单，标题会退成记录 id。
    */
   const buildSnapshot = useCallback(
-    (
-      formOverride?: Record<string, string>,
-      inFlightDoc?: { kind: DocKind; content: string },
-    ): SessionData => {
+    (formOverride?: Record<string, string>): SessionData => {
       // 只存**完整的一轮**（user + 一条成功的 ai）。
       //
       // ⚠️ 光按 `!error` 过滤是不够的：失败那一轮里**用户消息身上没有 error 标记**
@@ -1109,9 +1163,9 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       const stamped = new Date().toISOString()
       const documents: SessionData['documents'] = {}
       for (const kind of DOC_ORDER) {
-        // 正在生成的那一份，用**内存里最新的**流式正文（`docPartialRef`）覆盖产物存储 ——
-        // 否则会丢"最后一个 1.5 秒节流窗口"里收到的内容（`onChunk` 每 1.5 秒才写一次产物）。
-        const content = inFlightDoc?.kind === kind ? inFlightDoc.content : readDoc(kind)
+        // ⚠️ 任务的"部分正文"由 `useGenerationJob` 自己按 1.5 秒节流写进产物，
+        // 所以这里直接读产物就是最新的（早先那个 `inFlightDoc` 覆盖参数已经不需要了）。
+        const content = readDoc(kind)
         // `trim()` 而不是直接判空：**只有空白**的产物与没有产物是一回事。
         if (!content.trim()) continue
         documents[kind] = {
@@ -1134,7 +1188,19 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         documents,
         // ⚠️ `generating-*` 存进去是**允许**的：服务端在写入前会把它降级成 `review-*`
         // （需求测试 6 盯的就是这条：生成途中刷新不许卡在 generating）。
+        // **但有一个例外**：`activeJobId` 指向的任务真的在跑时，服务端**不降级** ——
+        // 那时 `generating-*` 是"活的生成中"，降级会让前端不去重连（后端
+        // `session_service.downgrade_session_data` 的 `running_job_ids`）。
         viewState,
+        // 生成任务化（05）：这两个字段**必须由前端写进快照**。后端在任务开始/完成时
+        // 也会往同一个键写，但前端每次自动保存是**整份覆盖** —— 不带它们就等于
+        // 把后端写的那份抹掉，刷新后既接不上任务、也看不到审核结论。
+        //
+        // ⚠️ `activeJobId` 读的是 **ref 而不是 state**：本函数被几个防抖 effect 调用，
+        // 而 state 要等下一次渲染才可见 —— 那个窗口里保存出来的快照会把 job id 写丢
+        // （见 `activeJobIdRef` 的说明）。
+        activeJobId: activeJobIdRef.current,
+        prdReviewResult,
         updatedAt: stamped,
       }
     },
@@ -1148,6 +1214,9 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       viewState,
       approvedDocs,
       truncatedDocs,
+      // ⚠️ **不放 `activeJobId`**：它从 ref 读，所以这个回调不必因为它换身份
+      // （依赖数组里的 state 只用于"确认快照形状要带这个字段"这件事本身）。
+      prdReviewResult,
       readDoc,
     ],
   )
@@ -1237,9 +1306,13 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
    *
    * 为什么必须做：刷新、关标签页、跳到别的站点时，浏览器**不会等你**那 1 秒防抖。
    * 这里做两件事：
-   * ① 用**此刻的状态**覆盖防抖队列里那份旧快照 —— 特别是生成途中「已经收到但还没到
-   *    1.5 秒节流点」的部分正文（通过 `inFlightDoc` 传进去，而不是等 `writeDoc` 生效）；
+   * ① 用**此刻的状态**覆盖防抖队列里那份旧快照；
    * ② 马上 flush，请求带 `keepalive`，页面卸载后仍能发完。
+   *
+   * ⚠️ 快照里那份"生成中的部分正文"**不需要在这里特殊处理**了：任务化之后
+   * `useGenerationJob` 自己每 1.5 秒把已收到的正文写进产物（`writeDoc`），
+   * 所以 `readDoc(kind)` 拿到的就是最新的 —— 早先那个 `inFlightDoc` 参数
+   * 是给"前台流式只在结束时落盘"补的，现在没有可补的窗口了。
    *
    * 只做在有 id 之后：`/v2` 新建、还没 id 时**不创建方案**（与需求测试 1 一致）。
    */
@@ -1247,12 +1320,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     const leave = () => {
       const id = savedIdRef.current
       if (!id) return
-      const partial = docPartialRef.current
-      const inFlightDoc =
-        isGenerating && generatingKind && partial
-          ? { kind: generatingKind, content: partial }
-          : undefined
-      const snapshot = buildSnapshot(undefined, inFlightDoc)
+      const snapshot = buildSnapshot()
       // 记下「此刻正在生成哪一份」：下一屏要据此提示用户
       // （服务端会把 generating-* 降级，库里留不下这个信息）
       if (isGenerating && generatingKind) snapshot.interruptedKind = generatingKind
@@ -1322,11 +1390,12 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     readDoc,
   ])
 
-  // 卸载时把两条流都掐掉，别留下悬挂连接
+  // 卸载时把对话流掐掉，别留下悬挂连接。
+  // ⚠️ 产物流（生成 / 优化）**不在这里**：它们由 `useGenerationJob` 管理，
+  // 那个 hook 有自己的卸载清理（同样的理由：不掐会留下悬挂连接）。
   useEffect(
     () => () => {
       abortRef.current?.abort()
-      docAbortRef.current?.abort()
     },
     [],
   )
@@ -1744,21 +1813,20 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
   ) : null
 
   /**
-   * 生成一份产物。
+   * 生成一份产物 —— **只做"生成之前"的事，然后交给 `useGenerationJob`**。
    *
-   * 三份走同一条路径，只有"调哪个函数、带哪些上游"不同 —— 所以用 `kind` 分支一次，
-   * 而不是写三个几乎一样的函数（那样改错误处理要改三处）。
+   * 职责边界（这是本次改造的核心）：
    *
-   * ⚠️ **每个产物一次调用只产出一个分片，且这里是整份生成**（不传 `scope`，
-   * 由后端按 `DocumentScope.whole_document()` 处理）。
+   * | 归这里 | 归 hook |
+   * | --- | --- |
+   * | 接口文档的 RAG 检索与用户确认 | `createJob` + 订阅 SSE |
+   * | 链条约束（缺 PRD 不许生成下游） | 正文累积、写库、截断标记 |
+   * | 首次落库（任务必须挂在一条已存在的会话上） | 切 `generating-*` / `review-*` |
+   * | 结构化摘要缺失时的明确提示 | 步骤条/秒表/汇总、失败收束、刷新重连 |
    *
-   * 关于"整份会不会太长"：**真机实测过，不会**。整份 PRD（技能包 6 章结构，含第 2 章的
-   * FR-xx / AC-xx 编号）实测远低于输出上限、**没有截断**
-   * （`backend/validation_out/prd_skill.txt`）。所以这里的真实代价是
-   * **耗时长、失败要整份重来**，不是长度。
-   *
-   * 仍然**不在这里编一套分片计划** —— 章节清单已经内嵌在提示词里，
-   * 前端再抄一份必然漂移（`HANDOFF.md` §4 坑 #10）。
+   * ⚠️ **这里已经不生成任何东西了**：没有分片循环、没有 SSE handler、没有
+   * `AbortController`。产物由**后台任务**生成，页面断开也不影响它
+   * （这就是把生成任务化的全部意义）。
    */
   const handleGenerateDocument = useCallback(
     async (kind: DocKind) => {
@@ -1799,282 +1867,55 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         return
       }
 
-      docAbortRef.current?.abort()
-      const controller = new AbortController()
-      docAbortRef.current = controller
-      docPartialRef.current = ''
-
-      setIsGenerating(true)
-      setGeneratingKind(kind)
-      setDocFailure(null)
-      setStreamingDoc('')
-      setViewState(DOC_META[kind].generating)
-
-      // 观测（03）：新的一趟开始 —— 清掉上一趟的汇总/步骤/请求 ID，并把秒表归零。
-      // ⚠️ 顺序不能反：`resetGeneration` 会清空步骤条，先 `begin*` 就白设了。
-      // 清 `errorRequestId` 是必须的：否则上一次失败的请求 ID 会挂在新一趟的失败横幅旁边。
-      resetGeneration()
-      resetErrorMeta()
-      // 观测（04，一次产物 = 一次 run）：**这一趟的 run id 只在这里生成一次**，
-      // 下面每一片请求都带同一个（`X-Run-ID`），后端据此把各片并成整份合计。
-      // ⚠️ 顺序：必须在 `resetGeneration` 之后（它清汇总）、在第一个请求之前（后端的账按它分组）。
-      // 也在 `begin*` 之前 —— 步骤条与汇总都属于这一趟，一起就位。
-      const runId = newRunId()
-      startRun(runId)
-      if (kind === 'prd') beginPrdGeneration()
-      else if (kind === 'api') beginApiDocsGeneration()
-      else beginPromptsGeneration()
-      startTimer()
-
-      // 结构化表单里"20 题装不下"的那部分（页面结构、关键交互、范围、LLM 说明、可用性）
-      // 排在最前面：它是用户**明确填过**的内容，比从对话里抠出来的更硬。
-      const knownInfo = [structuredExtras, summaryExtras, ragExtras, buildKnownInfo(messages)]
-        .filter(Boolean)
-        .join('\n\n')
-      const context = {
-        form: submitted ?? {},
-        // ⚠️ 空串**不要传**：后端对"不传"填「（尚无）」，传空串则会把提示词里那一格
-        // 变成空 —— 而留空等于告诉模型"这个维度没输入"，它就会拿邻近内容顶替（坑 #3）。
-        ...(knownInfo ? { known_info: knownInfo } : {}),
-      }
-      /**
-       * 观测（03）：三份产物的 handler 集合**不一样** —— PRD 有双智能体的阶段事件
-       * （`onStage`），接口文档与提示词套件没有机器审查那一步，只有 `done`。
-       * 用 `Pick<StreamHandlers, …>` 挑出来的那份，缺的字段就是 `undefined`，
-       * 所以下面一律用 `?.` 调。
-       *
-       * ⚠️ 类型必须标成 `StreamHandlers`：三个 `Pick<…>` 的**联合类型**只允许访问
-       * 它们共有的字段（`onRunSummary`），`obsHandlers.onDone` 会直接报
-       * 「Property 'onDone' does not exist on type」—— 实测踩到过。
-       */
-      const obsHandlers: StreamHandlers =
-        kind === 'prd'
-          ? createPrdHandlers()
-          : kind === 'api'
-            ? createApiDocsHandlers()
-            : createPromptsHandlers()
-
-      // 跨片累加的格位：`onDone` 里写、循环里读。
-      // **必须是局部变量**：state 在同一个 tick 里读不到刚写的值。
-      let truncatedAnyPart = false
-      /**
-       * 循环里当前/断在第几片（1 基，只在分片生成时有意义）。
-       *
-       * ⚠️ 它有两个用途：失败时报告"断在第几片"，以及让 `onDone` 判断"这是不是最后一片"。
-       * 后者不能靠闭包里的 `offset` —— `baseOptions` 是在循环**之外**建好的，看不到循环变量。
-       */
-      let failedPart: number | null = null
-      /** 这次要生成几片。`onDone` 靠它判断"这是不是最后一片"（分片计划到手后才填）。 */
-      let planTotal = 0
-
-      /**
-       * 循环**之外**就建好的公共选项（正文回调、截断标记、阶段、汇总）。
-       *
-       * ⚠️ 它**不含** run 头：片序号是循环变量，只能在循环里拼 —— 见 `withPart`。
-       */
-      const baseOptions = {
-        signal: controller.signal,
-        onChunk: (_piece: string, fullText: string) => {
-          docPartialRef.current = fullText
-          setStreamingDoc(fullText)
-          // 每 ~1.5 秒把**已经收到的部分正文**写进产物。
-          //
-          // 为什么需要：流式正文原先只在生成**结束时**才落盘，刷新/断电时一个字都不剩 ——
-          // 界面表现就是「PRD 页空的、内容全没了」（实测反馈）。
-          // ⚠️ 只落「已收到的内容」，**不动生成逻辑**：请求、分片、提示词、审核一律没变。
-          const stamp = Date.now()
-          if (stamp - lastPartialWriteRef.current > 1500) {
-            lastPartialWriteRef.current = stamp
-            writeDoc(kind, fullText)
-          }
-        },
-        /**
-         * ⚠️ **截断必须在这里收下。** 它在正文里看不出来（末尾就是半行表格），
-         * 不接这个标记的话后端辛苦算出来的结论就白丢了 —— 用户会拿一份残缺文档
-         * 当成功的结果通过审核、下载、交给下游。
-         *
-         * 分片生成时**任一片被截断，整份就算残的**，所以跨片取"或"。
-         */
-        onDone: (meta: StreamChunkMeta) => {
-          if (meta.truncated === true) truncatedAnyPart = true
-          // 观测（03）：分片生成时 `onDone` **每一片都会回调一次** —— 只有最后一片
-          // 才允许把步骤条收成"全部完成"。不判这一下的话，第 1 片回来界面上两步就都打勾了，
-          // 而后面还有两片在跑。
-          if (failedPart === planTotal) obsHandlers.onDone?.(meta, docPartialRef.current)
-        },
-        /**
-         * 双智能体的阶段事件。**重写时必须清空这一片的缓冲** —— 重写是从零重写的，
-         * 不清空就会把旧稿和新稿拼在一起。
-         */
-        onStage: (stage: PrdGenerationStage) => {
-          setPrdStage(stage)
-          if (stage.stage === 'rewriting') {
-            docPartialRef.current = ''
-            setStreamingDoc('')
-          }
-          // 观测（03）：阶段 → 步骤条（`writing/reviewing/rewriting` → 起草/审查/修订）
-          obsHandlers.onStage?.(stage)
-        },
-        /**
-         * 观测（03/04）：整趟汇总。后端在 `done` 之前发一帧 `run_summary`。
-         *
-         * 分片生成时**每一片各发一帧**：归属判定（按 `run_id`）在 hook 里，
-         * 同一 run 的**后到者覆盖前者是预期的** —— 后端把整份合计放进后到的那一帧
-         * （第 1 片的帧只算第 1 片）。前端不做相加：耗时是墙钟、且有并发。
-         */
-        onRunSummary: obsHandlers.onRunSummary,
-      }
-
-      try {
-        // ---------- 先拿分片计划 ----------
-        // **切分规则由服务端给**（它解析提示词文件得出，那是章节清单的唯一真相），
-        // 前端只负责循环与拼接。计划拿不到就是拿不到：这里**不回退成"整份生成"** ——
-        // 那会让接口文档与套件悄悄变回被截断的残文档，而界面上看不出任何区别（坑 #18）。
-        // 每次生成都从「没有阶段」起步，否则上一次的审核意见会挂在新稿上。
-        if (kind === 'prd') setPrdStage(null)
-        const plan = await getDocumentPlan(kind)
-        setDocProgress({ kind, total: plan.parts.length, part: 0, label: plan.source })
-        // 观测（03）：分片数要留给 `onDone`（它只能靠闭包里的可变格位判断"最后一片"）
-        planTotal = plan.parts.length
-
-        // ---------- 逐片生成、逐片累加 ----------
-        const pieces: string[] = []
-        for (const [offset, part] of plan.parts.entries()) {
-          failedPart = offset + 1
-          setDocProgress({ kind, total: plan.parts.length, part: offset + 1, label: part.label })
-          docPartialRef.current = ''
-          setStreamingDoc('')
-          /**
-           * 这一片的请求头（观测 04）：**同一个 `runId`、逐片递增的 `partIndex`、
-           * 固定的 `partTotal`**。后端据此把 N 次请求并成"一次产物生成"，
-           * 否则每片各记一份账，界面上「本次生成」只会显示最后一片。
-           *
-           * 每片新建对象、只多三个可选字段 —— 片序号是循环变量，
-           * 放在循环外建的话每一片都会带上同一（错误的）序号。
-           */
-          const options: StreamOptions = {
-            ...baseOptions,
-            runId,
-            partIndex: offset + 1,
-            partTotal: plan.parts.length,
-          }
-          const scope = { outline: part.outline, scope: part.scope, spec: part.spec }
-          // 摘要不在时**从表单草稿重建**：摘要是内存态，刷新就没，而它决定要不要走
-          // 双智能体审核 —— 不重建就会静默退回没有审核的表单路径（实测踩过）。
-          const prdSummary = structuredSummary ?? summaryFromStoredDraft()
-          // 三个分支各自直接调用（而不是先拼一个 request 再 as 断言）：
-          // `kind` 是判别联合的判别式，分开写才有类型收窄，也免掉三处 `as`。
-          if (kind === 'prd') {
-            // 优先走「结构化摘要 + 对话历史」这条路（A/B 实测覆盖 14/14，
-            // 优于只给摘要的 11/14、也优于表单版的 13/14）。
-            // 没有摘要时（没走结构化录入）回落到表单 + known_info 那条。
-            //
-            // 走的是**双智能体**版（Writer 写初稿 → Reviewer 审核 → 有问题自动重写，
-            // 上限 1 次）：实测审核通过 2 次调用 / 5.6 秒，触发重写 3 次调用 / 10.5 秒。
-            // 代价是慢一倍，换来的是「编造的约束」这类问题在交付前就被拦掉——
-            // 实测确实拦到过两条凭空捏造的约束。
-            pieces.push(
-              prdSummary
-                ? await generatePrdWithReviewStream(
-                    prdSummary,
-                    messages.map((message) => ({ role: message.role, content: message.content })),
-                    options,
-                  )
-                : await generatePrdStream({ ...context, scope }, options),
-            )
-          } else if (kind === 'api') {
-            pieces.push(
-              await generateApiDocsStream({ ...context, prd_content: prdContent, scope }, options),
-            )
-          } else {
-            pieces.push(
-              await generatePromptsStream(
-                {
-                  ...context,
-                  prd_content: prdContent,
-                  ...(apiDocsContent ? { api_content: apiDocsContent } : {}),
-                  scope,
-                },
-                options,
-              ),
-            )
-          }
-        }
-
-        // ---------- 拼接 ----------
-        // 后续分片理论上不该重复文档标题（计划的 `spec` 明确禁止了），但模型不一定听话；
-        // 真重复了就会在文首出现两遍标题，所以做一次**保守**清理（见 `stitchParts`）。
-        const full = stitchParts(pieces)
-        writeDoc(kind, full)
-        setDocFailure(null)
-        setTruncatedDocs((prev) => ({ ...prev, [kind]: truncatedAnyPart }))
-        // 重新生成后要把"已通过"撤掉：内容变了，旧的通过结论不再成立
-        setApprovedDocs((prev) => ({ ...prev, [kind]: false }))
-        // ⚠️ **必须把视图切回审核页。** 忘了这一句的后果很隐蔽：产物状态是**派生**的
-        // （`statusFor` 只看内容/失败/通过），所以界面上照样显示"待审核"，看不出问题；
-        // 而 `VIEW_TO_STEP` 又把 `generating-*` 与 `review-*` 映到**同一格**，步骤条也一样。
-        // 但盘上留下的是 `generating-*`，下次刷新会被降级并误报"上次生成被打断"。
-        setViewState(DOC_META[kind].review)
-      } catch (error) {
-        // 被掐掉的不算失败（清空重来 / 卸载）
-        if (controller.signal.aborted) return
-        // 观测（03）：文案改成「生成在『机器审查』阶段失败 · 已等待 27s · 原因」，
-        // 并把后端给的 `request_id` 一起收下（界面在失败横幅右侧给一个复制按钮）。
-        // `elapsedSeconds` 不传：hook 里默认就用当前秒表值。
-        const { message, requestId } = captureStreamError(error)
-        // ⚠️ **不把半截内容写进产物**：一次失败的重生成会把上一版好文档顶掉。
-        // 分片生成时这条**尤其重要** —— 前几片可能已经成功了，但拼起来的仍然是残的
-        // （缺后面几章却看着像完整文档），比"生成失败"危险得多。
-        // 界面上仍显示上一版 + 失败原因（`DocumentReview` 的 failed 分支就是这么写的）。
+      // 「生成」也是**关键动作**：任务要求会话已存在（后端对不存在的会话返 404），
+      // 所以先确保落库。按钮那一路已经调过一次 `ensureSessionSaved()`（幂等，只是 flush），
+      // 但对话步的「生成 PRD」与快捷入口的自动生成没有 —— 收在这里，两种入口都安全。
+      const sessionIdForJob = await ensureSessionSaved()
+      if (!sessionIdForJob) {
         setDocFailure({
           kind,
-          // 分片中断要说清"断在第几片"：只说"生成失败"的话，用户会以为是整份都没跑，
-          // 而实际上前面几片已经成功、只是没写进产物（宁可全丢，也不能写成残的）。
-          message:
-            failedPart !== null
-              ? `${message}（分片生成中断在第 ${failedPart} 片，未写入任何内容 —— 已生成的分片不保留，避免留下缺章的残文档）`
-              : message,
-          requestId,
+          message: '方案没能存到服务端，生成任务无法创建 —— 检查网络后重试（详见浏览器控制台）。',
         })
-        setViewState(DOC_META[kind].review)
-      } finally {
-        setDocProgress(null)
-        setStreamingDoc('')
-        // 观测（03）：秒表一定要停 —— 它是个 `setInterval`，不停会一直给组件喂 state
-        stopTimer()
-        if (docAbortRef.current === controller) {
-          setIsGenerating(false)
-          setGeneratingKind(null)
-          docAbortRef.current = null
-        }
+        return
       }
+
+      if (kind === 'prd') {
+        // ⚠️ **任务接口只吃结构化摘要**（技能包 8 字段），没有"20 题表单"那条入口。
+        // 摘要来自内存，刷新后由本机草稿重建（`summaryFromStoredDraft`）。
+        // 两个都没有时**明确报错**，而不是偷偷退回一条没有审核的路径 ——
+        // 那正是 `HANDOFF.md` §4 坑 #4 说的"缺输入就自己编"。
+        const summary = structuredSummary ?? summaryFromStoredDraft()
+        if (!summary) {
+          setDocFailure({
+            kind,
+            message:
+              '这次没有结构化摘要，无法创建 PRD 生成任务 —— 请回到第一步填一次结构化表单' +
+              '（或刷新页面让本机草稿恢复）。',
+          })
+          setViewState(DOC_META.prd.review)
+          return
+        }
+        await jobGen.startPrd(summary)
+        return
+      }
+
+      if (kind === 'api') {
+        await jobGen.startApiDocs(prdContent)
+        return
+      }
+      await jobGen.startPrompts(prdContent, apiDocsContent)
     },
     [
       isGenerating,
       prdContent,
       apiDocsContent,
       messages,
-      submitted,
       structuredSummary,
-      writeDoc,
-      // 观测（03）。⚠️ `captureStreamError` 的依赖里带着秒表，所以它**每秒换一次身份**，
-      // 这个 callback 也就跟着每秒换一次 —— 可接受：生成期间 App 本来就因为秒表在重渲染，
-      // 而这里没有被任何 effect 依赖（加 effect 时要留意这一条）。
-      resetGeneration,
-      resetErrorMeta,
-      // 观测（04）：run id 相关的两处依赖（`startRun` 与 `activeRunId` 见下面的过滤逻辑）
-      startRun,
-      startTimer,
-      stopTimer,
-      beginPrdGeneration,
-      beginApiDocsGeneration,
-      beginPromptsGeneration,
-      captureStreamError,
-      createPrdHandlers,
-      createApiDocsHandlers,
-      createPromptsHandlers,
+      ensureSessionSaved,
+      jobGen,
     ],
   )
+
 
   // ---------------------------------------------------------------- 对话 → 摘要回填
 
@@ -2169,139 +2010,57 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
   }, [handleGenerateDocument])
 
   /**
-   * AI 优化：只改一节（F8.6）。
+   * AI 优化：只改一节（F8.6）—— **现在也走 Generation Job**（与其他三条链路一致）。
    *
-   * ⚠️ **返回的是"被修订的那一节"，不是整篇** —— 所以必须用 `replaceSection` 拼回去，
-   * 否则要么整篇被一节替换掉，要么文档里出现两遍同一节。
+   * 这里只做三件事：守卫（没内容不优化）、把**整篇**一起交给 hook（后端收尾要把改过的
+   * 那一节拼回整篇）、把生成侧上下文塞进 `context`。剩下的全在
+   * `useGenerationJob.startOptimize` 里：创建任务、订阅、刷新重连、失败收束。
+   *
+   * ⚠️ 与生成链路的差别（都由 hook 负责，这里不要重复实现）：
+   * **视图不切**（用户就停在审阅页）、没有 Stepper（单段流）、正文是"那一节"，
+   * 显示时由 hook 用 `replaceSection` 拼回整篇。
    */
   const handleOptimizeDocument = useCallback(
     async (kind: DocKind, request: OptimizeRequest) => {
       if (isGenerating) return
-
-      docAbortRef.current?.abort()
-      const controller = new AbortController()
-      docAbortRef.current = controller
-      docPartialRef.current = ''
-
-      setIsGenerating(true)
-      setGeneratingKind(kind)
-      setDocFailure(null)
-      setStreamingDoc('')
-
-      // 观测（04）：AI 优化跟三份产物一样会发 `run_summary`，所以**接同一套观测**。
-      // 它是**单请求**（后端按 `1/1` 记账），但 run id 照样要生成：不生成的话
-      // `handleRunSummary` 的归属判定会把这一帧丢掉，优化完面板上什么都不显示。
-      resetGeneration()
-      resetErrorMeta()
-      const runId = newRunId()
-      startRun(runId)
-      beginOptimizeGeneration()
-      startTimer()
+      const current = readDoc(kind)
+      if (!current.trim()) {
+        setDocFailure({ kind, message: `${DOC_META[kind].title}还没有内容，没什么可优化的。` })
+        return
+      }
 
       // 结构化表单里"20 题装不下"的那部分（页面结构、关键交互、范围、LLM 说明、可用性）
       // 排在最前面：它是用户**明确填过**的内容，比从对话里抠出来的更硬。
       const knownInfo = [structuredExtras, summaryExtras, ragExtras, buildKnownInfo(messages)]
         .filter(Boolean)
         .join('\n\n')
-      const context = {
-        form: submitted ?? {},
-        ...(knownInfo ? { known_info: knownInfo } : {}),
-      }
-      /**
-       * 观测（04）：优化的观测接线。
-       *
-       * 它是**单请求**，所以 run 头固定 `1/1`（后端按一片记账）；`runId` 是这个请求
-       * 自己的那一趟 —— 面板按它归属，别把上一份产物的汇总挂到这一节上。
-       */
-      const options: StreamOptions = {
-        signal: controller.signal,
-        runId,
-        partIndex: 1,
-        partTotal: 1,
-        // 汇总（耗时 / tokens / 调用次数）与失败时的 request_id 都走 hook 那一套；
-        // 原先这条路上一个都没接，所以优化既没有统计、失败也没有可复制的 id。
-        ...createOptimizeHandlers(),
-        onChunk: (_piece: string, fullText: string) => {
-          docPartialRef.current = fullText
-          setStreamingDoc(fullText)
-          // 每 ~1.5 秒把**已经收到的部分正文**写进产物。
-          //
-          // 为什么需要：流式正文原先只在生成**结束时**才落盘，刷新/断电时一个字都不剩 ——
-          // 界面表现就是「PRD 页空的、内容全没了」（实测反馈）。
-          // ⚠️ 只落「已收到的内容」，**不动生成逻辑**：请求、分片、提示词、审核一律没变。
-          const stamp = Date.now()
-          if (stamp - lastPartialWriteRef.current > 1500) {
-            lastPartialWriteRef.current = stamp
-            writeDoc(kind, fullText)
-          }
+
+      await jobGen.startOptimize({
+        docType: kind,
+        section: request.section,
+        sectionContent: request.currentContent,
+        documentContent: current,
+        instruction: request.feedback,
+        context: {
+          form: submitted ?? {},
+          ...(knownInfo ? { known_info: knownInfo } : {}),
+          // ⚠️ 修接口文档 / 套件时要能回指 PRD（服务层对这两类**强制**要求 prd_content）。
+          // `kind === 'prd'` 时**不能传**：它没有上游，服务层的签名也不收。
+          ...(kind === 'prd' ? {} : { prd_content: prdContent }),
         },
-        // ⚠️ **优化不碰 `truncatedDocs`**（与 `handleGenerateDocument` 刻意不同）：
-        // 那个标记说的是「**整份**正文被截断过」，而优化只重写一节 ——
-        // 把标记清掉等于宣布"这份文档补全了"，而我们并不知道用户有没有补上末尾。
-        // 宁可留着一个"末尾可能是缺的"提醒，也不要谎报完整。
-      }
-
-      try {
-        // ⚠️ 三分支而不是两分支：`kind` 在这三个接口上的**上游要求不同** ——
-        // `api` / `prompts` 必须有 `prd_content`，`prd` 不能有（它没有上游）。
-        // `OptimizeDocumentRequest` 是判别联合，写成 `kind === 'api' ? A : B`
-        // 会让 `prompts` 落进 B 而缺 `prd_content`，编译期就报（已实测报到）。
-        const shared = {
-          ...context,
-          section: request.section,
-          current_content: request.currentContent,
-          feedback: request.feedback,
-        }
-        const revised =
-          kind === 'api'
-            ? await optimizeDocumentStream(
-                { ...shared, kind: 'api', prd_content: prdContent },
-                options,
-              )
-            : kind === 'prompts'
-              ? await optimizeDocumentStream(
-                  { ...shared, kind: 'prompts', prd_content: prdContent },
-                  options,
-                )
-              : await optimizeDocumentStream({ ...shared, kind: 'prd' }, options)
-
-        writeDoc(kind, replaceSection(readDoc(kind), request.section, revised))
-        setDocFailure(null)
-        // 内容变了 → 旧的"已通过"不再成立
-        setApprovedDocs((prev) => ({ ...prev, [kind]: false }))
-      } catch (error) {
-        if (controller.signal.aborted) return
-        // 观测（03/04）：失败时把后端给的 `request_id` 一起收下 —— 成功面板上有 run id，
-        // 失败横幅上也得有一串能查日志的（原先这里只留一句文案）。
-        const { message, requestId } = captureStreamError(error)
-        setDocFailure({ kind, message, requestId })
-      } finally {
-        setStreamingDoc('')
-        // 观测（03）：秒表必须停（`setInterval`，不停会一直给组件喂 state）
-        stopTimer()
-        if (docAbortRef.current === controller) {
-          setIsGenerating(false)
-          setGeneratingKind(null)
-          docAbortRef.current = null
-        }
-      }
+      })
     },
     [
       isGenerating,
       prdContent,
       messages,
       submitted,
+      structuredExtras,
+      summaryExtras,
+      ragExtras,
       readDoc,
-      writeDoc,
-      // 观测（03/04）：与 `handleGenerateDocument` 同一套依赖（理由见那边的说明）
-      resetGeneration,
-      resetErrorMeta,
-      startRun,
-      startTimer,
-      stopTimer,
-      beginOptimizeGeneration,
-      captureStreamError,
-      createOptimizeHandlers,
+      setDocFailure,
+      jobGen,
     ],
   )
 
@@ -2556,14 +2315,16 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
    * 「发 `abandon` 事件 + 清本地缓存」。
    *
    * ⚠️ 在飞的流要先掐掉：不掐的话那条流的 `catch` 会在清空之后往状态里写东西
-   * （`abortRef` / `docAbortRef` 的守卫按 `controller` 身份判断，所以写不进去，
-   * 但连接会挂着）。
+   * （守卫按 `controller` 身份判断，所以写不进去，但连接会挂着）。
+   * 对话流是 `abortRef`；**产物流（生成 / 优化）是 `jobGen.cancel()`** ——
+   * 它只中止订阅，**不取消后端那个任务**（任务照跑完并落库）。
    */
   const handleRestart = useCallback(() => {
     abortRef.current?.abort()
     abortRef.current = null
-    docAbortRef.current?.abort()
-    docAbortRef.current = null
+    jobGen.cancel()
+    applyActiveJobId(null)
+    setPrdReviewResult(null)
     setValues({})
     setSubmitted(null)
     setRestoredDraft(false)
@@ -2606,7 +2367,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     setViewState('form')
     clearFormDraft()
     clearSession()
-  }, [stopTimer, resetGeneration, resetClarification, resetErrorMeta])
+  }, [stopTimer, resetGeneration, resetClarification, resetErrorMeta, jobGen])
 
   /**
    * 真正交给列表渲染的消息。
@@ -3156,11 +2917,11 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
             actions={docActionsFor(activeDoc)}
             failureReason={docFailure?.kind === activeDoc ? docFailure.message : undefined}
             truncated={truncatedDocs[activeDoc]}
-            progress={
-              docProgress?.kind === activeDoc
-                ? `正在生成第 ${Math.max(docProgress.part, 1)}/${docProgress.total} 片：${docProgress.label}`
-                : undefined
-            }
+            // ⚠️ 生成任务化（05）之后这里**不再有分片进度**：分片是后端在任务内部做的
+            // （`services/job_runner._consume_sharded`），而 Job 的 SSE 协议目前**不发**
+            // 分片级事件（只有 snapshot / text_delta / phase / review / run_summary / done）。
+            // 所以用户看到的是 Stepper + 「正在分片生成…可能需要一两分钟」的 hint，
+            // 而不是"第 2/3 片"。要恢复那一行得让后端补一个 part 事件（本次未做）。
             onContentChange={(content) => handleDocChange(activeDoc, content)}
             onOptimize={(request) => handleOptimizeDocument(activeDoc, request)}
             // ---------- 观测（03）：四个插槽，内容全在编排层决定 ----------
@@ -3188,8 +2949,8 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
               ) : undefined
             }
             // 传 `undefined` 而不是空组件：否则插槽判断为真，正文下面会多一个空的 `mx-4`
-            // ⚠️ `streaming` 必须传：分片生成时第 1 片的帧里就只有 1/3，
-            // 不区分"还在跑"的话用户会读到一句假的"有一片没并进来"。
+            // ⚠️ `streaming` 必须传：任务化之后 `run_summary` 仍是**收尾前**发的那一帧，
+            // 不区分"还在跑"的话用户会在生成途中读到一份看起来已完成的汇总。
             summarySlot={
               docRunSummary ? (
                 <RunSummaryPanel
@@ -3205,8 +2966,11 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
               （由 `truncated` 横幅单独提示），PRD 不会（实测完整）。 */}
           {activeDoc === 'prd' && statusFor('prd') !== 'not_started' && (
             <p className="text-xs text-slate-400">
-              整份 PRD 一次生成完，实测需要几十秒（约 3 分钟属于宽裕估计）——
-              期间请保持页面打开，刷新会打断这次生成。长度不用担心：实测能一次出全 6 章。
+              {jobGen.isOptimizingJob
+                ? '正在按你的反馈重写这一节 —— 刷新不会中断它：任务在后台继续跑，回来后会自动接上进度。'
+                : '整份 PRD 一次生成完，实测需要几十秒（约 3 分钟属于宽裕估计）。' +
+                  '刷新或关掉页面都不会中断它：生成是后台任务，回来会自动接上进度。' +
+                  '长度不用担心：实测能一次出全 6 章。'}
             </p>
           )}
 

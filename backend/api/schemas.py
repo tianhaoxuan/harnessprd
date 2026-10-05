@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
@@ -28,6 +29,16 @@ from services.conversation_service import DEFAULT_MAX_ROUNDS
 # 分片范围用服务层的 dataclass 直接表达，不在 API 层再定义一个同形模型 ——
 # 那样 `DocumentScopeView` → `DocumentScope` 的转换就会变成两份契约的同步工作。
 from services.document_service import DocumentScope
+
+# Generation Job 的枚举与 payload 规则同理：定义在 services/job_models.py，
+# 这里复用。三个 Literal 直接就是数据库 CHECK 的那三个取值。
+from services.job_models import (
+    PAYLOAD_REQUIRED_KEYS,
+    JobArtifact,
+    JobPhase,
+    JobSnapshot,
+    JobStatus,
+)
 
 # ⚠️ **必须起别名**：本文件第 215 行已经有一个同名的 `SessionSummary`（给占位接口
 # `/api/v1/sessions` 用的状态机版契约：`state: SessionPhase` + `datetime` 时间）。
@@ -76,6 +87,10 @@ __all__ = [
     "RetrieveRagRequest",
     "RetrieveRagResponse",
     "RagHit",
+    # Generation Job（`/api/jobs/*`）
+    "CreateJobRequest",
+    "CreateJobResponse",
+    "JobSnapshotView",
 ]
 
 
@@ -687,3 +702,120 @@ class SessionStoreListView(BaseModel):
         default_factory=list,
         description="摘要列表，按 updated_at 倒序；**不含 session_data**",
     )
+
+
+# ---------------------------------------------------------------- Generation Job（`/api/jobs/*`）
+#
+# 与上一个区同理：这里只放**传输层才需要**的形状（请求体、快照响应、创建回执）。
+# 任务本身的领域模型在 `services/job_models.py`（`JobRecord` / `JobSnapshot`），
+# 本区不复制它的字段定义，只决定"哪些字段对外可见"。
+
+
+class CreateJobRequest(BaseModel):
+    """`POST /api/jobs` 的请求体。
+
+    ## `payload` 为什么按 artifact 分形状
+
+    三种产物要的输入不一样（PRD 要结构化摘要，后两份要 PRD 正文），所以 `payload`
+    是个自由字典 + **按 artifact 校验必需键**（见 `job_models.PAYLOAD_REQUIRED_KEYS`）。
+    不在这里写三个子模型的原因：那样每加一种产物就要改三处（模型、路由、runner），
+    而校验规则只需要一份清单。
+
+    ⚠️ 校验放在这里（→ **422**）而不是留给 runner：任务创建成功却立刻失败，
+    用户拿到的是一个 `job_id` 加一条错误，比当场被拒更难查
+    （与 `api/conversation.py`「入参校验必须在开流前完成」是同一条纪律）。
+    """
+
+    session_id: NonBlankStr = Field(description="任务挂在哪份会话上（会话必须已存在）")
+    artifact: JobArtifact = Field(
+        description="生成哪种产物：`prd`（从结构化摘要起草）/ `api-docs`（从 PRD 推导）/ "
+        "`prompts`（从 PRD + 接口文档推导）"
+    )
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "各产物的输入。必需键：`prd` → `requirements_summary`；"
+            "`api-docs` → `prd_content`；`prompts` → `prd_content`（可选 `api_docs_content`）。"
+            "三者都可带 `conversation_messages`（`[{role, content}]`）当对话历史"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_required_payload_keys(self) -> CreateJobRequest:
+        required = PAYLOAD_REQUIRED_KEYS[self.artifact]
+        missing = [key for key in required if not _has_content(self.payload.get(key))]
+        if missing:
+            raise ValueError(
+                f"{self.artifact} 任务的 payload 缺少必需项：{'、'.join(missing)}"
+                f"（该产物需要的键：{'、'.join(required)}）"
+            )
+        return self
+
+
+def _has_content(value: Any) -> bool:
+    """payload 里的值算不算"有内容"。空字典 / 空串 / 全空白都算没有。
+
+    `api-docs` 的 `prd_content` 是空串时**必须**在 422 被拦下：没有 PRD 可读，
+    模型只会凭空造接口，而造出来的东西看起来完全像真的
+    （`document_service.generate_api_docs_stream` 的同一条理由）。
+    """
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        return bool(value)
+    return True
+
+
+class CreateJobResponse(BaseModel):
+    """`POST /api/jobs` 的响应。
+
+    **只回 `job_id`**（需求如此）：后续查状态走 `GET /api/jobs/{id}`，
+    收进度走 `GET /api/jobs/{id}/stream`。这里不回快照是为了让创建路径尽量短 ——
+    它本该是一个"登记任务并立刻返回"的动作，不该顺便把草稿也读一遍。
+    """
+
+    job_id: str
+
+
+class JobSnapshotView(BaseModel):
+    """`GET /api/jobs/{job_id}` 的响应（也是 SSE 首帧 `snapshot` 的载荷）。
+
+    ⚠️ 与 `services/job_models.JobRecord` 刻意不同：内部记录有 `payload_json` /
+    `previous_draft` / `created_at` 这些**不该对外**或暂时不需要对外的列。
+    对外契约只增不减，内部字段则可以随便加。
+    """
+
+    id: str
+    session_id: str
+    artifact: JobArtifact
+    status: JobStatus
+    phase: JobPhase
+    draft_content: str = Field(
+        default="", description="**权威草稿**。刷新后页面应当先用它填上，不要留白"
+    )
+    review: dict[str, Any] | None = Field(
+        default=None, description="审查结论（仅 PRD）：`{passed, issues, review_model, review_skipped, round}`"
+    )
+    result: dict[str, Any] | None = Field(
+        default=None,
+        description="收尾结果：`{content, review, revision_applied, truncated, finish_reason, run_summary}`",
+    )
+    error: str | None = Field(default=None, description="失败原因（`status=failed` 时才有）")
+    doc_type: str | None = Field(
+        default=None,
+        description="**优化任务**改的是哪份产物（`prd` / `api` / `prompts`）；生成任务为 `null`",
+    )
+    section: str | None = Field(
+        default=None,
+        description=(
+            "**优化任务**在改哪一节（逐字的标题行）；生成任务为 `null`。"
+            "⚠️ 优化时 `draft_content` 是「模型这一节写了多少」，**不是整篇** —— "
+            "客户端要靠它把这一节拼回整篇才能正确显示"
+        ),
+    )
+
+    @classmethod
+    def from_snapshot(cls, snapshot: JobSnapshot) -> JobSnapshotView:
+        return cls(**snapshot.model_dump(exclude={"created_at", "updated_at"}))

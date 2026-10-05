@@ -1,7 +1,10 @@
 # HANDOFF —— 交接说明
 
 > 写给接手开发的**人 / AI**。读完这一份再读别的。
-> 最后更新：LLM 观测 / token 预算 / 「一次产物生成 = 一个 run」跨分片合并落地，前端生成观测 UI 完成之后（维护范围见 §11 第 9 条：**只维护 V2**）。
+> 最后更新：**Generation Job（生成任务化）落地之后** —— `/api/jobs/*`：任务状态落库、
+> 后台协程执行、断开 SSE 不 cancel、收尾同步会话；四个 `generate-*-stream` 标记 deprecated。
+> 再往前一次是「LLM 观测 / token 预算 / 一次产物生成 = 一个 run」与前端生成观测 UI。
+> （维护范围见 §11 第 9 条：**只维护 V2**。）
 
 ---
 
@@ -420,6 +423,8 @@ $env:PYTHONIOENCODING='utf-8'
 | 7 | **LLM 工厂门面** | 新增 `services/llm_factory.py` 的 `get_llm()`，**转发**到既有的 `build_chat_model()`，不复制实现；**保留 deepseek** | 只留 anthropic / openai 会断掉唯一配了 Key 的链路（`validation_out/` 那 7 份留档全靠它） |
 | 8 | **API 版本段** | **保留 `/api/v1/`**，不改造成裸 `/api/` | 自检与文档全部按 `/api/v1` 写；版本段是将来做破坏性变更时唯一的退路（`docs/接口文档模板.md` 的原则也是「路径前缀 `/api/v1/`，破坏性变更才升版本」）。已因漏 `/v1` 排查过三次，故写进本节，并在 `backend/README.md` 加了可直接复制的 curl |
 | 9 | **维护范围：只维护 V2** | 以后**只维护 `/v2*`**（`/v2` 新建、`/v2/:id` 编辑、`/v2/list` 列表）；**V1 的 `/` 保留现状、不再维护** —— 不删、不补功能、不为它写新分支。localStorage 持久化层**暂时保留**（V2 仍在用它：表单草稿 / 结构化录入摘要 / 入口模式偏好 + 首屏秒开缓存） | `/` 与 `/v2*` 的路由都在 `frontend/src/main.tsx`；V2 外壳是 `frontend/src/pages/V2Workbench.tsx`。⚠️ 两种版本渲染**同一个** `App`（`frontend/src/App.tsx`），所以「只改 V2」通常意味着**只动外壳/路由层** |
+| 10 | **生成任务化（Generation Job）** | 新增 `/api/jobs/*`（创建 / 快照 / 订阅 SSE）：任务状态与草稿落 `generation_jobs` 表，执行在后台 `asyncio.Task`，进度走进程内广播；**断开 SSE 不 cancel 任务**；同一份文档只允许一个在跑的任务（重复 → 409）；收尾时同步会话（`activeJobId` / `viewState` / `documents.<kind>.content` / `prdReviewResult`）；有 running 任务时 `generating-*` **不再被降级**；服务重启把遗留 `running` 标成 failed。四个 `generate-*-stream` 保留兼容、标 `deprecated=True` | `services/job_models.py` / `job_repository.py` / `job_service.py` / `job_bus.py` / `job_runner.py`；`api/jobs.py`；`services/session_service.py` 的降级与同步；`main.py` 的 lifespan（建表 + 扫描遗留任务）。验收：`scripts/job_check.py`（离线 66 项）+ `--live`（三种产物真模型各一个任务） |
+| 11 | **前端接上 Generation Job** | 四条链路（PRD / 接口文档 / 提示词套件 的**生成** + **AI 优化**）都改成「创建 Job + 订阅 Job stream」，不再有前台 `POST *-stream`；刷新按 `activeJobId` 自动重连、快照全文立刻显示（不重播打字机）；Job 生命周期**不进** `App.tsx`（在 `hooks/useGenerationJob.ts` / `utils/jobStream.ts` / `services/jobApi.ts`）。本轮把 `optimize-document-stream` 也任务化：`optimize-*` artifact、**全程停在 `review-*`**（不切 `generating-*`、无 Stepper）、`draft_content` 是"那一节"、收尾由后端拼回整篇（`services/section_edit.py`），失败也拼回整篇再落库 | 新增 `frontend/src/{types/job.ts,services/jobApi.ts,utils/jobStream.ts,utils/jobViews.ts,utils/docMeta.ts,hooks/useGenerationJob.ts}`；`App.tsx` 删掉前台产物流（`docAbortRef` / `docPartialRef` / `lastPartialWriteRef` 与 `inFlightDoc` 参数一并删） |
 
 > 第 2 条是本轮发现的**第三处设计文档互相矛盾**（前两处见 §10 第 1、3 条）。判定依据：
 > `状态数据设计.md` 与 `会话持久化方案.md` 详细定义了数据契约与接口面，而 `功能清单.md`
@@ -437,3 +442,54 @@ $env:PYTHONIOENCODING='utf-8'
 >    「生成 / 重新生成」「PRD 入口」三个按钮上），所以 V1 建的方案会进 `backend/harnessprd.db`，
 >    也会出现在 `/v2/list`。既然 V1 不维护，暂时**接受**这个行为；将来若要把 V1 隔离成本地-only，
 >    做法见第 2 条（加开关，别按 `sessionId` 判）。
+
+> **第 10 条（生成任务化）落地时注意四件事**：
+>
+> 1. ✅ **前端已接入**（同一轮改动）：三条生成链路都走「`POST /api/jobs` → 订阅
+>    `GET /api/jobs/{id}/stream`」。入口在 `hooks/useGenerationJob.ts`，页面（`App.tsx`）
+>    只传会话上下文、只把 hook 写回的状态渲染出来 —— 页面里**没有** `readJobStream`、
+>    没有 `createJob`、没有重连 effect、没有产物流的 `AbortController`。
+>    刷新重连的入口是快照里的 `activeJobId`（前端 `buildSnapshot` 必须带着它，
+>    否则下一次整份覆盖会把后端写的那份抹掉）。
+>    ⚠️ `AppV2.tsx` **在这个仓库里不存在**：V2（`/v2*`）与 V1（`/`）渲染的是**同一个**
+>    `App.tsx`，所以这次改造落在共用文件上，没有新增 V1 分支（HANDOFF §11 第 9 条）。
+> 2. **接口文档 / 提示词套件在任务里仍然分片**（`document_plan` + `services/stitch.py`）。
+>    这是对需求的一处**有意偏离**：需求只说"复用现有 generator"，但实测整份必然被输出上限截断
+>    （§4 坑 #18/#20），退回单次调用等于把已修好的 bug 引回来。PRD 不分片（整份装得下）。
+> 3. **降级规则的语义变了**：`generating-*` 不再一律当孤儿态 —— 服务端有 `status=running`
+>    的任务时它是**活的**，降级会让前端不去重连、用户把半截草稿当终稿。
+>    `session_service.downgrade_session_data(..., running_job_ids=…)` 是唯一的判断入口。
+> 4. **单进程边界**：`job_bus` 是进程内字典，多实例部署时"创建任务的实例"与"订阅的实例"
+>    若不是同一个，订阅者只拿得到 snapshot 与最终 done。换 Redis pub/sub 的改动点只在
+>    `job_bus.publish` / `subscribe` 两个函数里（需求本次明确不做 Celery / Redis / 独立 Worker）。
+> 5. ⚠️ **SSE 订阅必须"先注册订阅、再读任务状态"**（`api/jobs.py` 的 `_job_stream`）。
+>    反过来的顺序有一个真实竞态，**实测复现过**：读状态时任务还在跑，而 runner 恰好在
+>    "读状态"与"注册订阅"之间跑完并广播 `done` + 哨兵 —— 那些事件推给了没人，订阅者
+>    于是等一个永远不会再来的 `done`，界面上**永远停在"生成中"**（复现场景：在审查阶段刷新页面）。
+>    回归用例见 `scripts/job_check.py` 的「竞态」一条（用 `wait_for` 把"挂住"变成失败断言）。
+
+> **第 11 条（AI 优化任务化）落地时注意五件事** —— 前四条都是"优化与生成不是一回事"：
+>
+> 1. **`draft_content` 的语义随 artifact 变**：生成任务里它是"产物全文的增量"，
+>    优化任务里它是**"模型这一节写了多少"**（服务层只回一节，`generate_scope` 被强制对齐）。
+>    拼接在后端收尾做（`services/section_edit.py` 的 `replace_section`，是
+>    `DocumentReview.tsx` 里同名 TS 函数的镜像），结果放 `result_json.content` 与 `done.content`。
+>    ⚠️ **`GET /api/jobs/{id}` 与 SSE 首帧都必须带 `section`**：客户端要靠它 + 会话里的整篇
+>    自己拼出"整篇 + 正在改写的那一节"。本轮实测踩到过 —— 首帧漏了 `section`，优化中的正文
+>    只显示那一节片段，前后章节全不见，看起来像"整篇被替换了"。
+> 2. **优化全程停在 `review-*`**，跑的时候**不切** `generating-*`（与生成任务相反）：
+>    用户就停在审阅页上看这一节被改写，切走再切回来界面会闪；`session_service` 里
+>    `sync_job_started` / `sync_optimize_*` 按 `is_optimize_artifact` 分支。
+>    界面上也**没有 Stepper**（优化是单段流，硬画三步条是骗人），只有 `beginOptimizeGeneration()`
+>    那一行 hint。
+> 3. **优化失败时不能把草稿直接写进 `documents.*.content`**：那是把整篇换成一段话。
+>    能拼就拼回整篇（`job_runner._optimize_partial`），拼不了就一个字不动 ——
+>    前端失败路径同口径（`subscribeJob` 的 optimize 分支）。同理**不写 `truncated`**
+>    （那是"整篇被截断"的标记）、**不清 `prdReviewResult`**（没重新审稿）。
+> 4. **判重按"冲突组"而不是 artifact 字符串**（`job_models.ARTIFACT_CONFLICT_GROUP`）：
+>    `prd` 与 `optimize-prd` 写同一个字段，必须互斥（→ 409）；不同文档之间不冲突。
+>    前端另有一道 UI 守卫：生成中 `DocumentReview` **不显示**优化面板（反之按钮一律禁用），
+>    所以正常操作撞不到 409 —— 但服务端那道必须有，否则绕过 UI 就能让两份输出互相覆盖。
+> 5. **改 `artifact` 的 CHECK 要迁移旧库**：SQLite 不能改 CHECK，`CREATE TABLE IF NOT EXISTS`
+>    对已存在的表也不动手。`job_repository.ensure_schema()` 会检测旧表 → 复制数据重建
+>    （实测 16 行旧任务一行没丢，两条索引按"先重建后建索引"的顺序恢复）。

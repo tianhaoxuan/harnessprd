@@ -21,6 +21,7 @@
     /api/v1/conversation/*   对话阶段：题目下发（**已实现**）、流式回复与产物生成（**已实现**）
     /api/v1/sessions/*       会话生命周期 / 表单草稿 / 事件（唯一变更入口）/ 文档 / 对话历史（占位，501）
     /api/session/*           会话**快照存储**：list / {id} / save / delete（**已实现**，4 条）
+    /api/jobs/*              生成任务（Generation Job）：创建 / 快照 / 订阅 SSE（**已实现**，3 条）
     /api/v1/config           运行配置（占位，501）
 
 ⚠️ `/api/session/*` **刻意不带版本前缀**：路径是需求给定的，而它与 `/api/v1/sessions/*`
@@ -37,6 +38,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.health import router as health_router
+from api.jobs import router as jobs_router
 from api.router import api_router
 from api.session import router as session_router
 from api.session import session_not_found_handler
@@ -44,6 +46,8 @@ from core.config import Settings, get_settings
 from core.logging import configure_logging
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from services.job_runner import shutdown as shutdown_job_runner
+from services.job_service import DuplicateRunningJob, JobNotFound, JobService
 from services.token_estimator import BudgetExceededError
 
 from middleware.request_id import REQUEST_ID_HEADER, RUN_ID_HEADER, RequestIdMiddleware
@@ -80,6 +84,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 测试导入、打包、只读环境都会碰到它。lifespan 只在"进程真的要开始服务"时跑。
     session_service: SessionService = app.state.session_service
     session_service.ensure_ready()
+    # 生成任务表（同一库文件里的第二张表）。**启动即建表**，与方案表一起。
+    job_service: JobService = app.state.job_service
+    job_service.ensure_ready()
+    # 上一轮进程留下的 pending / running 任务永远不会有 runner 接管了（`asyncio.create_task`
+    # 活不过重启），所以**启动时如实标记中断**，而不是让界面永远显示"生成中"。
+    _stale = job_service.fail_stale_jobs()
+    if _stale:
+        logger.warning("服务重启：%d 个未完成的生成任务已标记为 failed", len(_stale))
     if not settings.llm_configured:
         # 明确告知"能起来但调不通"，避免把 503 误判成代码 bug
         logger.warning(
@@ -88,6 +100,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             settings.llm_provider,
         )
     yield
+    # 关停：取消在跑的生成任务。收尾（标记 failed）留给**下次启动**做 ——
+    # 取消点可能落在任何 await 上，此时写库发事件都不可靠（见 services/job_runner.shutdown）。
+    shutdown_job_runner()
     logger.info("%s 已停止", settings.app_name)
 
 
@@ -112,7 +127,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 会话业务层（API 直接调它）。建表在 lifespan 里做，见上面的说明。
     # 挂在 `app.state` 上而不是模块级单例：`create_app(settings)` 可以造多个独立实例
     # （测试就是这么用的），模块级单例会让它们共用一条库文件。
-    app.state.session_service = SessionService(settings)
+    #
+    # 任务层先建、再注入会话层：会话层要用它回答"这个 job 还在跑吗"（降级判断）。
+    # 顺序反过来的话，会话层会自己造一个 JobService（同一个库路径，功能上没问题，
+    # 但测试注入的临时库就只对其中一半生效 —— 那正是最难查的一类污染）。
+    app.state.job_service = JobService(settings)
+    app.state.session_service = SessionService(settings, jobs=app.state.job_service)
 
     # 请求工号：先于业务中间件注册，让**所有**响应都带上 X-Request-ID，
     # 并让后续任意深度的 LLM 调用都能从上下文读到它。
@@ -140,9 +160,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 原因见 `api/session.py`：它与 `/api/v1/sessions/*` 那组占位接口不是一回事。
     app.include_router(session_router)
 
+    # 生成任务（3 条，`/api/jobs/*`）——同样**不在 /api/v1 下**（需求给定的路径），
+    # router 自带前缀。这是「生成必须是后台任务」的落地入口：POST 只登记任务并返回
+    # job_id，执行在后台协程里跑，断开 SSE 不影响它。
+    app.include_router(jobs_router)
+
     # 会话不存在的语义是 **404**。异常处理器只能挂在 app 上（挂不到 router 上），
     # 所以在这里注册；路由函数因此保持"纯转发"，不必每条都写 try/except。
     app.add_exception_handler(SessionNotFound, session_not_found_handler)
+
+    async def job_not_found_handler(_: Request, exc: Exception) -> JSONResponse:
+        """任务不存在 → **404**（与 `SessionNotFound` 同口径）。"""
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    async def duplicate_job_handler(_: Request, exc: Exception) -> JSONResponse:
+        """同一会话 + 同一产物已有在跑的任务 → **409 Conflict**。
+
+        为什么是 409 而不是 400 / 422：请求本身完全合法，冲突的是**当前资源状态**
+        （另一次生成正在写同一份产物）。409 正好表达这个语义，客户端也能据此
+        提示"已经有一个在跑了"而不是"参数错了"。
+        """
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "type": "JOB_ALREADY_RUNNING",
+                "job_id": getattr(exc, "running_id", None),
+            },
+        )
+
+    app.add_exception_handler(JobNotFound, job_not_found_handler)
+    app.add_exception_handler(DuplicateRunningJob, duplicate_job_handler)
 
     async def budget_exceeded_handler(_: Request, exc: Exception) -> JSONResponse:
         """JSON 接口超预算统一 **422**（SSE 走 error 事件，见 api/conversation.py）。"""

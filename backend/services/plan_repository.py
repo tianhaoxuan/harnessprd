@@ -106,6 +106,42 @@ class PlanStorageError(RuntimeError):
         self.path = path
 
 
+@contextmanager
+def open_connection(
+    db_path: Path, *, busy_timeout_ms: int = 5000
+) -> Iterator[sqlite3.Connection]:
+    """开一条 SQLite 连接，用完提交/回滚并关闭。
+
+    三个 PRAGMA 各有理由：
+    - `journal_mode=WAL`：读不阻塞写（列表页读的时候后台还能写）
+    - `busy_timeout`：写锁冲突时**等**而不是立刻抛 `database is locked`
+    - `foreign_keys=ON`：SQLite 默认是关的，将来加外键时不会踩空
+
+    ⚠️ **本函数是模块级的**（原来只是 `PlanRepository._connect` 的方法体）：
+    同一个库文件里现在有第二张表（`generation_jobs`，见 `job_repository.py`），
+    两个仓储各写一份连接与 PRAGMA 就等于两份真相 —— 改一处忘一处不会有任何报错，
+    而这类"连接参数悄悄不一致"的问题极难排查（表现是偶发的 `database is locked`）。
+    方法版本仍然保留（`PlanRepository._connect` 只是转调），所以调用方一行都不用改。
+    """
+    path = Path(db_path)
+    try:
+        conn = sqlite3.connect(str(path), timeout=busy_timeout_ms / 1000)
+    except sqlite3.Error as exc:
+        raise PlanStorageError(path, exc) from exc
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+        conn.execute("PRAGMA foreign_keys = ON")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 class PlanRepository:
     """方案的读写。**只做持久化，不做业务判断**（那是 `plan_service` 的事）。"""
 
@@ -225,29 +261,9 @@ class PlanRepository:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        """开一条连接，用完提交/回滚并关闭。
-
-        三个 PRAGMA 各有理由：
-        - `journal_mode=WAL`：读不阻塞写（列表页读的时候后台还能写）
-        - `busy_timeout`：写锁冲突时**等**而不是立刻抛 `database is locked`
-        - `foreign_keys=ON`：SQLite 默认是关的，将来加外键时不会踩空
-        """
-        try:
-            conn = sqlite3.connect(str(self._path), timeout=self._busy_timeout_ms / 1000)
-        except sqlite3.Error as exc:
-            raise PlanStorageError(self._path, exc) from exc
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
-            conn.execute("PRAGMA foreign_keys = ON")
+        """开一条连接（转调模块级 `open_connection`，PRAGMA 只有一份实现）。"""
+        with open_connection(self._path, busy_timeout_ms=self._busy_timeout_ms) as conn:
             yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
 
 def dumps_snapshot(value: Mapping[str, Any] | Sequence[Any] | str) -> str:

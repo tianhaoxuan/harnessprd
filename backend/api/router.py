@@ -6,12 +6,21 @@
       ├── health                   健康检查（/health 与 /api/v1/health 同源）
       ├── sessions/*               会话生命周期、表单草稿、事件（唯一变更入口）、文档正文、对话历史
       ├── conversation/*           对话阶段：题目下发、首轮/接续流式对话（SSE）、
-      │                            产物的流式生成与修订（SSE，4 条）
+      │                            产物的流式生成与修订（SSE，4 条；**generate-* 已弃用**）
       └── config                   运行配置
+
+另外两条**不在 `/api/v1` 下**（需求给定的路径，各自带前缀，在 `main.py` 单独挂）::
+
+    /api/session/*               会话快照存储：list / {id} / save / delete
+    /api/jobs/*                  生成任务（Generation Job）：创建 / 快照 / 订阅 SSE
 
 ⚠️ `/conversation/*` 里那 7 个 POST 都是**无状态补全**（不落状态、客户端自带上文），
 与「唯一变更入口」的纪律不冲突但**必须随会话层一起改形** —— 见 `api/conversation.py`
 的模块 docstring。其中 4 个生成接口还只是**前台流式**，不等于设计要求里的后台生成任务。
+
+✅ **后台生成任务已经有了**：`/api/jobs/*`（见 `api/jobs.py` 与 `services/job_runner.py`）。
+它满足 `会话持久化方案` §7.1「生成不绑在 HTTP 请求上」，也是**产物落库的权威路径**。
+`/conversation/generate-*-stream` 因此被标记为 deprecated（保留兼容，不再推荐）。
 
 已删除的东西，别再往回加：
 

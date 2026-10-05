@@ -17,6 +17,7 @@ from fastapi import Depends, Request
 from core.config import Settings, get_settings
 from services.conversation_service import ConversationService
 from services.document_service import DocumentService
+from services.job_service import JobService
 from services.session_service import SessionService
 
 
@@ -26,6 +27,19 @@ def get_conversation_service() -> ConversationService:
 
 def get_document_service() -> DocumentService:
     return DocumentService()
+
+
+def get_job_service(request: Request) -> JobService:
+    """生成任务业务层。
+
+    ⚠️ 与 `get_session_service` 同一条理由：**优先取 `app.state.job_service`**，
+    否则 `create_app(settings)` 造的临时库会被绕过（`get_settings()` 是进程级单例），
+    测试于是写到默认的 `backend/harnessprd.db` 上，互相污染且很难发现。
+    """
+    service = getattr(request.app.state, "job_service", None)
+    if isinstance(service, JobService):
+        return service
+    return JobService()
 
 
 def get_session_service(request: Request) -> SessionService:
@@ -46,4 +60,5 @@ def get_session_service(request: Request) -> SessionService:
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 ConversationServiceDep = Annotated[ConversationService, Depends(get_conversation_service)]
 DocumentServiceDep = Annotated[DocumentService, Depends(get_document_service)]
+JobServiceDep = Annotated[JobService, Depends(get_job_service)]
 SessionServiceDep = Annotated[SessionService, Depends(get_session_service)]

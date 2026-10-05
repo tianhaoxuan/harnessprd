@@ -45,10 +45,18 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any
 
 from core.config import Settings
+from services.job_models import (
+    ARTIFACT_DOC_KIND,
+    ARTIFACT_GENERATING_VIEW,
+    ARTIFACT_REVIEW_VIEW,
+    PRD_REVIEW_RESULT_KEY,
+    is_optimize_artifact,
+)
+from services.job_service import JobService
 from services.plan_models import (
     ENTRY_MODES,
     STAGES,
@@ -105,7 +113,9 @@ def downgrade_view_state(view: str) -> tuple[str, DocKind | None]:
     return target if target else (view, None)
 
 
-def downgrade_session_data(session_data: str) -> tuple[str, str | None, DocKind | None]:
+def downgrade_session_data(
+    session_data: str, *, running_job_ids: Collection[str] = ()
+) -> tuple[str, str | None, DocKind | None]:
     """把快照里的 `viewState` 降级。
 
     返回 `(快照文本, 原 viewState, 被打断的产物)`。
@@ -113,6 +123,23 @@ def downgrade_session_data(session_data: str) -> tuple[str, str | None, DocKind 
     ⚠️ **不需要降级时原样返回**（不改键序、不改空白）。这个函数在每次保存时都会被调用，
     如果它顺手重新序列化一遍，"存进去什么就拿回什么"这条性质就没了 ——
     而且库里每存一次都会产生一次无意义的文本变更。
+
+    ## `running_job_ids`：有任务真在跑时**不许**降级
+
+    Generation Job 把"生成中"变成了**服务端事实**（`generation_jobs` 表里有一行
+    `status=running`），而不只是浏览器里的一个视图状态。这时再按
+    "生成中 = 孤儿态"去降级就是错的：
+
+    - 降成 `review-*` → 前端认为稿子已经写完了，于是**不去重连** SSE，
+      用户把一份半截草稿当成终稿；
+    - 降成澄清页 → 用户被弹回去，而任务其实还在后台写。
+
+    所以只要快照里的 `activeJobId` 指向一个**在跑**的任务，就原样保留 `generating-*`；
+    任务收尾时由 runner 自己把 `activeJobId` 清掉并落回 `review-*`
+    （见 `SessionService.sync_job_completed`）—— 那时降级判断再也不会命中它。
+
+    ⚠️ 判断依据**只看 `activeJobId`**，不看"这个会话有没有在跑的 job"：同一个会话可能
+    有另一个产物的任务在跑（接口文档在生成时，PRD 那个视图不该受影响）。
     """
     try:
         parsed = json.loads(session_data)
@@ -125,6 +152,10 @@ def downgrade_session_data(session_data: str) -> tuple[str, str | None, DocKind 
         return session_data, None, None
     downgraded, kind = downgrade_view_state(view)
     if kind is None:
+        return session_data, None, None
+    active_job = parsed.get("activeJobId")
+    if isinstance(active_job, str) and active_job in running_job_ids:
+        # 任务真的在跑：这是**活的生成中**，不是孤儿态
         return session_data, None, None
     parsed["viewState"] = downgraded
     # 只有真要改的时候才重新序列化（紧凑 + 不转义中文，与 plan_repository 的口径一致）
@@ -213,16 +244,33 @@ class SessionService:
         self,
         settings: Settings | None = None,
         plans: PlanService | None = None,
+        jobs: JobService | None = None,
     ) -> None:
-        self._plans = plans or PlanService(settings)
+        self._settings = settings or get_settings()
+        self._plans = plans or PlanService(self._settings)
+        # 任务层：只用来回答"这个 job 还在跑吗"（降级判断）与"把任务进度写回会话"。
+        # 依赖方向是 **session → job**，job 那一侧不反向依赖会话（`job_repository` 只懂 SQL），
+        # 所以这里不存在循环导入。
+        self._jobs = jobs or JobService(self._settings)
 
     @property
     def plans(self) -> PlanService:
         return self._plans
 
+    @property
+    def jobs(self) -> JobService:
+        return self._jobs
+
     def ensure_ready(self) -> None:
-        """建表（幂等）。应用启动时调用 —— 见 `main.py` 的 lifespan。"""
+        """建表（幂等）。应用启动时调用 —— 见 `main.py` 的 lifespan。
+
+        ⚠️ **两张表都要建**：本层的降级判断要读 `generation_jobs`
+        （"这个 job 还在跑吗"）。只建方案表的话，`get_session()` / `save_session()`
+        会以 `no such table: generation_jobs` 炸掉 —— 而报错点离原因很远
+        （在第 N 次保存时才暴露）。自检脚本就是这么踩到的。
+        """
         self._plans.ensure_ready()
+        self._jobs.ensure_ready()
 
     # ------------------------------------------------------------ 读
 
@@ -233,16 +281,25 @@ class SessionService:
             for row in self._plans.list(limit=limit, offset=offset)
         ]
 
+    def running_job_ids(self, session_id: str) -> set[str]:
+        """这个会话下**正在跑**的任务 id（降级判断的唯一依据）。"""
+        return self._jobs.running_ids_for_sessions([session_id])
+
     def get_session(self, session_id: str) -> SessionLoad:
-        """取完整快照。`generating-*` **先降级再返回**。
+        """取完整快照。`generating-*` **先降级再返回**，除非有任务真在跑。
 
         降级**不回写**：读操作不该改数据。库里若因故留着 `generating-*`（例如别的写入方
         绕过本层），每次读都会稳定地降级成同一个结果 —— 这是可预期的，不是"时好时坏"。
+
+        ⚠️ `running_job_ids` 必须传：没有它，正在后台生成的任务会被当成孤儿态降级掉，
+        前端于是不会去重连 SSE（需求 §十一 的关键一条）。
         """
         record = self._plans.get(session_id)
         if record is None:
             raise SessionNotFound(f"会话不存在：{session_id}")
-        text, original, kind = downgrade_session_data(record.snapshot)
+        text, original, kind = downgrade_session_data(
+            record.snapshot, running_job_ids=self.running_job_ids(session_id)
+        )
         return SessionLoad(
             **record.model_dump(exclude={"snapshot"}),
             session_data=text,
@@ -257,11 +314,19 @@ class SessionService:
         session_data: str | Mapping[str, Any],
         session_id: str | None = None,
     ) -> SessionSaveResult:
-        """新建（无 id）或更新（有 id）。**写入前降级**，标题只在新记录时解析。"""
+        """新建（无 id）或更新（有 id）。**写入前降级**，标题只在新记录时解析。
+
+        ⚠️ 写入前的降级同样要跳过"有任务真在跑"的快照：否则用户（或前端）在这次生成
+        期间恰好保存了一次，`generating-prd` 就在库里被改成了 `review-prd` ——
+        而任务还在后台写，界面从此不再重连。
+        """
         text = normalize_snapshot(session_data)
-        # 写入前降级：库里**不该**出现 generating-*（它是"此刻在跑"的意思，
-        # 而落库这个动作本身就说明那一刻已经过去了）。
-        text, downgraded_from, _ = downgrade_session_data(text)
+        running: set[str] = set()
+        if session_id is not None:
+            running = self.running_job_ids(session_id)
+        # 写入前降级：库里**不该**出现孤儿态的 generating-*（它是"此刻在跑"的意思，
+        # 而落库这个动作本身就说明那一刻已经过去了）——除非确有任务在跑。
+        text, downgraded_from, _ = downgrade_session_data(text, running_job_ids=running)
         if downgraded_from is not None:
             logger.info("保存会话时把 %s 降级后再写入（原状态只存在于内存）", downgraded_from)
         entry_mode, current_stage = derive_summary_fields(text)
@@ -294,3 +359,200 @@ class SessionService:
         """删除。不存在 → `SessionNotFound`（HTTP 层 404）。"""
         if not self._plans.delete(session_id):
             raise SessionNotFound(f"会话不存在：{session_id}")
+
+    # ------------------------------------------------------------ 任务同步（Generation Job）
+    #
+    # 职责边界：**Job 表是草稿的权威来源**，会话快照只记"用户做到哪、当前任务是谁"。
+    # 所以这里只写四个键（activeJobId / viewState / documents.<kind> / prdReviewResult），
+    # 其余字段（messages / form / entryMode / roundIndex / interruptedKind）**原样保留** ——
+    # 整份覆盖会把前端自己拥有的 state 抹掉，而且不会有任何报错。
+    #
+    # 节流：不必每个 chunk 都写会话（那是 job 表的活，见 job_service.DRAFT_PERSIST_INTERVAL_SECONDS）。
+    # 只在这三个时刻同步：任务开始、完成、失败。
+
+    def sync_job_started(self, *, session_id: str, job_id: str, artifact: str) -> None:
+        """任务开始：`activeJobId` = 本任务；**生成**任务同时把 `viewState` 切到 `generating-*`。
+
+        ⚠️ **优化任务不切视图**（`is_optimize_artifact` 分支）：用户就停在审阅页上看这一节
+        被重写，切到 `generating-*` 会让人以为整篇在重生成 —— 而且回头率很高：
+        优化完还要落回 `review-*`，一来一回界面会闪一下。
+
+        ⚠️ 只有 `_patch_session` 能写出 `generating-*` 并让它**留在库里**：
+        `save_session` 那条路径会在写入前降级（"落库这个动作说明那一刻已经过去了"），
+        而任务同步写的正是"此刻确实在跑"，所以走的是单独这条路。
+        """
+        patch: dict[str, Any] = {"activeJobId": job_id}
+        if not is_optimize_artifact(artifact):
+            patch["viewState"] = ARTIFACT_GENERATING_VIEW[artifact]
+        self._patch_session(session_id, patch)
+
+    def sync_job_completed(
+        self,
+        *,
+        session_id: str,
+        job_id: str,
+        artifact: str,
+        content: str,
+        review: Mapping[str, Any] | None = None,
+        truncated: bool | None = None,
+    ) -> None:
+        """任务完成：清 `activeJobId`、落回 `review-*`、把终稿写进 `documents.<kind>.content`。
+
+        - `review` 只对 PRD 有意义，写在 `prdReviewResult`（需求点名要的键）；
+        - `truncated` 如实写进文档对象（`HANDOFF.md` §4 坑 #18：截断必须在界面上看得见）。
+          `None` = 不说这事（调用方没拿到 outcome 时），**不写成 false** ——
+          "不知道"与"确定没截断"是两件事。
+        """
+        document: dict[str, Any] = {"content": content}
+        if truncated is not None:
+            document["truncated"] = bool(truncated)
+        patch: dict[str, Any] = {
+            "activeJobId": None,
+            "viewState": ARTIFACT_REVIEW_VIEW[artifact],
+            "documents": {doc_kind_for(artifact): document},
+        }
+        if artifact == "prd" and review is not None:
+            patch[PRD_REVIEW_RESULT_KEY] = dict(review)
+        self._patch_session(session_id, patch)
+
+    def sync_job_failed(
+        self,
+        *,
+        session_id: str,
+        job_id: str,
+        artifact: str,
+        draft: str = "",
+    ) -> None:
+        """任务失败：清 `activeJobId`、落回 `review-*`，**把已收到的草稿留在正文里**。
+
+        为什么保留半截草稿而不是清空：那是用户等了几分钟换来的东西，
+        清掉等于惩罚用户；而他可以在审核页看到"就断在这里"，再决定手改还是重生成。
+        """
+        patch: dict[str, Any] = {
+            "activeJobId": None,
+            "viewState": ARTIFACT_REVIEW_VIEW[artifact],
+        }
+        if draft:
+            patch["documents"] = {doc_kind_for(artifact): {"content": draft}}
+        self._patch_session(session_id, patch)
+
+    # ------------------------------------------------------------ 优化任务的同步
+    #
+    # 与生成任务的**关键差别**（三条，都由 `job_runner` 那边决定并在这里落地）：
+    #
+    # | | 生成 | 优化 |
+    # | --- | --- | --- |
+    # | `viewState` | 跑时 `generating-*`，收尾 `review-*` | **全程 `review-*`** |
+    # | 正文来源 | 模型输出的全文 | 模型输出**一节** → `job_runner` 拼回整篇后才写 |
+    # | `truncated` | 如实写 | **不写**（整篇是否被截断与"改了一节"无关） |
+    # | `prdReviewResult` | 完成时更新 | **保留**（优化不改审查结论） |
+
+    def sync_optimize_completed(
+        self,
+        *,
+        session_id: str,
+        job_id: str,
+        artifact: str,
+        content: str,
+    ) -> None:
+        """优化完成：清 `activeJobId`、写回**整篇**、`viewState` 保持 `review-*`。
+
+        ⚠️ `content` 必须是**拼好的整篇**（`job_runner._patched_document` 的产物）。
+        这里不做拼接：本层不知道"哪一节"、也不该知道（拼接规则只有一份，在
+        `services/section_edit.py`）。
+
+        ⚠️ **不动 `prdReviewResult`**：优化 PRD 不重新审稿，把审查结论清掉会让顶部的
+        "审核通过 / 还有 N 条意见"凭空消失 —— 那是在撒谎。
+        """
+        self._patch_session(
+            session_id,
+            {
+                "activeJobId": None,
+                "viewState": ARTIFACT_REVIEW_VIEW[artifact],
+                "documents": {doc_kind_for(artifact): {"content": content}},
+            },
+        )
+
+    def sync_optimize_failed(
+        self,
+        *,
+        session_id: str,
+        job_id: str,
+        artifact: str,
+        partial: str | None = None,
+    ) -> None:
+        """优化失败：清 `activeJobId`，`viewState` 保持 `review-*`。
+
+        `partial` 是"已经收到的那一节拼回整篇"的结果（可为 `None` = 一个字都没收到）。
+        ⚠️ **不要**把一节的片段直接当 `content` 传进来 —— 那会把整篇替换成一段话。
+        拼接由 `job_runner._optimize_partial` 负责，本层只落库。
+        """
+        patch: dict[str, Any] = {
+            "activeJobId": None,
+            "viewState": ARTIFACT_REVIEW_VIEW[artifact],
+        }
+        if partial:
+            patch["documents"] = {doc_kind_for(artifact): {"content": partial}}
+        self._patch_session(session_id, patch)
+
+    def _patch_session(
+        self,
+        session_id: str,
+        patch: Mapping[str, Any],
+    ) -> bool:
+        """把 `patch` 合并进快照并落库。返回是否命中（会话不存在 → `False`，不抛）。
+
+        **为什么是合并而不是覆盖**：前端那份快照里有 `messages` / `form` / `entryMode` /
+        `roundIndex` 等一堆与产物无关的字段，覆盖式写入会把它们清空 ——
+        而症状是"聊过的对话不见了"，排查时很难联想到是任务同步干的。
+
+        `documents` 做**一层深合并**（只认这一层）：`{prd: {content}}` 不该把
+        `{prd: {approved: true}}` 顶掉。更深的结构不合并 —— 那是"写一个通用 JSON merge"
+        的开始，而这里只有这一处需要（需求里同步的字段就这几个）。
+
+        ⚠️ 直接走 `PlanService.update`，**不过 `save_session`**：那条路径会在写入前把
+        `generating-*` 降级掉，而本函数在任务开始时要写的正是 `generating-*`。
+        绕开它比在那里加一个"这次别降级"的例外参数更清楚。
+        """
+        record = self._plans.get(session_id)
+        if record is None:
+            logger.warning("任务同步时会话已不存在（session=%s），跳过这次同步", session_id)
+            return False
+        try:
+            parsed = json.loads(record.snapshot)
+        except json.JSONDecodeError:  # pragma: no cover - 入库前已过 normalize_snapshot
+            parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+
+        for key, value in patch.items():
+            if key == "documents" and isinstance(value, Mapping):
+                documents = parsed.get("documents")
+                if not isinstance(documents, dict):
+                    documents = {}
+                for kind, item in value.items():
+                    existing = documents.get(kind)
+                    if isinstance(existing, dict) and isinstance(item, Mapping):
+                        documents[kind] = {**existing, **item}
+                    else:
+                        documents[kind] = dict(item) if isinstance(item, Mapping) else item
+                parsed["documents"] = documents
+            else:
+                parsed[key] = value
+
+        text = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        # 摘要列跟着快照走（列表页显示"生成中 / 待审核"靠它）；`None` = 不动那一列
+        entry_mode, current_stage = derive_summary_fields(text)
+        updated = self._plans.update(
+            session_id,
+            PlanUpdate(entry_mode=entry_mode, current_stage=current_stage, snapshot=text),
+        )
+        return updated is not None
+
+
+def doc_kind_for(artifact: str) -> str:
+    """`artifact` → 快照 `documents` 里的键（`api-docs` → `api`）。
+
+    映射本身在 `job_models.ARTIFACT_DOC_KIND`，这里只是取一次 —— 本模块**不**再写第二份。
+    """
+    return ARTIFACT_DOC_KIND[artifact]

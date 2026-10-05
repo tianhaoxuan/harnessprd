@@ -9,10 +9,30 @@
 | GET | `/questions` | 表单题目定义（已实现） |
 | POST | `/start-stream` | 首轮流式对话（SSE） |
 | POST | `/continue-stream` | 接续流式对话（SSE） |
-| POST | `/generate-prd-stream` | 生成 PRD（SSE） |
-| POST | `/generate-api-docs-stream` | 从 PRD 生成接口文档（SSE） |
-| POST | `/generate-prompts-stream` | 从 PRD 生成提示词套件（SSE） |
-| POST | `/optimize-document-stream` | 按反馈修订文档的某一节（SSE，F8.6） |
+| POST | `/generate-prd-stream` | 生成 PRD（SSE）⚠️ **已弃用** |
+| POST | `/generate-api-docs-stream` | 从 PRD 生成接口文档（SSE）⚠️ **已弃用** |
+| POST | `/generate-prompts-stream` | 从 PRD 生成提示词套件（SSE）⚠️ **已弃用** |
+| POST | `/generate-prd-from-summary-stream` | 从摘要生成 PRD（SSE）⚠️ **已弃用** |
+| POST | `/optimize-document-stream` | 按反馈修订文档的某一节（SSE，F8.6）⚠️ **已弃用** |
+
+## ⚠️ 五个 `generate-*` / `optimize-*` 已弃用：正式入口是 `POST /api/jobs`
+
+Generation Job（`api/jobs.py` + `services/job_runner.py`）落地之后，"生成产物"与
+"按反馈改一节"这两件事都有了**后台任务**这条正确的路：任务状态落库、刷新不断、
+断开 SSE 照样跑完、草稿可恢复。
+
+而下面这五个是**前台流式补全**：请求断了这一轮就没了，产物不落库。
+它们仍在（`deprecated=True`）只是为了不破坏既有回归脚本与旧调用方，**新代码不要再用**。
+
+| 弃用的前台接口 | 换成 |
+| --- | --- |
+| `generate-prd-stream` / `generate-prd-from-summary-stream` | `POST /api/jobs`（`artifact=prd`） |
+| `generate-api-docs-stream` | `POST /api/jobs`（`artifact=api-docs`） |
+| `generate-prompts-stream` | `POST /api/jobs`（`artifact=prompts`） |
+| `optimize-document-stream` | `POST /api/jobs`（`artifact=optimize-*`） |
+
+澄清那两条（`start-stream` / `continue-stream`）**没有**弃用 —— 澄清本来就是短交互，
+任务化的收益抵不过复杂度（需求也明确"本次不改造澄清"）。
 
 ## ⚠️ 这几个 POST 都是「无状态补全」，不是状态变更
 
@@ -488,12 +508,22 @@ async def retrieve_api_docs_rag(payload: RetrieveRagRequest) -> RetrieveRagRespo
 @router.post(
     "/generate-prd-from-summary-stream",
     summary="从结构化摘要生成 PRD（SSE）",
+    deprecated=True,
 )
 async def generate_prd_from_summary_stream(
     payload: GeneratePrdFromSummaryRequest,
     service: DocumentServiceDep,
 ) -> StreamingResponse:
     """**直接从结构化摘要生成 PRD**，流式返回 Markdown。
+
+    ⚠️ **已弃用（deprecated）：正式入口是 `POST /api/jobs`**（`artifact=prd`）。
+    本接口是**前台流式**：请求断了这一轮就没了，产物不落库。它保留是因为
+    `validate_prompts.py` / `skill_prd_check.py` 等回归脚本按裸文本契约在用它。
+    **新代码不要再用它**。
+
+    与任务化的差别（不是等价替换，读之前要知道）：任务里的 PRD 走**双智能体**
+    （写手 + 审核员，见 `services/job_runner.py`），而本接口默认 `review=false` 是单智能体。
+    想要"审一遍再交稿"请用 `/api/jobs`；想要"一次裸文本、不审"才用它。
 
     与 `generate-prd-stream` 是**两条并存的路径**（见
     `DocumentService.generate_prd_from_summary_stream` 的对比表）：
@@ -555,12 +585,17 @@ async def get_document_plan(kind: DocKind) -> DocumentPlanView:
     return DocumentPlanView.from_plan(build_plan(kind))
 
 
-@router.post("/generate-prd-stream", summary="生成 PRD（SSE）")
+@router.post("/generate-prd-stream", summary="生成 PRD（SSE）", deprecated=True)
 async def generate_prd_stream(
     payload: GeneratePrdRequest,
     service: DocumentServiceDep,
 ) -> StreamingResponse:
     """生成 PRD，逐段流式返回 Markdown。
+
+    ⚠️ **已弃用（deprecated）：正式入口是 `POST /api/jobs`**（`artifact=prd`）。
+    理由是需求里的「生成必须是后台任务」：本接口是**前台流式**，刷新页面就等于丢掉这一轮，
+    产物也不落库（`services/job_runner.py` 才是落库 + 断连续跑的那条路）。
+    保留它是为了不破坏既有回归脚本与旧调用方。
 
     一次调用产出一份产物。**整份 PRD 实测能一次生成完**（默认走技能包的 6 章结构、
     未截断，见 `backend/validation_out/prd_skill.txt`）。
@@ -582,12 +617,16 @@ async def generate_prd_stream(
     )
 
 
-@router.post("/generate-api-docs-stream", summary="从 PRD 生成接口文档（SSE）")
+@router.post("/generate-api-docs-stream", summary="从 PRD 生成接口文档（SSE）", deprecated=True)
 async def generate_api_docs_stream(
     payload: GenerateApiDocsRequest,
     service: DocumentServiceDep,
 ) -> StreamingResponse:
     """从**已通过审核的 PRD** 推导接口文档，逐段流式返回 Markdown。
+
+    ⚠️ **已弃用（deprecated）：正式入口是 `POST /api/jobs`**（`artifact=api-docs`）。
+    任务那条路会**按服务端的分片计划逐片生成再拼接**（本接口要靠调用方自己循环），
+    而且是后台执行、断开不丢。见 `services/job_runner.py` 的模块 docstring。
 
     `prd_content` 必填且不能为空白（`NonBlankStr` → **422**）。这不是形式主义：
     链条约束要求每个接口都能回指到 PRD 的 FR 编号（`gen_common.md` §三份产物），
@@ -605,12 +644,16 @@ async def generate_api_docs_stream(
     )
 
 
-@router.post("/generate-prompts-stream", summary="从 PRD 生成提示词套件（SSE）")
+@router.post("/generate-prompts-stream", summary="从 PRD 生成提示词套件（SSE）", deprecated=True)
 async def generate_prompts_stream(
     payload: GeneratePromptsRequest,
     service: DocumentServiceDep,
 ) -> StreamingResponse:
     """生成提示词套件，逐段流式返回。
+
+    ⚠️ **已弃用（deprecated）：正式入口是 `POST /api/jobs`**（`artifact=prompts`）。
+    理由同 `generate-api-docs-stream`：任务那条路自带分片计划与后台执行，
+    而本接口是前台流式 + 调用方自己循环。
 
     ⚠️ 产出是**多文件**格式，用 `=== FILE: <相对路径> ===` 分隔各文件
     （`docs/提示词套件模板.md`）—— **调用方负责按这个分隔行切分**，
@@ -633,12 +676,23 @@ async def generate_prompts_stream(
     )
 
 
-@router.post("/optimize-document-stream", summary="按反馈修订文档的某一节（SSE，F8.6）")
+@router.post(
+    "/optimize-document-stream",
+    summary="按反馈修订文档的某一节（SSE，F8.6）",
+    deprecated=True,
+)
 async def optimize_document_stream(
     payload: OptimizeDocumentRequest,
     service: DocumentServiceDep,
 ) -> StreamingResponse:
     """只修订文档的**一节**（F8.6「针对不合格项一键重生成对应章节」），逐段流式返回。
+
+    ⚠️ **已弃用（2026-10-05）**：前端改为走 `POST /api/jobs`（
+    `artifact=optimize-prd|optimize-api-docs|optimize-prompts`）+ 订阅 Job 进度 ——
+    理由是这条前台流会在客户端断开时**丢掉整趟修订**（用户等了半天，一次刷新全没）。
+    保留它是因为对外契约只增不减，且"按反馈改一节"的服务层实现（
+    `document_service.optimize_document_stream`）仍由 Job runner 复用；
+    新代码请用 Job 那条路（它还会把改好的那一节**拼回整篇**写进会话，这条不会）。
 
     system prompt 仍用该产物自己的 `gen_*`（含 `gen_common` 基线）—— 修订不是另一种
     文档类型，规则完全一样；变的只是 human message。

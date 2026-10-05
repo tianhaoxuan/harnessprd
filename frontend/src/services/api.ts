@@ -258,7 +258,7 @@ export function describeApiError(error: unknown): string {
 // ---------------------------------------------------------------- 流式对话（SSE）
 
 /** 一帧的解析结果。`data` 已 JSON 解析；解析失败时是原始字符串。 */
-interface ParsedFrame {
+export interface ParsedFrame {
   event: string
   data: unknown
 }
@@ -268,8 +268,14 @@ interface ParsedFrame {
  *
  * 按 SSE 规范处理：`字段: 值`、`:` 开头是注释行、同一帧内多个 `data:` 用换行拼接。
  * 行尾的 `\r` 一并容忍（服务端用 CRLF 时）。
+ *
+ * ⚠️ **导出给 `utils/jobStream.ts` 用**（`export` 是给它的，不是给业务层的）：
+ * Job 的进度流是另一条 SSE（GET、事件名不同、以 `[DONE]` 结束），但它与世界
+ * "怎么把一帧文本解成 `{event, data}`"完全是同一件事。各写一份的话，
+ * 两边对 `\r`、对冒号后空格、对非 JSON 负载的处理迟早不一样 ——
+ * 而这类差别只在特定服务端行为下才暴露。
  */
-function parseFrame(frame: string): ParsedFrame | null {
+export function parseFrame(frame: string): ParsedFrame | null {
   let event = 'message' // SSE 的默认事件名
   const dataLines: string[] = []
 

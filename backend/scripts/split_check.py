@@ -40,11 +40,19 @@ from pathlib import Path
 
 import httpx
 
+# `services.*` 的导入要先有 backend/ 在 sys.path 上（脚本是从 backend/scripts/ 跑的）。
+# 与本目录其它脚本（smoke_check / validate_prompts / verify_run_agg）同一套做法。
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from services.stitch import stitch_parts  # noqa: E402 - 必须在 sys.path 之后导入
+
 # 后端地址。默认 8000，可用 `HARNESS_API_BASE` 覆盖 —— 需要的原因很实际：
 # 机器上常有一个**改动之前**就起着的后端占着 8000（本轮实测撞到过），
 # 而那段旧代码验不了新提示词。硬编码端口只能让人去停别人的服务。
 BASE = os.environ.get("HARNESS_API_BASE", "http://127.0.0.1:8000/api/v1/conversation")
-BACKEND = Path(__file__).resolve().parents[1]
+BACKEND = BACKEND_DIR  # 同一个值，只是本文件下游一直用这个名字（留档路径都基于它）
 # 上游 PRD：优先用**当前结构**（技能包 6 章）那一份，理由见文件头。
 PRD_FILE = BACKEND / "validation_out" / "prd_skill.txt"
 # 老结构（15 章 + 2 附录）那一份：只在当前结构留档缺失时兜底，并会打印警告。
@@ -110,26 +118,13 @@ async def generate_part(
 
 
 def stitch(pieces: list[str]) -> str:
-    """与前端 `stitchParts()` 同逻辑。"""
-    kept: list[str] = []
-    first_heading: str | None = None
-    for piece in pieces:
-        text = piece.strip()
-        if not text:
-            continue
-        lines = text.split("\n")
-        first_index = next((i for i, line in enumerate(lines) if line.strip()), -1)
-        first_line = lines[first_index].strip() if first_index >= 0 else ""
-        if first_line.startswith("# "):
-            if first_heading is None:
-                first_heading = first_line
-            elif first_line == first_heading:
-                del lines[first_index]
-                text = "\n".join(lines).strip()
-                if not text:
-                    continue
-        kept.append(text)
-    return "\n\n".join(kept)
+    """与前端 `stitchParts()` 同逻辑。
+
+    ⚠️ **实现已移到 `services/stitch.py`**（这里的 `stitch` 只是别名）：后端现在有两个
+    拼接调用方（本脚本与 `services/job_runner.py` 的后台任务），各写一份必然分叉，
+    而症状会是"验收脚本说完整、任务里的产物却缺一段"。逻辑一个字符都没改。
+    """
+    return stitch_parts(pieces)
 
 
 async def run_kind(client: httpx.AsyncClient, kind: str, prd: str, api_content: str = "") -> dict:

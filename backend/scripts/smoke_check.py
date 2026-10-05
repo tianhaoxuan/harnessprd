@@ -1219,6 +1219,11 @@ def main() -> int:
         "/api/session/list",
         "/api/session/{id}",
         "/api/session/save",
+        # 生成任务 3 条（Generation Job，已实现；`api/jobs.py`）。
+        # 三条路径都由路由自带 `/api/jobs` 前缀，**不在 `/api/v1` 下**（需求给定）。
+        "/api/jobs",
+        "/api/jobs/{job_id}",
+        "/api/jobs/{job_id}/stream",
     }
     placeholders = {
         f"{method.upper()} {path}": operation.get("responses", {})
