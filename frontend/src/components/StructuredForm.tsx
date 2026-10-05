@@ -1,8 +1,18 @@
 /**
  * 结构化录入表单 —— 流程的第一步（原来独立成一个 AppV2 界面，现在并进 V1 的向导）。
  *
- * 与 `FormStep`（按 20 题逐题渲染）的区别：这里按 `field-schema.json` 的字段组织成 4 个折叠区块，
- * 支持多行格式化输入（每行 `功能名｜描述｜价值｜优先级`）、一键填示例、以及 JSON 预览。
+ * 与 `FormStep`（按 20 题逐题渲染）的区别：这里按 `field-schema.json` 的字段组织成 4 个折叠区块。
+ *
+ * ## 05 之后：两个清单是**行编辑器**，不是格式化文本
+ *
+ * `mvpFeatures` / `pages` 从"多行文本 + 竖线约定"换成了可增删行的列表
+ * （`structured-form/MvpFeatureRowEditor.tsx` / `UiPageRowEditor.tsx`）——
+ * 用户不必再记格式，列就是输入框，"格式错"这件事从根上不存在了。
+ * 老 Session 与本机草稿里的竖线字符串由 `utils/structuredFormTransform.normalizeRowFields()`
+ * 在挂载时迁移成行数组（只跑一次）。
+ *
+ * 同时删掉了面向开发者的「查看 JSON 预览」（05 之前那一版删的）：它对产品经理没有帮助，
+ * 而它读的那些中间结构本该由校验与摘要去保证。
  *
  * ## 它只负责"填 + 转"，不负责生成
  *
@@ -16,7 +26,23 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Check, ChevronDown, ChevronRight, Code, Copy, FileText, Loader2 } from 'lucide-react'
+import { ChevronDown, ChevronRight, FileText, Loader2 } from 'lucide-react'
+
+// ---------- 05：两个行编辑器 + 行类型 + 文本/迁移工具 ----------
+// `parseList` / `splitFields` 已经搬到 `utils/structuredFormTransform.ts`：
+// 迁移逻辑（老的管道符字符串 → 行数组）也要用它们，两份实现迟早对
+// "空列算不算存在"给出不同答案。
+import UiPageRowEditor from './structured-form/UiPageRowEditor'
+import MvpFeatureRowEditor from './structured-form/MvpFeatureRowEditor'
+import {
+  emptyMvpFeatureRow,
+  emptyUiPageRow,
+  isBlankMvpRow,
+  isBlankUiPageRow,
+  type MvpFeatureRow,
+  type UiPageRow,
+} from '../types/structuredForm'
+import { normalizeRowFields, parseList } from '../utils/structuredFormTransform'
 
 import { clearLocal, readLocal, writeLocal } from '../services/storage'
 import type { FormValues } from './FormStep'
@@ -85,9 +111,9 @@ interface Values {
   productGoal: string
   targetUsers: string
   // 功能与页面
-  mvpFeatures: string
+  mvpFeatures: MvpFeatureRow[]
   futureFeatures: string
-  pages: string
+  pages: UiPageRow[]
   interactions: string
   // 技术约束
   auth: string
@@ -109,9 +135,9 @@ const EMPTY: Values = {
   platform: PLATFORMS[0]?.value ?? '',
   productGoal: '',
   targetUsers: '',
-  mvpFeatures: '',
+  mvpFeatures: [emptyMvpFeatureRow()],
   futureFeatures: '',
-  pages: '',
+  pages: [emptyUiPageRow()],
   interactions: '',
   auth: AUTH_OPTIONS[0]?.value ?? '',
   storage: STORAGE_OPTIONS[0]?.value ?? '',
@@ -129,12 +155,23 @@ const EMPTY: Values = {
 // ---------------------------------------------------------------- 示例预设
 
 /** 一键填充用的示例。`values` 是**部分字段**，缺的那些用 `EMPTY` 补齐。 */
+type PresetValues = Partial<Omit<Values, 'mvpFeatures' | 'pages'>> & {
+  /**
+   * ⚠️ 这两个清单在示例里刻意**保留老的管道符字符串**（下方 `PRESETS` 的原文）。
+   * `applyPreset()` 会走 `normalizeRowFields()` 把它们迁移成行数组 ——
+   * 于是这三份示例顺带成了**迁移路径的活体样例**：只要它们还能正确填充出列表，
+   * 老 Session 的迁移就是好的。
+   */
+  mvpFeatures?: string | MvpFeatureRow[]
+  pages?: string | UiPageRow[]
+}
+
 interface Preset {
   id: string
   label: string
   /** 鼠标悬停时显示的说明：这个示例是拿来测什么的 */
   hint: string
-  values: Partial<Values>
+  values: PresetValues
 }
 
 /**
@@ -265,26 +302,22 @@ const PRESETS: Preset[] = [
  * 规则：按 `\n` 分割，逐行去首尾空白，**丢掉空行**（用户在段落之间空一行是排版习惯，
  * 不是"一条空条目"）。CRLF 已被 `\r` 的 trim 顺手处理掉。
  */
-function parseList(text: string): string[] {
-  return text
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-}
+/**
+ * 文本工具与迁移逻辑已搬到 `utils/structuredFormTransform.ts`（见文件头的 import 说明）：
+ * `parseList` / `splitFields` 由那里导出，老的管道符解析（`legacyParseMvpFeatures` /
+ * `legacyParseUiPages`）与统一入口 `normalizeRowFields` 也在那边 ——
+ * 本文件不再自带任何"管道符"概念。
+ */
 
 /**
- * 按分隔符拆字段。
+ * MVP 功能的一行。
  *
- * 中文竖线 `｜` 与半角竖线 `|` 都认 —— 中文输入法下打出的是前者，从别处粘贴过来的
- * 往往是后者，只认一种会让人对着"格式没错但报格式错"发呆。
- * 拆完**保留空列不清除**：`功能名｜` 的第二列要能被判成"存在但为空"，
- * 顺手 filter 掉的话，这种写法会被当成只有一列，报错信息就指不准。
+ * ⚠️ `priority` **不再由界面填写**（05 把行结构收成"名称 / 描述 / 价值"三列）：
+ * 它留在类型与 `skillPayload` 里是因为 schema 认这个键，值一律为空字符串 ——
+ * 于是下游（FR 编号、接口文档的 P0 覆盖、套件覆盖矩阵）按 schema 的默认规则
+ * "不给按 P0 处理"。老数据迁移时那一列会被丢掉，见
+ * `utils/structuredFormTransform.legacyParseMvpFeatures`。
  */
-function splitFields(line: string): string[] {
-  return line.split(/[｜|]/).map((cell) => cell.trim())
-}
-
-/** MVP 功能的一行。`priority` 是第 4 列（可选，见 `parseMvpFeatures` 的说明）。 */
 interface MvpFeature {
   name: string
   description: string
@@ -299,61 +332,11 @@ interface PageItem {
   notes: string
 }
 
-/**
- * 解析 MVP 功能：每行 `功能名｜描述｜价值｜优先级`（第 3、4 列可省略）。
- *
- * 列的含义按使用方给的格式来：**第 3 列是「价值」不是「优先级」**。
- * 但下游（`FR-xx` 编号、接口文档的 P0 覆盖、套件的覆盖矩阵）都要优先级，
- * 所以再留一个**可选的第 4 列**：写了 `P0`/`P1`/`P2` 就带走，不写就留空
- * （schema 里 `priority` 本来就是可选的，规则是"不给按 P0 处理"）。
- *
- * 缺列时**不抛错**：空的列照样返回空串 —— 校验由 `validate()` 负责报错，
- * 解析器只管尽可能把用户写的东西还原出来（两者职责分开，报错信息才不会互相打架）。
+/*
+ * 老的 `parseMvpFeatures` / `parsePages`（把管道符字符串切成人看的清单）**已随 05 删除**：
+ * 表单不再存字符串，`buildRequirementsSummary()` 直接从行数组映射；
+ * 老数据的迁移落在 `utils/structuredFormTransform.legacyParse*` 里，只跑一次。
  */
-function parseMvpFeatures(text: string): MvpFeature[] {
-  const isPriority = (value: string) => /^P[0-2]$/i.test(value)
-  return parseList(text).map((line) => {
-    const cells = splitFields(line)
-    const name = cells[0] ?? ''
-    const description = cells[1] ?? ''
-    let userValue = cells[2] ?? ''
-    let priority = cells[3] ?? ''
-    // 兼容"只写三列、第三列写优先级"的写法（旧提示词就是这么教的）。
-    // 不认这一条的话，它会被当成"价值：P0"这种没有意义的内容带进 PRD。
-    if (!priority && isPriority(userValue)) {
-      priority = userValue
-      userValue = ''
-    }
-    return {
-      name,
-      description,
-      user_value: userValue,
-      priority: isPriority(priority) ? priority.toUpperCase() : '',
-    }
-  })
-}
-
-/**
- * 解析页面结构：每行 `页面名｜模块1,模块2｜备注`（第 2、3 列可省略）。
- *
- * 第 2 列按逗号拆成数组：中英文逗号与顿号都当分隔符（`列表,编辑器` / `列表，编辑器` /
- * `列表、编辑器` 是同一个意思）。备注是自由文本，原样保留。
- */
-function parsePages(text: string): PageItem[] {
-  return parseList(text).map((line) => {
-    const [name = '', moduleCell = '', notes = ''] = splitFields(line)
-    return {
-      name,
-      modules: parseList(moduleCell.replace(/[，、]/g, ',')).flatMap((cell) =>
-        cell
-          .split(',')
-          .map((item) => item.trim())
-          .filter(Boolean),
-      ),
-      notes,
-    }
-  })
-}
 
 /**
  * 技能包 `field-schema.json` 的 8 字段载荷（**唯一以 schema 为准的输出形状**）。
@@ -385,10 +368,12 @@ interface SkillPayload {
  * 没有任何作答时返回 `null`（调用方据此走老路径）。
  */
 export function summaryFromFormValues(
-  raw: Record<string, string>,
+  raw: Record<string, unknown>,
 ): Record<string, unknown> | null {
   if (!raw || Object.keys(raw).length === 0) return null
-  const { schemaPayload } = buildRequirementsSummary({ ...EMPTY, ...raw })
+  // 本机草稿里那两个清单可能是管道符字符串（05 之前写的）→ 统一归一化成行数组
+  const merged = { ...EMPTY, ...raw, ...normalizeRowFields(raw) } as Values
+  const { schemaPayload } = buildRequirementsSummary(merged)
   return Object.keys(schemaPayload).length > 0
     ? (schemaPayload as Record<string, unknown>)
     : null
@@ -450,8 +435,34 @@ interface RequirementsSummary {
  * | `priority` | `priority`（原样） | schema 里本来就有 |
  */
 function buildRequirementsSummary(values: Values): RequirementsSummary {
-  const mvpFeatures = parseMvpFeatures(values.mvpFeatures)
-  const pages = parsePages(values.pages)
+  // 05：两个清单直接来自**行数组**，不再解析任何文本格式（需求 §四 的映射）。
+  //
+  // 过滤口径刻意不同：
+  // - MVP：名称或描述有一个不为空就算一行（用户可能先填了描述没填名称，
+  //   那种行要报"功能名称为空"，而不是被静默丢掉）；
+  // - 页面：**只有名称不为空才算一行**（模块与备注是可省的，光填备注不成页面）。
+  //
+  // 缺列时给「待确认」而不是空串：schema 的 `description` 虽然可选，
+  // 但下游按"没有描述就等于没写清"处理时会丢掉整条功能 —— 留一个显式占位符更诚实。
+  const mvpFeatures: MvpFeature[] = values.mvpFeatures
+    .filter((row) => row.name.trim() || row.description.trim())
+    .map((row) => ({
+      name: row.name.trim() || '待确认',
+      description: row.description.trim() || row.name.trim() || '待确认',
+      user_value: row.user_value.trim() || '待确认',
+      // 行结构里没有优先级列 → 一律空（schema 可选，"不给按 P0 处理"）
+      priority: '',
+    }))
+  const pages: PageItem[] = values.pages
+    .filter((row) => row.name.trim())
+    .map((row) => ({
+      name: row.name.trim(),
+      modules: row.modules
+        .split(/[,，、]/)
+        .map((item) => item.trim())
+        .filter(Boolean),
+      notes: row.notes.trim(),
+    }))
   const targetUsers = parseList(values.targetUsers)
 
   const stack = [
@@ -656,9 +667,13 @@ function buildRequest(summary: RequirementsSummary): BuiltRequest {
  *
  * | 类别 | 规则 |
  * | --- | --- |
- * | 必填 | 产品名称 / 核心目标 / 目标用户 / 平台 / MVP 功能 不能为空 |
- * | 格式 | MVP 功能每行必须有两列（功能名｜描述）；页面结构每行必须有两列（页面名｜模块列表） |
+ * | 必填 | 产品名称 / 核心目标 / 目标用户 / 平台 不能为空（纯文本字段） |
+ * | 清单 | MVP 功能至少一行且每行"功能名称 + 功能描述"都不为空；页面结构至少一行且每行有页面名称 |
  * | 范围 | 「在范围内」与「不在范围内」不能出现相同条目 |
+ *
+ * ⚠️ "清单"那一行在 05 之前叫"格式"，判据是"竖线切出来至少两列且都不为空"——
+ * 那是给**文本约定**看的。现在列就是输入框，只剩"填没填"这件事；
+ * 全空行先被过滤掉（用户点了"添加"但还没填，不该因此报错）。
  *
  * 返回 `byField`（键 = `Values` 的字段名，值 = 该字段的人话错误）与 `summary`（拍平后给总提示框）。
  * **按字段分组**而不是一个平铺数组，是为了能同时做两件事：字段下方标红 + 顶部汇总。
@@ -673,12 +688,18 @@ interface ValidationResult {
   fieldCount: number
 }
 
-const REQUIRED_FIELDS: Array<{ key: keyof Values; label: string }> = [
+/**
+ * 必填的**纯文本**字段。行编辑器那两个字段（`mvpFeatures` / `pages`）不在这里：
+ * 它们的"必填"含义是"至少一行有意义的内容"，判据不同（见下面第 2 段），
+ * 而且 `values[key].trim()` 对数组本来就不成立。
+ */
+type StringFieldKey = Exclude<keyof Values, 'mvpFeatures' | 'pages'>
+
+const REQUIRED_FIELDS: Array<{ key: StringFieldKey; label: string }> = [
   { key: 'productName', label: '产品名称' },
   { key: 'productGoal', label: '核心目标' },
   { key: 'targetUsers', label: '目标用户' },
   { key: 'platform', label: '平台' },
-  { key: 'mvpFeatures', label: 'MVP 功能' },
 ]
 
 function validate(values: Values): ValidationResult {
@@ -696,27 +717,32 @@ function validate(values: Values): ValidationResult {
     if (!values[key].trim()) add(key, `${label}不能为空`)
   }
 
-  // ---------- 2. 格式：每行必须有的列 ----------
-  /**
-   * 逐行检查"至少两列且都不为空"。
-   *
-   * `splitFields()` 对空列不做过滤，所以 `「绑定群聊｜」` 会得到 `['绑定群聊', '']` ——
-   * 第二列存在但为空，必须单独判；只看列数会把这种写法放过去。
-   */
-  const checkColumns = (key: keyof Values, first: string, second: string) => {
-    parseList(values[key]).forEach((line, index) => {
-      const columns = splitFields(line)
-      const position = `第 ${index + 1} 行`
-      if (columns.length < 2) {
-        add(key, `${position}：只写到「${columns[0] || '空'}」，需要「${first}｜${second}」两列`)
-        return
-      }
-      if (!columns[0]) add(key, `${position}：${first}为空`)
-      if (!columns[1]) add(key, `${position}：${second}为空`)
-    })
+  // ---------- 2. 行编辑器：至少一行、且必填列不为空 ----------
+  //
+  // 05 之前这里逐行检查"竖线切出来至少两列、两列都不为空"—— 那个判据是给**文本格式**
+  // 看的。现在列就是 DOM 里的输入框，"格式"不可能错，只剩下"填没填"这件事。
+  //
+  // 空行先过滤：用户点了「添加功能」但还没填，不该因此报错（需求 §六：
+  // 校验前过滤全空行）。过滤后一行都不剩才是"请至少填写一个"。
+  const mvpRows = values.mvpFeatures.filter((row) => !isBlankMvpRow(row))
+  if (mvpRows.length === 0) {
+    add('mvpFeatures', '请至少填写一个 MVP 功能')
   }
-  checkColumns('mvpFeatures', '功能名', '描述')
-  checkColumns('pages', '页面名', '模块列表')
+  values.mvpFeatures.forEach((row, index) => {
+    if (isBlankMvpRow(row)) return
+    if (!row.name.trim()) add('mvpFeatures', `第 ${index + 1} 行：功能名称为空`)
+    if (!row.description.trim()) add('mvpFeatures', `第 ${index + 1} 行：功能描述为空`)
+  })
+
+  const pageRows = values.pages.filter((row) => !isBlankUiPageRow(row))
+  if (pageRows.length === 0) {
+    add('pages', '请至少填写一个页面')
+  }
+  values.pages.forEach((row, index) => {
+    // 页面行只要求名称：模块与备注都可省（只有备注不算一个页面，所以按"全空"过滤）
+    if (isBlankUiPageRow(row)) return
+    if (!row.name.trim()) add('pages', `第 ${index + 1} 行：页面名称为空`)
+  })
 
   // ---------- 3. 范围：两张表不能有同一条 ----------
   // 归一化只去首尾空白与结尾标点，不做模糊匹配 —— 中文条目上，模糊匹配的误报
@@ -986,16 +1012,15 @@ export default function StructuredForm({ onSubmit, submitting = false }: Structu
    * 一进页面就满屏红字会把"还没开始填"误报成"填错了"；点过之后改为实时更新。
    */
   const [submitted, setSubmitted] = useState(false)
-  /** JSON 预览面板是否展开。默认关着 —— 它是排查用的，不该挡在正常流程前面。 */
-  const [showJson, setShowJson] = useState(false)
-  const [copied, setCopied] = useState(false)
 
   // 挂载时读一次草稿。放在 effect 而不是 `useState` 初始化器里：
   // 初始化器在严格模式下会被调用两次，"读存储"这类副作用不该放在那儿。
   useEffect(() => {
-    const saved = readLocal<Partial<Values>>(DRAFT_KIND)
+    const saved = readLocal<Record<string, unknown>>(DRAFT_KIND)
     if (saved && Object.keys(saved).length > 0) {
-      setValues({ ...EMPTY, ...saved })
+      // 05：草稿里那两个清单可能是管道符字符串（老草稿），归一化成行数组；
+      // 其余字段是纯字符串，直接展开。
+      setValues({ ...EMPTY, ...saved, ...normalizeRowFields(saved) } as Values)
       setRestoredDraft(true)
     }
   }, [])
@@ -1004,7 +1029,15 @@ export default function StructuredForm({ onSubmit, submitting = false }: Structu
   // （写空对象会让"上次填过"的痕迹永远留在本机）。
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      const filled = Object.values(values).some((value) => value.trim())
+      // ⚠️ 逐字段判"有没有内容"：行数组没有 `.trim()`，老的
+      // `Object.values(values).some((v) => v.trim())` 会在数组字段上直接抛。
+      const filled = Object.entries(values).some(([key, value]) =>
+        key === 'mvpFeatures'
+          ? (value as MvpFeatureRow[]).some((row) => !isBlankMvpRow(row))
+          : key === 'pages'
+            ? (value as UiPageRow[]).some((row) => !isBlankUiPageRow(row))
+            : String(value).trim().length > 0,
+      )
       if (filled) writeLocal(DRAFT_KIND, values)
       else clearLocal(DRAFT_KIND)
     }, DRAFT_DEBOUNCE_MS)
@@ -1017,31 +1050,6 @@ export default function StructuredForm({ onSubmit, submitting = false }: Structu
    */
   const summary = useMemo(() => buildRequirementsSummary(values), [values])
 
-  /**
-   * 实时预览用的三份 JSON。
-   *
-   * - `parsed`：解析结果（列出表单原本的列名：`user_value` / `modules` / `notes`）
-   * - `skillPayload`：与 `field-schema.json` **完全匹配**的那一份（空字段不输出 → 始终合法）
-   * - `requestBody`：真正作为 `form` 交出去的东西（20 题作答 + `known_info`）
-   */
-  const preview = useMemo(() => {
-    const request = buildRequest(summary)
-    const { schemaPayload, ...parsed } = summary
-    return {
-      parsed,
-      skillPayload: schemaPayload,
-      requestBody: {
-        form: request.form,
-        ...(request.known_info ? { known_info: request.known_info } : {}),
-      },
-    }
-  }, [summary])
-
-  /** 格式化后的整段 JSON：2 空格缩进，把三块并在一起，复制一次就够。 */
-  const previewText = useMemo(() => JSON.stringify(preview, null, 2), [preview])
-
-  const previewFields = useMemo(() => Object.keys(preview.skillPayload).length, [preview])
-
   const validation = useMemo(() => validate(values), [values])
   const showErrors = submitted && validation.fieldCount > 0
 
@@ -1051,17 +1059,6 @@ export default function StructuredForm({ onSubmit, submitting = false }: Structu
       showErrors ? validation.byField[key] : undefined,
     [showErrors, validation],
   )
-
-  const handleCopy = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(previewText)
-      setCopied(true)
-      window.setTimeout(() => setCopied(false), 1500)
-    } catch {
-      // 剪贴板不可用（非 https、权限被拒）时不弹提示：面板里本来就能手动选中复制
-      setCopied(false)
-    }
-  }, [previewText])
 
   const set = useCallback(
     <K extends keyof Values>(key: K) => (value: Values[K]) =>
@@ -1083,7 +1080,9 @@ export default function StructuredForm({ onSubmit, submitting = false }: Structu
    * 3. **不动草稿键**：随后的防抖 effect 会把新内容写回去，不需要在这里手动写。
    */
   const applyPreset = useCallback((preset: Preset) => {
-    setValues({ ...EMPTY, ...preset.values })
+    // 示例里那两个清单是**老的管道符字符串**（见 `PresetValues` 的说明），
+    // 所以整体替换之后要过一遍迁移，得到行数组。
+    setValues({ ...EMPTY, ...preset.values, ...normalizeRowFields(preset.values) } as Values)
     setOpenSections({ basics: true, features: true, tech: true, quality: true })
   }, [])
 
@@ -1107,6 +1106,12 @@ export default function StructuredForm({ onSubmit, submitting = false }: Structu
   /** 面板标题右侧的"已填几条"。名字叫 countLabel 而不是 summary —— 后者已被解析结果占用。 */
   const countLabel = (text: string, unit = '行') => {
     const count = parseList(text).length
+    return count > 0 ? `${count} ${unit}` : '未填写'
+  }
+
+  /** 行数组版的"已填几条"（`countLabel` 是纯文本版）。`isBlank` 由调用方给判据。 */
+  const countRows = <T,>(rows: T[], isBlank: (row: T) => boolean, unit: string) => {
+    const count = rows.filter((row) => !isBlank(row)).length
     return count > 0 ? `${count} ${unit}` : '未填写'
   }
 
@@ -1186,20 +1191,22 @@ export default function StructuredForm({ onSubmit, submitting = false }: Structu
       <Section
         index={2}
         title="功能与页面"
-        summary={countLabel(values.mvpFeatures, '条功能')}
+        summary={countRows(values.mvpFeatures, isBlankMvpRow, '条功能')}
         open={openSections.features}
         onToggle={() => toggle('features')}
       >
-        <TextArea
+        <Field
           label="MVP 功能"
           required
-          rows={6}
-          value={values.mvpFeatures}
-          onChange={set('mvpFeatures')}
-          placeholder="每行一条，用竖线分隔：功能名｜描述｜价值｜优先级(P0/P1/P2)。例：&#10;绑定群聊并汇总｜选定群聊与时间范围后触发汇总，返回按人分组的草稿｜省掉每天翻记录｜P0&#10;导出到飞书｜把草稿导出为飞书文档并回链｜周报直接进群"
-          hint="前两列必填：功能名｜描述；后两列可省略"
+          hint="点「添加功能」加一行；前两列必填（功能名称、功能描述）"
           errors={errorsFor('mvpFeatures')}
-        />
+        >
+          <MvpFeatureRowEditor
+            rows={values.mvpFeatures}
+            onChange={set('mvpFeatures')}
+            disabled={submitting}
+          />
+        </Field>
         <TextArea
           label="未来规划"
           rows={3}
@@ -1209,15 +1216,13 @@ export default function StructuredForm({ onSubmit, submitting = false }: Structu
           hint="会进 PRD 的「不在范围内」"
           errors={errorsFor('futureFeatures')}
         />
-        <TextArea
+        <Field
           label="页面结构"
-          rows={4}
-          value={values.pages}
-          onChange={set('pages')}
-          placeholder="每行一个页面：页面名｜模块1,模块2｜备注。例如：&#10;周报草稿页｜列表,编辑器,导出条｜/reports/:id&#10;登录页｜表单,错误提示｜/login"
-          hint="每行必须有两列：页面名｜模块列表"
+          hint="点「添加页面」加一行；只有页面名称必填，模块用逗号分隔"
           errors={errorsFor('pages')}
-        />
+        >
+          <UiPageRowEditor rows={values.pages} onChange={set('pages')} disabled={submitting} />
+        </Field>
         <TextArea
           label="关键交互"
           rows={4}
@@ -1368,50 +1373,7 @@ export default function StructuredForm({ onSubmit, submitting = false }: Structu
         <span className="text-xs text-slate-400">
           下一步：AI 就缺口追问几轮（澄清阶段），通过后才生成 PRD
         </span>
-        <button
-          type="button"
-          onClick={() => setShowJson((open) => !open)}
-          aria-expanded={showJson}
-          data-testid="toggle-json"
-          className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-600 transition hover:bg-slate-50"
-        >
-          <Code className="h-3.5 w-3.5" aria-hidden />
-          {showJson ? '关闭 JSON 预览' : '查看 JSON 预览'}
-        </button>
       </div>
-
-      {showJson && (
-        <section
-          data-testid="json-preview"
-          className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm"
-        >
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-slate-100 px-4 py-3">
-            <span className="text-sm font-semibold text-slate-800">JSON 预览</span>
-            <span className="text-xs text-slate-400">
-              随表单实时更新｜parsed = 解析结果，skillPayload 与 schema 对齐（{previewFields} 项），
-              requestBody = 实际发出的请求
-            </span>
-            <button
-              type="button"
-              onClick={() => void handleCopy()}
-              className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-1.5 text-xs text-slate-600 transition hover:bg-slate-50"
-            >
-              {copied ? (
-                <Check className="h-3.5 w-3.5" aria-hidden />
-              ) : (
-                <Copy className="h-3.5 w-3.5" aria-hidden />
-              )}
-              {copied ? '已复制' : '复制'}
-            </button>
-          </div>
-          {/* 三块：parsed 是解析结果（保留表单的列名），skillPayload 是"与 schema 完全匹配"
-              的那一份（可直接跑 schema 校验），requestBody 是实际发出去的东西。
-              三者摆在一起，映射在哪一步"收口"一目了然。 */}
-          <pre className="max-h-[60vh] overflow-auto bg-slate-50 px-4 py-3 font-mono text-xs leading-relaxed text-slate-700">
-            {previewText}
-          </pre>
-        </section>
-      )}
     </div>
   )
 }

@@ -19,13 +19,25 @@ import StructuredForm, {
   summaryFromStoredDraft,
   type StructuredSubmit,
 } from './components/StructuredForm'
+// ---------- 方案入口（04）----------
+// 三个子界面都只负责画，**动作与状态全在本页**（`entryMode` / `formSubView` /
+// `importedPrd` / `handleImportPrdAsBaseline` 都在这里）。入口语义因此只有一处。
+import ProjectEntryChooser from './components/project-entry/ProjectEntryChooser'
+import ImportPrdPanel from './components/project-entry/ImportPrdPanel'
+import ImportPromptsPanel from './components/project-entry/ImportPromptsPanel'
 import RagHitsPanel from './components/RagHitsPanel'
 import SummaryDiffPanel, {
   diffSummaries,
   type SummaryChange,
 } from './components/SummaryDiffPanel'
 import MessageList from './components/MessageList'
-import StepProgress from './components/StepProgress'
+// 顶栏从 `StepProgress`（流程进度：一格 = 一个 ViewState）换成 `ArtifactProgressBar`
+// （产出物：一格 = 一份产出物，`done` 由"这份有没有正文"推导）。
+//
+// ⚠️ `components/StepProgress.tsx` 与 `types/index.ts` 的 `stepsForMode` / `stepIndexOf`
+// **刻意留着不删**：全仓只有它自己、本文件的 import、以及 README 两行散文提到它们，
+// 没有别处依赖 —— 留着这次改动就能一键回退。真要清理请单独一次提交（连 README 一起）。
+import ArtifactProgressBar from './components/ArtifactProgressBar'
 // ---------- 观测（03）----------
 // 四个展示组件 + 一个 hook。**组件只负责摆放，state 全在 hook 里** ——
 // 页面里不该出现"步骤怎么变、秒表怎么走"这类与业务流程无关的代码。
@@ -58,7 +70,6 @@ import {
   clearStructuredIntake,
   clearLocal,
   readFormDraft,
-  readEntryMode,
   readStructuredIntake,
   readLocal,
   SESSION_KIND,
@@ -81,6 +92,13 @@ import { buildZip, splitPromptSuite, type ZipEntry } from './services/zip'
 // 三份产物的元信息表（`DOC_META` / `DOC_ORDER` / `DOC_RUN_TYPES`）已搬到 `utils/docMeta`：
 // `utils/jobViews` 也要用它把 Job 的 artifact 映射成视图，而它 import 本文件就成环了。
 import { DOC_META, DOC_ORDER, DOC_RUN_TYPES } from './utils/docMeta'
+// 顶栏「产出物」的格子怎么裁剪、怎么点亮：**纯函数**，所以状态由内容推导而不另存一份
+// （刷新后不会出现"进度条说做完了、正文却是空的"），也可以离线断言。
+import {
+  buildArtifactNodes,
+  type ArtifactContents,
+  type ArtifactId,
+} from './utils/artifactProgress'
 import type { JobReview } from './types/job'
 import {
   STEPS,
@@ -88,9 +106,10 @@ import {
   type ConversationTurn,
   type DocStatus,
   type QuestionsConfig,
-  ENTRY_MODES,
   type EntryMode,
+  type FormSubView,
   type ViewState,
+  formSubViewForEntryMode,
 } from './types'
 
 type LoadState =
@@ -221,6 +240,23 @@ export interface SessionData {
    * （"审核通过" / "还有 N 条意见没改完" / "这次没审核"）正是从这里复原的。
    */
   prdReviewResult?: JobReview | null
+  /**
+   * 本次走的**入口**（04）。
+   *
+   * ⚠️ 这个字段是 04 篇**新加**的：在此之前快照里根本没有它 —— 而服务端
+   * `session_service.derive_summary_fields()` 一直在读 `parsed.get("entryMode")`
+   * 去填 `plans.entry_mode` 那一列。所以那一列**从来没被写过**，一直是建表默认的
+   * `structured`：列表页的"入口"标签对每份方案都显示同一个值，而从列表点进一份
+   * 导入型老方案也不会落到对应的导入界面（入口只在 `localStorage` 里记了一个"上次选的"）。
+   *
+   * 写进来之后，`entry_mode` 列与列表标签才名副其实，老方案也能按自己的入口落地。
+   */
+  entryMode?: EntryMode
+  /**
+   * 表单屏停在哪个子视图（04）。**可选**：老快照里没有它，
+   * 读的时候用 `formSubViewForEntryMode(entryMode)` 推导即可（需求 §八）。
+   */
+  formSubView?: FormSubView
   updatedAt: string
 }
 
@@ -624,6 +660,11 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
    * 不会出现"某个入口下生成规则不一样"这种第二套真相。
    */
   const [entryMode, setEntryMode] = useState<EntryMode>('structured')
+  /**
+   * 「表单」这一屏的子视图（04）。**全新会话默认落在 `chooser`** —— 先选路径再进界面。
+   * 老会话由 `formSubViewForEntryMode(entryMode)` 推导，跳过选择页。
+   */
+  const [formSubView, setFormSubView] = useState<FormSubView>('chooser')
   /** 快捷入口里粘贴进来的 PRD 正文（确认后写进 `prd` 产物）。 */
   const [importedPrd, setImportedPrd] = useState('')
   /**
@@ -971,6 +1012,13 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       // 这正是"刷新即重连"的入口（本机自用那条路；V2 编辑态走下面那个远程加载 effect）。
       applyActiveJobId(data.activeJobId ?? null)
       restorePrdReview(data.prdReviewResult)
+      // 入口（04）：老会话按**它自己快照里的** `entryMode` 落地，不再看 localStorage。
+      // 快照里有 `formSubView` 就优先用，没有就用 `entryMode` 推导（需求 §八）。
+      if (data.entryMode) {
+        setEntryMode(data.entryMode)
+        writeEntryMode(data.entryMode)
+      }
+      setFormSubView(data.formSubView ?? formSubViewForEntryMode(data.entryMode ?? 'structured'))
 
       // 被刷新/关页面打断的生成必须**说出来**：只降级不提示的话，
       // 用户会把上一版内容当成刚刚生成出来的（§7.4 那条孤儿生成态的本意就在此）。
@@ -1087,6 +1135,13 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       // 漏了它，刷新后会停在一个永远不动的"生成中"。
       applyActiveJobId(data.activeJobId ?? null)
       restorePrdReview(data.prdReviewResult)
+      // 入口（04）：老会话按**它自己快照里的** `entryMode` 落地，不再看 localStorage。
+      // 快照里有 `formSubView` 就优先用，没有就用 `entryMode` 推导（需求 §八）。
+      if (data.entryMode) {
+        setEntryMode(data.entryMode)
+        writeEntryMode(data.entryMode)
+      }
+      setFormSubView(data.formSubView ?? formSubViewForEntryMode(data.entryMode ?? 'structured'))
       // 落地哪一屏：**留在快照记录的那一步**。
       //
       // 刻意**不**因为「那份产物是空的」就退回对话页：用户上一秒在 PRD 步，把她踢回澄清页
@@ -1205,6 +1260,12 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         // （见 `activeJobIdRef` 的说明）。
         activeJobId: activeJobIdRef.current,
         prdReviewResult,
+        // 入口（04）：这两项也**必须由前端写进快照** —— 服务端的
+        // `derive_summary_fields()` 读的就是 `entryMode`（填 `plans.entry_mode` 那一列），
+        // 而整份覆盖意味着"前端不带它 = 把它抹掉"。不带的话列表页的入口标签
+        // 与老方案的落地子视图都会退回默认值（这个字段是 04 篇才加上的，见 `SessionData`）。
+        entryMode,
+        formSubView,
         updatedAt: stamped,
       }
     },
@@ -1218,6 +1279,9 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       viewState,
       approvedDocs,
       truncatedDocs,
+      // 入口（04）：`buildSnapshot` 会把它们写进快照，所以回流时必须拿到最新值。
+      entryMode,
+      formSubView,
       // ⚠️ **不放 `activeJobId`**：它从 ref 读，所以这个回调不必因为它换身份
       // （依赖数组里的 state 只用于"确认快照形状要带这个字段"这件事本身）。
       prdReviewResult,
@@ -1694,35 +1758,41 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
   const shortcutMode = entryMode !== 'structured'
 
   /**
-   * 切入口。
+   * 切入口（04：由**路径选择页**调用，不再有一条全局入口条）。
    *
-   * 三套流程的「起点」不同，所以切过去要**把视图挪到该入口的第一步**：
-   * 否则会出现"选了快捷入口，界面还停在对话页"这种对不上的状态。
+   * 三套流程的「起点」现在都落在**同一屏**（`viewState === 'form'`）的不同子视图上：
+   * `structured` → 表单；`prd-shortcut` / `prompts-debug` → 各自的粘贴向导。
+   * 贴完点「作为基准并继续」（`handleImportPrdAsBaseline`）才会把 `viewState`
+   * 抬到 `review-api-docs` / `review-prompts` —— 也就是说**"进入导入向导"与
+   * "开始跑这条流程"是两件事**，改造前它们被混在同一个按钮里（旧的入口条一按就直接
+   * 跳到 review 屏，用户还没贴 PRD 就先看到一张空的 PRD 审阅页）。
    */
   const chooseEntryMode = useCallback(
     (mode: EntryMode) => {
       setEntryMode(mode)
       writeEntryMode(mode)
-      if (mode === 'structured') setViewState('form')
-      else if (mode === 'prd-shortcut') setViewState('review-prd')
-      else setViewState('review-prompts')
-      // 进快捷入口时把输入框预填成当前会话的 PRD（有的话），省一次粘贴
+      setFormSubView(formSubViewForEntryMode(mode))
+      setViewState('form')
+      // 进导入向导时把输入框预填成当前会话的 PRD（有的话），省一次粘贴
       if (mode !== 'structured') setImportedPrd((prev) => prev || prdContent)
       setBaselineAccepted(false)
+      // 「进导入路径」= 关键动作：一选就落库（沿用改造前入口条对 `prd-shortcut` 的做法，
+      // 现在两条导入路径一视同仁）。不这么做的话，用户贴完 PRD 才第一次建会话 ——
+      // 而 `handleImportPrdAsBaseline` 会立刻按 `entryMode` 起生成，那时才建会话就晚了。
+      if (mode !== 'structured') void ensureSessionSaved()
     },
-    [prdContent],
+    [prdContent, ensureSessionSaved],
   )
 
   /** 步骤条点击：**自由推进**，不做前端门槛（不合条件的生成按钮自己会灰）。 */
   const handleStepSelect = useCallback((next: ViewState) => setViewState(next), [])
 
-  /** 启动时恢复上次选的入口。 */
-  useEffect(() => {
-    const saved = readEntryMode()
-    if (saved === 'structured' || saved === 'prd-shortcut' || saved === 'prompts-debug') {
-      setEntryMode(saved)
-    }
+  /** 三个子界面的「← 返回路径选择」（需求 §一）。 */
+  const backToChooser = useCallback(() => {
+    setFormSubView('chooser')
+    setViewState('form')
   }, [])
+
   /**
    * 这次生成能不能走「摘要 + 双智能体审核」那条路。
    *
@@ -2117,9 +2187,14 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
    * 只能走 `POST /sessions/{id}/events`（那条接口仍是 **501**），而且
    * 「服务端 `state` 是真相，前端不自己实现状态机」（`会话持久化方案` §7.3）。
    * 现在先本地推进，理由与表单提交那里完全相同；会话层就绪后整个删掉换成发事件。
+   *
+   * @param options.navigate 默认 `true`：通过之后按 `STAGE_ACTIONS.next` 推进到下一屏。
+   *   传 `false` = **只标通过、留在原地**。PRD 页的「跳过接口文档，直接生成提示词」要它：
+   *   默认那一跳会落在**接口文档页**（`STAGE_ACTIONS.prd.next === 'api'`），而那条路的下一站
+   *   是提示词 —— 中间闪一屏接口文档会让人以为"点了跳过却进了接口文档"。
    */
   const handleApproveDocument = useCallback(
-    (kind: DocKind) => {
+    (kind: DocKind, options?: { navigate?: boolean }) => {
       // ---------- 守卫 1：空产物不能通过 ----------
       // 允许通过一份空文档，等于给后面每一步留下一个没有上游的产物
       if (!readDoc(kind).trim()) {
@@ -2144,8 +2219,11 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       setApprovedDocs(nextApproved)
 
       const next = STAGE_ACTIONS[kind].next
-      if (next) setViewState(DOC_META[next].review)
-      else handleEndTask(nextApproved)
+      // ⚠️ `next === null`（最后一份）时**必须**照旧走 `handleEndTask` ——
+      // 不能因为"这次不跳页"就把"通过即完成"也一起吞掉。
+      if (next) {
+        if (options?.navigate !== false) setViewState(DOC_META[next].review)
+      } else handleEndTask(nextApproved)
     },
     [readDoc, approvedDocs, handleEndTask],
   )
@@ -2350,6 +2428,12 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     setStreamingDoc('')
     setIsGenerating(false)
     setGeneratingKind(null)
+    // 入口（04）：「清空重来」= 回到**路径选择页**（而不是直接落在表单上）。
+    // 入口本身也一起复位：上一次选的 `prompts-debug` 留着，会让"重新开始"后的顶栏
+    // 进度只剩一步，而用户其实还没选过任何路径。
+    setEntryMode('structured')
+    writeEntryMode('structured')
+    setFormSubView('chooser')
     // 观测（03）：整轮观测状态一起清 —— 秒表、步骤条、汇总、上下文档位、失败的请求 ID。
     // ⚠️ 秒表必须**停**：它是个 `setInterval`，不停会一直给这个已经清空的页面喂 state。
     stopTimer()
@@ -2463,11 +2547,33 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       const hasContent = status !== 'not_started'
       const actions: DocumentAction[] = []
 
+      /**
+       * PRD 审阅页的 **forward 分层**（本篇改造）。
+       *
+       * PRD 是链条的源头，"往下走"其实有**两条**路，改造前这两条路只有后者被说出口：
+       *
+       * | 出口 | 走什么 |
+       * | --- | --- |
+       * | 生成接口文档 | 链条主路径。要过 RAG 确认（`RagHitsPanel`），**不绕过** |
+       * | 直接生成提示词 | 跳过接口文档。提示词会缺 API 细节，所以摆成**次要出口** |
+       *
+       * 两条都以"手上真有一份 PRD 正文"为前提，所以门是 `hasContent`。
+       * `structured` 是"本来就会生成接口文档"的主路径 —— 跳过那一枚做成文字链
+       * （`variant: 'link'`）；另外两个入口是用户**主动选的捷径**，两枚并列，
+       * 跳过那一枚降成 `secondary` 即可。
+       */
+      const showPrdForward = kind === 'prd' && hasContent
+      /** 三份都通过时"唯一的深色主按钮"要让给「进入完成页」（见下面两处的 `variant`）。 */
+      const allApproved = DOC_ORDER.every((k) => approvedDocs[k])
+
       if (hasContent) {
         actions.push({
           key: 'approve',
           label: approved ? '已通过' : stage.approveLabel,
-          variant: 'primary',
+          // ⚠️ PRD 页上深色主按钮让给下面的 forward：审核页的主按钮该指向"下一步做什么"，
+          // 而 PRD 这一页的下一步就是往下生成。通过本身仍然在这儿（它是一道真实的状态变更，
+          // 也是"生成 / 下一步"两道门槛的判据），只是不再抢视觉焦点。
+          variant: showPrdForward ? 'secondary' : 'primary',
           disabled: approved,
           title: approved
             ? '这一份已经通过了'
@@ -2497,7 +2603,10 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       })
 
       // 只有**已通过**才给"下一步"：这是有序性的关键（见上面的说明）
-      if (approved && stage.next) {
+      //
+      // ⚠️ PRD 页除外：那一页的 forward 已经把"去接口文档"这一步包进去了
+      // （见 `showPrdForward`），再挂一枚「下一步：接口文档」就是同一件事说两遍。
+      if (approved && stage.next && !showPrdForward) {
         actions.push({
           key: 'next',
           label: `下一步：${DOC_META[stage.next].title}`,
@@ -2506,10 +2615,55 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         })
       }
 
+      if (showPrdForward) {
+        actions.push({
+          key: 'forward-api-docs',
+          // 主路径 PRD 页的**深色主按钮**。文案是"生成"而不是"通过"：它真的会起一次生成。
+          // 已经有接口文档时也不改文案 —— 顶栏与页脚以"下一步是什么"为准，
+          // 覆盖风险由 `title` 说清楚（改文案会让同一颗按钮在不同会话里叫两个名字）。
+          label: '生成接口文档 →',
+          variant: allApproved ? 'secondary' : 'primary',
+          title: apiDocsContent.trim()
+            ? '会重新生成并覆盖现有接口文档 —— 想只改一节请用接口文档页的「AI 优化」'
+            : '会先做一次 RAG 检索（接口规范 + 历史示例），由你逐条确认后才开始生成',
+          // ⚠️ **先把 PRD 标成已通过**，再往下生成。不通过就生成会走进死胡同：
+          // 生成不看"通过"标志（`handleGenerateDocument` 只要求有 `prd_content`），
+          // 但**下一步的「通过」看**（`STAGE_ACTIONS.api.upstream === 'prd'`）——
+          // 于是用户生成完接口文档，却卡在那一页被禁用的「通过」上。
+          //
+          // RAG 门控照旧走：`handleGenerateDocument('api')` 在 `ragConfirmedRef` 为假
+          // 且还没有接口文档正文时会先检索并弹 `RagHitsPanel`，确认之后才真生成。
+          onClick: () => {
+            handleApproveDocument('prd')
+            void handleGenerateDocument('api')
+          },
+        })
+
+        actions.push({
+          key: 'skip-api-docs',
+          label: '跳过接口文档，直接生成提示词',
+          variant: entryMode === 'structured' ? 'link' : 'secondary',
+          title: '提示词套件会缺少接口清单与字段契约那部分细节',
+          onClick: () => {
+            // ⚠️ 只在"这条入口本来会生成接口文档"时问一句。`prompts-debug` 本来就是
+            // 跳过接口文档的入口（见 `ENTRY_MODES` 的 hint），在那里再问一遍是噪音。
+            if (entryMode !== 'prompts-debug') {
+              const ok = window.confirm('跳过接口文档时，提示词可能缺少 API 细节。是否继续？')
+              if (!ok) return
+            }
+            // 与上面同一道理：不先通过 PRD，提示词页那枚「通过」会因为缺上游而禁用
+            // （`STAGE_ACTIONS.prompts.upstream === 'prd'`）。
+            // `navigate: false` = 别先跳到接口文档页（见 `handleApproveDocument` 的说明）。
+            handleApproveDocument('prd', { navigate: false })
+            void handleGenerateDocument('prompts')
+          },
+        })
+      }
+
       // 三份都通过之后，**任何**审核页都要能回完成页。
       // 早先只在 `prompts` 阶段给这个按钮，结果是：从完成页点进「接口文档」看一眼，
       // 就再也回不去了（只能按浏览器后退，或者用调试跳转行）。
-      if (DOC_ORDER.every((k) => approvedDocs[k])) {
+      if (allApproved) {
         actions.push({
           key: 'finish',
           label: '进入完成页',
@@ -2524,8 +2678,92 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
 
       return actions
     },
-    [statusFor, approvedDocs, handleApproveDocument, handleGenerateDocument, handleEndTask, viewState, entryMode, prdContent],
+    [
+      statusFor,
+      approvedDocs,
+      handleApproveDocument,
+      handleGenerateDocument,
+      handleEndTask,
+      viewState,
+      entryMode,
+      prdContent,
+      apiDocsContent,
+    ],
   )
+
+  /**
+   * 「产出物」进度条上点某一格跳去哪。
+   *
+   * ⚠️ **只有 `done` 的格子会被调用** —— `buildArtifactNodes` 只对 `done` 调 `onNavigate`，
+   * 所以这里不必再判断"这一份有没有正文"。返回 `undefined` = 这一屏没有对应去处，
+   * 那一格就渲染成**不可点**（而不是"点了没反应"）。
+   */
+  const handleArtifactNavigate = useCallback(
+    (id: ArtifactId): (() => void) | undefined => {
+      switch (id) {
+        case 'requirements':
+          // 「需求」= 表单这一屏的**本入口子视图**（structured 是表单，
+          // 两个导入入口是各自的粘贴向导）。与「返回导入入口」那颗按钮同一个落点。
+          return () => {
+            setFormSubView(formSubViewForEntryMode(entryMode))
+            setViewState('form')
+          }
+        case 'clarification':
+          return () => handleStepSelect('chatting')
+        case 'prd':
+          return () => handleStepSelect('review-prd')
+        case 'api-docs':
+          return () => handleStepSelect('review-api-docs')
+        case 'prompts':
+          return () => handleStepSelect('review-prompts')
+      }
+    },
+    [entryMode, handleStepSelect],
+  )
+
+  /**
+   * 顶栏那一排格子（本篇改造）。
+   *
+   * 输入只有三样：**入口**（裁剪格子数）、**当前屏**（谁是 active）、**各份正文**（谁打勾）。
+   * 于是状态完全由内容推导 —— 不另存一份进度，刷新后也不会出现
+   * "进度条说做完了、正文却是空的"。
+   */
+  const artifactNodes = useMemo(() => {
+    /**
+     * 「需求」那一格的判据之一：表单里有没有有效的产品名。
+     *
+     * 两个来源取并集：`values` 是**正在填**的那份（刷新后从本机草稿恢复过来），
+     * `submitted` 是**已提交**的那份。只看其中一个都会留下一段"明明填了却不算"的窗口。
+     */
+    const hasProductName = Boolean(
+      (values.product_name ?? '').trim() || (submitted?.product_name ?? '').trim(),
+    )
+    const contents: ArtifactContents = {
+      hasProductName,
+      hasClarification: messages.length > 0,
+      roundIndex,
+      prdContent,
+      apiDocsContent,
+      promptsContent,
+    }
+    return buildArtifactNodes({
+      entryMode,
+      viewState,
+      contents,
+      onNavigate: handleArtifactNavigate,
+    })
+  }, [
+    entryMode,
+    viewState,
+    values.product_name,
+    submitted?.product_name,
+    messages.length,
+    roundIndex,
+    prdContent,
+    apiDocsContent,
+    promptsContent,
+    handleArtifactNavigate,
+  ])
 
   const showDone = load.status === 'ok' && viewState === 'done'
   /** 只要有一份产物有内容就给打包入口 —— 不要求三份齐全（缺哪份会在通知里点名）。 */
@@ -2552,11 +2790,10 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         )}
       </header>
 
-      <StepProgress
-        viewState={viewState}
-        entryMode={entryMode}
-        onSelect={handleStepSelect}
-      />
+      {/* 顶栏：**产出物**进度（本篇改造）。格子数与点亮状态全部由
+          `buildArtifactNodes` 从「入口 + 当前屏 + 各份正文」推导出来 ——
+          这里只摆一个组件，没有任何进度判断的逻辑。 */}
+      <ArtifactProgressBar nodes={artifactNodes} />
 
       {/* 恢复提示放在**所有屏之上**：现在恢复的可能是任意一屏（某个产物的审核页 / done /
           对话页），只挂在对话页上的话大部分时候都看不到。
@@ -2585,40 +2822,6 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
           方案已保存到服务端 · {savedId.slice(0, 8)}
         </p>
       ) : null}
-
-      {/* 三个入口。放在**所有屏之上**：随时可切，且切换时把视图带到该入口的第一步。 */}
-      <div
-        data-testid="entry-mode-bar"
-        className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2"
-      >
-        <span className="text-xs text-slate-400">入口</span>
-        {ENTRY_MODES.map((mode) => (
-          <button
-            key={mode.id}
-            type="button"
-            data-testid={`entry-mode-${mode.id}`}
-            onClick={() => {
-              chooseEntryMode(mode.id)
-              // 「PRD 入口」= 关键动作：进这个入口就落库（需求测试 3 的首次 save）。
-              // 放在 onClick 而不是 chooseEntryMode 内部：那两者声明位置相邻，
-              // 在依赖数组里互相引用容易命中 const 的 TDZ（本仓库注释里踩过同一类）。
-              if (mode.id === 'prd-shortcut') void ensureSessionSaved()
-            }}
-            title={mode.hint}
-            className={[
-              'rounded-md border px-2.5 py-1 text-xs transition',
-              entryMode === mode.id
-                ? 'border-primary-300 bg-primary-50 font-medium text-primary-800'
-                : 'border-slate-200 bg-white text-slate-500 hover:text-slate-700',
-            ].join(' ')}
-          >
-            {mode.label}
-          </button>
-        ))}
-        <span data-testid="entry-mode-hint" className="text-xs text-slate-400">
-          {ENTRY_MODES.find((mode) => mode.id === entryMode)?.hint}
-        </span>
-      </div>
 
       {/* 打包下载也放**所有屏之上**：产物可能分散在三步里看，用户不该为了下载而先跳回去。 */}
       {showBundleButton ? (
@@ -2672,8 +2875,60 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         </div>
       )}
 
-      {load.status === 'ok' && viewState === 'form' && (
+      {/*
+        ---------- 表单这一屏：按 `formSubView` 分支（04）----------
+        改造前：三套入口是一条**全局入口条**（钉在所有屏之上），一按就直接把 `viewState`
+        跳到 review-* —— 用户还没贴 PRD 就先看到一张空的 PRD 审阅页。现在四个子视图都在
+        这一屏里，选好、贴完、点「作为基准并继续」才抬 `viewState`（见 `chooseEntryMode`）。
+      */}
+      {load.status === 'ok' && viewState === 'form' && formSubView === 'chooser' && (
+        <ProjectEntryChooser onChoose={chooseEntryMode} />
+      )}
+
+      {load.status === 'ok' && viewState === 'form' && formSubView === 'import-prd' && (
+        <ImportPrdPanel
+          title="导入 PRD：把你的 PRD 贴进来当基准"
+          description="跳过表单与对话澄清。确认之后先生成接口文档（那一步会先做 RAG 检索：接口规范 + 历史接口示例，由你逐条确认），再生成提示词套件。"
+          value={importedPrd}
+          onChange={(next) => {
+            setImportedPrd(next)
+            // 内容变了就不再是「已确认」的那一份，按钮要能再点一次（改造前同此行为）
+            setBaselineAccepted(false)
+          }}
+          onConfirmBaseline={handleImportPrdAsBaseline}
+          onLoadCurrentPrd={() => setImportedPrd(prdContent)}
+          canLoadCurrentPrd={Boolean(prdContent.trim())}
+          baselineAccepted={baselineAccepted}
+          onBack={backToChooser}
+        />
+      )}
+
+      {load.status === 'ok' && viewState === 'form' && formSubView === 'import-prompts' && (
+        <ImportPromptsPanel
+          value={importedPrd}
+          onChange={(next) => {
+            setImportedPrd(next)
+            setBaselineAccepted(false)
+          }}
+          onConfirmBaseline={handleImportPrdAsBaseline}
+          onLoadCurrentPrd={() => setImportedPrd(prdContent)}
+          canLoadCurrentPrd={Boolean(prdContent.trim())}
+          baselineAccepted={baselineAccepted}
+          onBack={backToChooser}
+        />
+      )}
+
+      {load.status === 'ok' && viewState === 'form' && formSubView === 'structured' && (
         <>
+          <button
+            type="button"
+            data-testid="form-back-to-chooser"
+            onClick={backToChooser}
+            className="self-start text-xs text-slate-500 transition hover:text-slate-800"
+          >
+            ← 返回路径选择
+          </button>
+
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs text-slate-500">
             <span>
               {load.config.title} · 版本{' '}
@@ -2823,65 +3078,24 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         </section>
       )}
 
-      {/* 快捷入口的 PRD 输入框要跟着**该入口的第一步**走：PRD 快捷入口落在 PRD 步，
-          提示词调试入口直接落在提示词步 —— 只认 `activeDoc === 'prd'` 的话，
-          后者永远看不到粘贴框（实测被用户问到）。 */}
-      {load.status === 'ok' &&
-      shortcutMode &&
-      (activeDoc === 'prd' || entryMode === 'prompts-debug') && (
-        <section
-          data-testid="prd-import"
-          className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm"
+      {/* 导入路径的**返回入口**（04）。
+          粘贴区已经搬到表单屏的子视图里（`ImportPrdPanel` / `ImportPromptsPanel`）——
+          它原来挂在这里，而这里已经是"贴完并往下走"之后的那一屏，同一个粘贴框出现两次
+          只会让人不知道该用哪个。这条链接补回**入口条被删掉后失去的能力**：
+          从审阅屏回到导入向导改基准 PRD（需求 §八：导入路径审阅中点「返回入口」
+          → 回到 import-prd / import-prompts，不是 chooser）。 */}
+      {load.status === 'ok' && shortcutMode && (
+        <button
+          type="button"
+          data-testid="back-to-import-entry"
+          onClick={() => {
+            setViewState('form')
+            setFormSubView(formSubViewForEntryMode(entryMode))
+          }}
+          className="self-start text-xs text-slate-500 transition hover:text-slate-800"
         >
-          <h2 className="text-sm font-medium text-slate-800">
-            {entryMode === 'prd-shortcut'
-              ? 'PRD 快捷入口：把你的 PRD 贴进来当基准'
-              : '提示词调试入口：贴一份 PRD 当输入'}
-          </h2>
-          <p className="mt-1 text-xs text-slate-500">
-            {entryMode === 'prd-shortcut'
-              ? '跳过表单与对话澄清。确认之后先生成接口文档（那一步会先做 RAG 检索：接口规范 + 历史接口示例，由你逐条确认），再生成提示词套件。'
-              : '跳过前面的全部流程。提示词套件必须吃 PRD（后端缺 prd_content 会 422），接口文档可以留空（后端填「（尚无）」）。'}
-          </p>
-          <textarea
-            data-testid="prd-import-textarea"
-            value={importedPrd}
-            onChange={(event) => {
-              setImportedPrd(event.target.value)
-              // 内容变了就不再是「已确认」的那一份，按钮要能再点一次
-              setBaselineAccepted(false)
-            }}
-            rows={8}
-            placeholder="把已有 PRD 的 Markdown 全文粘贴到这里…"
-            className="mt-3 w-full rounded-lg border border-slate-200 p-3 font-mono text-xs text-slate-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400"
-          />
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              data-testid="prd-import-confirm"
-              onClick={handleImportPrdAsBaseline}
-              disabled={!importedPrd.trim() || baselineAccepted}
-              className="rounded-lg bg-primary-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-primary-700 disabled:cursor-not-allowed disabled:bg-slate-300"
-            >
-              {baselineAccepted ? '已作为基准 ✓' : '作为基准并继续'}
-            </button>
-            <button
-              type="button"
-              data-testid="prd-import-load"
-              onClick={() => setImportedPrd(prdContent)}
-              disabled={!prdContent.trim()}
-              className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs text-slate-600 transition hover:text-slate-800 disabled:cursor-not-allowed disabled:text-slate-300"
-            >
-              载入当前会话的 PRD
-            </button>
-            <span className="text-xs text-slate-400">{importedPrd.trim().length} 字符</span>
-            {baselineAccepted ? (
-              <span data-testid="prd-baseline-state" className="text-xs text-emerald-600">
-                已作为基准，正在按这个入口往下走（想改内容就再编辑一次上面的文本）。
-              </span>
-            ) : null}
-          </div>
-        </section>
+          ← 返回导入入口
+        </button>
       )}
 
       {load.status === 'ok' && activeDoc && (

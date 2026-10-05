@@ -20,11 +20,12 @@
 | `src/utils/jobStream.ts` | **Job 的 SSE 读取器** `readJobStream()`：`snapshot` / `text_delta` / `phase` / `review` / `run_summary` / `done` / `error` / `[DONE]` |
 | `src/utils/jobViews.ts` | Job 的 `artifact` ↔ 产物 kind / 视图（`api-docs` ↔ `api` 的映射只有这一处） |
 | `src/utils/docMeta.ts` | `DOC_META` / `DOC_ORDER` / `DOC_RUN_TYPES`（从 `App.tsx` 搬出来的**唯一来源**，`jobViews` 也要用） |
+| `src/utils/artifactProgress.ts` | 顶部**产出物**进度条的纯推导 `buildArtifactNodes()`：按 `entryMode` 裁剪格数、按"这份有没有正文"推导 `done`、`active` 按当前屏 |
 | `src/hooks/useGenerationJob.ts` | **四条链路的编排**：`startPrd` / `startApiDocs` / `startPrompts` / `startOptimize`、订阅、刷新重连、abort |
 | `src/types/job.ts` | Job 的前端类型（与后端 `api/jobs.py` 契约一一对应） |
 | `scripts/check-plain-text.mjs` | 离线守卫：拦住"在 JSX 文本里写 `**加粗**`" |
 | `src/components/FormStep.tsx` | 20 题表单：按 `type` 渲染四种控件、必答红星号、高级题折叠、前端校验（`validateForm` 导出给 App 复用） |
-| `src/components/StepProgress.tsx` | 顶部步骤条，5 格，由 `ViewState` 投影 |
+| `src/components/ArtifactProgressBar.tsx` | 顶部**产出物**进度条：一格 = 一份产出物，只有已完成的格子可点。它替换掉了原先的 `StepProgress.tsx`（**流程进度**：一格 = 一个 `ViewState`）；`StepProgress.tsx` 与 `stepsForMode` / `stepIndexOf` 已无人调用，刻意留着以便一键回退 |
 | `src/components/MessageList.tsx` | 消息列表：用户靠右、AI 靠左，AI 正文渲染 Markdown（含 GFM 表格），贴底才自动滚 |
 | `src/components/ChatInput.tsx` | 输入框：Enter 发送、Shift+Enter 换行、输入法组合态不误发、高度自适应 |
 | `src/components/Markdown.tsx` | 对话与文档共用的 Markdown 渲染，样式映射只有这一份 |
@@ -655,7 +656,8 @@ pnpm dev            # http://localhost:5173
 
 必须写完整类名，不能拼 `bg-primary-${shade}`。Tailwind 是扫描源码里的完整类名生成 CSS 的，
 拼接出来的它扫不到，样式会静默消失。`src/components/MessageList.tsx` 的 `MARKDOWN_COMPONENTS`
-和 `src/components/StepProgress.tsx` 里的每一档都是字面量，就是为了这一点。
+和 `src/components/ArtifactProgressBar.tsx`（以及它替换掉的 `src/components/StepProgress.tsx`）
+里的每一档都是字面量，就是为了这一点。
 
 另一个相关陷阱是：构建成功不等于样式生效。没被任何模块 import 的文件根本不在 Vite 的模块图里，
 `pnpm build` 通过证明不了它的类名被生成了（Tailwind 按 `content` 扫源码，与模块图无关）。

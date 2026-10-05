@@ -376,23 +376,54 @@ export interface EntryModeMeta {
 export const ENTRY_MODES: readonly EntryModeMeta[] = [
   {
     id: 'structured',
-    label: '结构化需求入口',
+    label: '从零创建',
     hint: '完整流程：表单 → AI 对话澄清 → PRD → 接口文档 → 提示词',
     steps: ['form', 'chatting', 'review-prd', 'review-api-docs', 'review-prompts'],
   },
   {
     id: 'prd-shortcut',
-    label: 'PRD 快捷入口',
+    label: '导入 PRD',
     hint: '已有 PRD：先 RAG 检索规范与历史示例，再生成接口文档和提示词套件',
     steps: ['review-prd', 'review-api-docs', 'review-prompts'],
   },
   {
     id: 'prompts-debug',
-    label: '提示词调试入口',
+    label: '导入 PRD+接口文档',
     hint: '跳过前置流程，直接生成提示词套件（需要自带 PRD 文本）',
     steps: ['review-prompts'],
   },
 ]
+
+/**
+ * 「表单」这一屏内部的子视图（04 篇）。
+ *
+ * 改造前：三个入口是**一条全局的入口条**，钉在所有屏之上、随时可切，于是新人一进
+ * `/v2` 就要在"从零创建 / 导入 PRD / 导入 PRD+接口文档"之间做一次没有上下文的判断。
+ * 改造后：先在一个**路径选择页**里选一次，再落到专属界面；`viewState === 'form'`
+ * 这一屏按 `formSubView` 分支渲染。
+ *
+ * ⚠️ 四个取值**都在 `viewState === 'form'` 之下**（不是四屏）：
+ * `import-*` 是"表单这一步里的导入向导"，选完、贴完、点「作为基准并继续」之后
+ * 由 `handleImportPrdAsBaseline` 把 `viewState` 抬到 `review-*`，那时子视图自然退场。
+ */
+export type FormSubView = 'chooser' | 'structured' | 'import-prd' | 'import-prompts'
+
+/**
+ * `entryMode` → 该落在哪个子视图（**老会话按它推导，跳过 chooser**）。
+ *
+ * 与 `stepsForMode` 放在一起：两者都是"入口 → 这一屏该长什么样"的映射，
+ * 分两处写迟早漂移。
+ */
+export function formSubViewForEntryMode(mode: EntryMode): FormSubView {
+  switch (mode) {
+    case 'prd-shortcut':
+      return 'import-prd'
+    case 'prompts-debug':
+      return 'import-prompts'
+    default:
+      return 'structured'
+  }
+}
 
 /** 步骤 → 默认落在哪个视图（步骤条点击用）。 */
 export const STEP_VIEW: Record<StepId, ViewState> = {

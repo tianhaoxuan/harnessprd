@@ -187,7 +187,14 @@ export interface DocumentAction {
   key: string
   label: string
   onClick: () => void
-  variant?: 'primary' | 'secondary' | 'danger'
+  /**
+   * 视觉权重，从高到低：`primary` > `secondary` > `link`（`danger` 是与它们正交的语义色）。
+   *
+   * `link` 是给"**次要出口**"用的：它必须存在（否则用户以为流程只剩一条路），
+   * 但它是**绕开主链路**的那一条（例如 PRD 审阅页的「跳过接口文档，直接生成提示词」），
+   * 摆成第二个按钮会让人以为两条路一样正当。
+   */
+  variant?: 'primary' | 'secondary' | 'danger' | 'link'
   disabled?: boolean
   /** 悬停说明；`disabled` 时尤其需要（比如"改过就要二次确认"） */
   title?: string
@@ -309,6 +316,11 @@ const ACTION_VARIANTS: Record<NonNullable<DocumentAction['variant']>, string> = 
     'border border-slate-300 text-slate-700 hover:bg-slate-50 focus-visible:ring-primary-300 disabled:text-slate-400',
   danger:
     'border border-rose-300 text-rose-700 hover:bg-rose-50 focus-visible:ring-rose-300 disabled:text-rose-300',
+  // 文字链：没有边框也没有底色，只剩一行灰字加下划线 —— 与 `primary` 的深色实心块
+  // 一眼就能分开。**保留底座的 `px-3 py-1.5`**：那点内边距是点击热区，去掉它
+  // 在触屏上会很难点中；视觉权重已经由"无边框无底色 + 灰字"拉开了。
+  link:
+    'text-slate-500 underline underline-offset-2 hover:text-slate-800 focus-visible:ring-slate-300 disabled:text-slate-300 disabled:no-underline',
 }
 
 // ---------------------------------------------------------------- 剪贴板
