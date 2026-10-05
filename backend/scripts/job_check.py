@@ -145,7 +145,8 @@ def offline() -> None:
         settings = Settings(sqlite_path=tmp / "jobs.db")
         jobs = JobService(settings)
         sessions = SessionService(settings, jobs=jobs)
-        # 只调会话层的 ensure_ready：它必须把**两张表**都建上（本层的降级判断要读任务表）。
+        # 只调会话层的 ensure_ready：它必须把**三组表**都建上（本层的降级判断要读任务表，
+        # 镜像同步与任务收尾的版本写入要读 documents / document_versions）。
         # 这条断言本身就是需求 §十三.6 的前置条件 —— 少建一张表会在第 N 次保存时才炸。
         sessions.ensure_ready()
 
@@ -416,6 +417,37 @@ def offline() -> None:
             and snap["documents"]["api"].get("approved") is True,
         )
 
+        # ---------- 版本层：生成 Job 完成后写入 v1（02 篇验收标准 1 / 3 / 4） ----------
+        prd_cur = sessions.documents.get_current_version(session_id, "prd")
+        check(
+            "版本层：PRD Job 完成 → v1，且正文与 session_data 镜像**一致**（双写不偏差）",
+            prd_cur is not None
+            and prd_cur.version_no == 1
+            and prd_cur.content == record.draft_content
+            and prd_cur.content == snap["documents"]["prd"]["content"],
+            f"v{prd_cur.version_no if prd_cur else None}",
+        )
+        check(
+            "版本层：source_kind=generate，source_job_id 指向这个任务",
+            prd_cur.source_kind.value == "generate" and prd_cur.source_job_id == prd_job,
+            f"{prd_cur.source_kind.value} / {prd_cur.source_job_id}",
+        )
+        check(
+            "版本层：run_summary 与 review 都写进 metadata（PRD 才有审查环节）",
+            isinstance(prd_cur.metadata().get("run_summary"), dict)
+            and prd_cur.metadata().get("review", {}).get("issues") == [{"detail": "第 2 章太薄"}],
+            "、".join(sorted(prd_cur.metadata())),
+        )
+        _api_cur = sessions.documents.get_current_version(session_id, "api-docs")
+        check(
+            "版本层：会话里先种下的接口文档正文被**迁移**成 import 的 v1（老数据那条路）",
+            _api_cur is not None
+            and _api_cur.version_no == 1
+            and _api_cur.source_kind.value == "import"
+            and _api_cur.content == "旧接口文档",
+            f"v{_api_cur.version_no if _api_cur else None}/{_api_cur.source_kind.value if _api_cur else None}",
+        )
+
         # ---------- 跳过订阅：没人订阅也要跑完（需求 §十三.3） ----------
         solo_job = jobs.create_job(session_id, "prd", {"requirements_summary": {"product_name": "x"}})
         solo_model = _ScriptedModel(drafts=[["# 无人订阅也要跑完"]], reviews=[review_ok])
@@ -505,6 +537,31 @@ def offline() -> None:
         check(
             "失败也清 activeJobId（否则界面永远停在生成中）",
             boom_snap.get("activeJobId") is None and boom_snap.get("viewState") == "review-prd",
+        )
+        # ---------- 版本层：失败但有半成品也要写（02 篇验收标准 5） ----------
+        boom_cur = sessions.documents.get_current_version(session_id, "prd")
+        boom_versions = sessions.documents.list_versions(session_id, "prd")
+        check(
+            "版本层：失败但留下半成品 → 仍然**升新版**（generate），metadata 标 job_status=failed",
+            boom_cur is not None
+            and boom_cur.version_no == len(boom_versions)
+            and boom_cur.version_no > 1
+            and boom_cur.content.startswith("# 半截")
+            and boom_cur.source_kind.value == "generate"
+            and boom_cur.metadata().get("job_status") == "failed",
+            f"v{boom_cur.version_no if boom_cur else None}｜{boom_cur.metadata().get('job_status') if boom_cur else None}",
+        )
+        check(
+            "版本层：失败路径是**追加**而不是就地覆盖 —— 版本号连续、v1 正文一字未动",
+            [item.version_no for item in boom_versions]
+            == list(range(len(boom_versions), 0, -1))
+            and boom_versions[-1].content == record.draft_content,
+            str([item.version_no for item in boom_versions]),
+        )
+        check(
+            "版本层：失败时版本正文与会话镜像**一致**（两条链路用的是同一份草稿）",
+            boom_cur.content == boom_snap["documents"]["prd"]["content"],
+            "一致",
         )
 
         # ---------- 服务重启：遗留 running → failed ----------
@@ -737,6 +794,67 @@ def offline() -> None:
             and after.get("viewState") == "review-prd"
             and after.get("activeJobId") is None,
             f"viewState={after.get('viewState')} activeJobId={after.get('activeJobId')}",
+        )
+        # ---------- 版本层：优化**不升号**（02 篇验收标准 2） ----------
+        opt_cur = sessions.documents.get_current_version(doc_session, "prd")
+        check(
+            "版本层：优化 Job 完成 → current **就地更新**，version_no 不变、不新增版本",
+            opt_cur is not None
+            and opt_cur.version_no == 1
+            and opt_cur.content == opt_record.draft_content
+            and len(sessions.documents.list_versions(doc_session, "prd")) == 1,
+            f"v{opt_cur.version_no if opt_cur else None}｜共 {len(sessions.documents.list_versions(doc_session, 'prd'))} 版",
+        )
+        check(
+            "版本层：优化**不改** source_kind（仍是首版出生时的 import）",
+            opt_cur.source_kind.value == "import",
+            opt_cur.source_kind.value,
+        )
+        check(
+            "版本层：优化把本趟 run_summary 写进 metadata（对照 Job id 能看出是哪一趟）",
+            isinstance(opt_cur.metadata().get("run_summary"), dict)
+            and opt_cur.metadata().get("run_summary") == opt_record.result().get("run_summary"),
+            "、".join(sorted(opt_cur.metadata())),
+        )
+        # 同一 PRD **连续第二次**优化：仍不升号，metadata 的 run_summary 换成最后一次
+        second_payload = dict(optimize_payload)
+        second_payload["document_content"] = opt_record.draft_content
+        second_payload["current_content"] = "## 2. 功能需求\n\n新需求（更细）"
+        second_job = jobs.create_job(doc_session, opt_artifact, second_payload)
+        second_model = _ScriptedModel(
+            drafts=[["## 2. 功能需求", "\n\n", "再细一点"]], reviews=[]
+        )
+        asyncio.run(
+            run_job(
+                second_job,
+                jobs=jobs,
+                sessions=sessions,
+                documents=DocumentService(model=second_model),
+            )
+        )
+        second_record = jobs.get_job(second_job)
+        second_cur = sessions.documents.get_current_version(doc_session, "prd")
+        check(
+            "版本层：**连续两次优化**后 version_no 仍为 1、正文是第二次的结果（验收标准 2）",
+            second_record.status == "completed"
+            and second_cur.version_no == 1
+            and second_cur.content == second_record.draft_content
+            and "再细一点" in second_cur.content
+            and len(sessions.documents.list_versions(doc_session, "prd")) == 1,
+            f"v{second_cur.version_no}｜{second_cur.content[-12:].replace(chr(10), ' ')}｜共 {len(sessions.documents.list_versions(doc_session, 'prd'))} 版",
+        )
+        check(
+            "版本层：metadata.run_summary 是**最后一次**那趟的账（浅合并覆盖同名字段）",
+            second_cur.metadata().get("run_summary") == second_record.result().get("run_summary"),
+            "最后一次",
+        )
+        check(
+            "版本层：两次优化后会话镜像也跟着更新（镜像与 current 一致）",
+            json.loads(sessions.get_session(doc_session).session_data)["documents"]["prd"][
+                "content"
+            ]
+            == second_cur.content,
+            "一致",
         )
         check(
             "优化**不动** `truncated`（那个标记说的是整篇被截断过，与改一节无关）",

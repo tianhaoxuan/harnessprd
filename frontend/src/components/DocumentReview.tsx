@@ -3,6 +3,8 @@ import {
   AlertCircle,
   Check,
   Copy,
+  Eye,
+  History,
   Loader2,
   Lock,
   Pencil,
@@ -201,7 +203,7 @@ export interface OptimizeRequest {
   feedback: string
 }
 
-interface DocumentReviewProps {
+export interface DocumentReviewProps {
   /** 文档名，如「PRD（产品需求文档）」 */
   title: string
   /** 已产出的正文。生成中可以为空（此时看 `streamingContent`） */
@@ -255,6 +257,29 @@ interface DocumentReviewProps {
   warnSlot?: ReactNode
   errorSlot?: ReactNode
   summarySlot?: ReactNode
+
+  /**
+   * ---------- 版本侧栏与预览态（04）----------
+   *
+   * 本组件**不调任何版本接口**：侧栏是调用方拼好的一个 `ReactNode`，
+   * 预览态也只是"三个 prop + 只读"。业务全在
+   * `components/DocumentReviewWithVersions.tsx` 那一层。
+   *
+   * 为什么用插槽而不是让本组件自己认识版本：与上面四个观测插槽同一条理由 ——
+   * 组件要保持纯展示、可离线渲染，后端换版本字段也不用改这里。
+   *
+   * ⚠️ 这五个 prop **全部可选**：不传时渲染出来的 DOM 与改动前**完全一致**
+   * （`generating-*` 那三屏就是这么用的 —— 它们不挂版本侧栏）。
+   */
+  versionPanel?: ReactNode
+  /** 正在预览某一版历史（只读）。`true` 时编辑器不可改、优化入口禁用。 */
+  isPreviewMode?: boolean
+  /** 预览态顶栏的文案，如「预览 v1」。 */
+  previewLabel?: string
+  /** 点「恢复此版本」。不传则不显示那颗按钮。 */
+  onRestorePreview?: () => void
+  /** 恢复请求在途（按钮 loading）。 */
+  isRestoring?: boolean
 }
 
 // ---------------------------------------------------------------- 状态呈现
@@ -340,9 +365,26 @@ export default function DocumentReview({
   warnSlot,
   errorSlot,
   summarySlot,
+  versionPanel,
+  isPreviewMode = false,
+  previewLabel,
+  onRestorePreview,
+  isRestoring = false,
 }: DocumentReviewProps) {
   const isGenerating = status === 'generating'
+  /**
+   * 这一状态**本来**该用哪种主体：`true` 渲染 textarea，`false` 渲染只读 Markdown。
+   * 只看 `status`，与预览无关（预览要的恰恰是"只读的 textarea"，见 `canEditDraft`）。
+   */
   const isEditable = EDITABLE.has(status)
+  /**
+   * 现在**允许改**编辑器里的字吗。
+   *
+   * 预览态下两者会分叉：主体仍是 textarea（需求 §八 明确要"textarea 只读"，
+   * 而不是切成 Markdown 渲染 —— 那样用户就没法对着历史版本原文核对了），
+   * 但它 `readOnly`、也不上报 `onContentChange`。
+   */
+  const canEditDraft = isEditable && !isPreviewMode
 
   /**
    * 编辑中的草稿。
@@ -397,8 +439,8 @@ export default function DocumentReview({
     setSectionIndex((prev) => (prev < sections.length ? prev : 0))
   }, [sections.length])
 
-  const busy = isGenerating || optimizing
-  const edited = isEditable && draft !== baseline
+  const busy = isGenerating || optimizing || isPreviewMode
+  const edited = canEditDraft && draft !== baseline
 
   useEffect(
     () => () => {
@@ -452,16 +494,29 @@ export default function DocumentReview({
     <section
       data-testid="document-review"
       data-status={status}
+      data-preview={isPreviewMode ? 'true' : undefined}
       className={[
         // `min-h-0` + `overflow-hidden`：面板里有一大块可滚动区域（编辑器 / 预览），
         // 少了这两个，内层内容会把面板顶破、盖到下面的兄弟元素上（实测截图确认过）。
-        'flex min-h-0 flex-col gap-3 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm',
+        'flex min-h-0 gap-3 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm',
+        // 有版本侧栏时整体是**一行**（主体 + 窄栏）；没有时还是原来那个纵向排列。
+        versionPanel ? 'flex-row' : 'flex-col',
         className,
       ].join(' ')}
     >
-      {/* ---------- 头部：标题 + 状态 + 工具 ---------- */}
-      <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-slate-100 px-4 py-3">
-        <h2 className="text-base font-medium text-slate-800">{title}</h2>
+      {/*
+        主体那一列。没有版本侧栏时用 `contents` —— 那个 div **不生成盒子**，
+        它的孩子直接成为 `<section>` 的 flex 子项，所以 `generating-*` 那三屏
+        （不传 `versionPanel`）渲染出来的 DOM 与布局和加版本功能之前**完全一致**。
+      */}
+      <div
+        className={
+          versionPanel ? 'flex min-h-0 flex-1 flex-col gap-3' : 'contents'
+        }
+      >
+        {/* ---------- 头部：标题 + 状态 + 工具 ---------- */}
+        <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-slate-100 px-4 py-3">
+          <h2 className="text-base font-medium text-slate-800">{title}</h2>
         <span
           data-testid="document-status"
           className={['rounded px-1.5 py-0.5 text-xs', statusMeta.className].join(' ')}
@@ -478,21 +533,49 @@ export default function DocumentReview({
             已手改
           </span>
         )}
-        {!isEditable && displayText.length > 0 && (
-          <span
-            className="inline-flex items-center gap-1 text-xs text-slate-400"
-            title={
-              status === 'approved'
-                ? '已通过审核，如需修改请先打回'
-                : '生成中 / 失败的内容是只读的'
-            }
-          >
-            <Lock className="h-3 w-3" aria-hidden />
-            只读
-          </span>
-        )}
+          {isPreviewMode && (
+            <span
+              data-testid="document-preview-badge"
+              className="inline-flex items-center gap-1 rounded bg-sky-100 px-1.5 py-0.5 text-xs text-sky-800"
+              title="正在看历史版本；恢复会以它的正文创建一个新版本，历史版本一律保留"
+            >
+              <Eye className="h-3 w-3" aria-hidden />
+              {previewLabel ?? '预览历史版本'}
+              <span className="text-sky-700/80">· 只读</span>
+            </span>
+          )}
+          {!isEditable && !isPreviewMode && displayText.length > 0 && (
+            <span
+              className="inline-flex items-center gap-1 text-xs text-slate-400"
+              title={
+                status === 'approved'
+                  ? '已通过审核，如需修改请先打回'
+                  : '生成中 / 失败的内容是只读的'
+              }
+            >
+              <Lock className="h-3 w-3" aria-hidden />
+              只读
+            </span>
+          )}
 
-        <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex items-center gap-2">
+            {isPreviewMode && onRestorePreview && (
+              <button
+                type="button"
+                data-testid="document-restore"
+                onClick={onRestorePreview}
+                disabled={isRestoring}
+                title="以这一版的正文创建一个新版本并设为当前（不会删改任何历史版本）"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-primary-600 px-2.5 py-1 text-xs font-medium text-white transition hover:bg-primary-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 disabled:cursor-not-allowed disabled:bg-slate-300"
+              >
+                {isRestoring ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                ) : (
+                  <History className="h-3.5 w-3.5" aria-hidden />
+                )}
+                {isRestoring ? '恢复中…' : '恢复此版本'}
+              </button>
+            )}
           <span className="text-xs tabular-nums text-slate-400" title="按非空白字符计">
             {countContentChars(displayText)} 字
           </span>
@@ -565,12 +648,16 @@ export default function DocumentReview({
         </div>
       )}
 
-      {/* ---------- 主体：只读 Markdown / 可编辑 textarea ---------- */}
+      {/* ---------- 主体：只读 Markdown / 可编辑（预览态下是只读的）textarea ---------- */}
       {isEditable ? (
         <textarea
           data-testid="document-editor"
           value={draft}
+          // 预览态：仍然用 textarea（需求 §八 明确要"textarea 只读"），
+          // 这样用户能对着历史版本的**原文**核对，而不是看一份重新排版的 Markdown。
+          readOnly={isPreviewMode}
           onChange={(event) => {
+            if (!canEditDraft) return
             const next = event.target.value
             setDraft(next)
             // 记下"这是我们自己报出去的"，下一次 content 变成这个值时就知道是回显而非新产物
@@ -581,7 +668,12 @@ export default function DocumentReview({
           // `min-h-[12rem]` 而不是更大的值：这是**可以缩小的下限**，不是固定高度。
           // 给太大（比如 24rem）会在窄视口里把面板顶破 —— 内层撑破外层是 flex 的经典坑，
           // 实测在 1200×850 的窗口下就复现了。
-          className="mx-4 min-h-[12rem] flex-1 resize-y rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs leading-relaxed text-slate-800 outline-none transition focus:border-primary-400 focus:ring-2 focus:ring-primary-100"
+          className={[
+            'mx-4 min-h-[12rem] flex-1 resize-y rounded-lg border px-3 py-2 font-mono text-xs leading-relaxed outline-none transition focus:ring-2',
+            isPreviewMode
+              ? 'border-sky-200 bg-sky-50/40 text-slate-700 focus:border-sky-300 focus:ring-sky-100'
+              : 'border-slate-300 bg-white text-slate-800 focus:border-primary-400 focus:ring-primary-100',
+          ].join(' ')}
         />
       ) : (
         <div
@@ -619,7 +711,7 @@ export default function DocumentReview({
           ⚠️ `approved` 时**不给**优化入口：这一状态本身就不可编辑（见 `EDITABLE` 的说明），
           而优化是"改内容"——留着它等于一边说"要改先打回"、一边又开了个改的后门
           （而且优化成功会把"已通过"撤掉，用户会莫名发现通过没了）。 */}
-      {onOptimize && !isGenerating && status !== 'approved' && sections.length > 0 && (
+      {onOptimize && !isGenerating && status !== 'approved' && sections.length > 0 && !isPreviewMode && (
         <div className="mx-4 rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
           <div className="flex flex-wrap items-center gap-2">
             <label
@@ -675,28 +767,37 @@ export default function DocumentReview({
         </div>
       )}
 
-      {/* ---------- 底部自定义操作按钮 ---------- */}
-      {actions.length > 0 && (
-        <footer className="flex flex-wrap items-center gap-2 border-t border-slate-100 px-4 py-3">
-          {actions.map((action) => (
-            <button
-              key={action.key}
-              type="button"
-              data-action={action.key}
-              onClick={action.onClick}
-              // 忙碌时**一律**禁用：生成/优化期间点"通过"会把半截产物审成定稿
-              disabled={busy || action.disabled}
-              title={action.title}
-              className={[
-                'rounded-lg px-3 py-1.5 text-xs font-medium transition focus:outline-none focus-visible:ring-2 disabled:cursor-not-allowed',
-                ACTION_VARIANTS[action.variant ?? 'secondary'],
-              ].join(' ')}
-            >
-              {action.label}
-            </button>
-          ))}
-        </footer>
-      )}
+        {/* ---------- 底部自定义操作按钮 ---------- */}
+        {actions.length > 0 && (
+          <footer className="flex flex-wrap items-center gap-2 border-t border-slate-100 px-4 py-3">
+            {actions.map((action) => (
+              <button
+                key={action.key}
+                type="button"
+                data-action={action.key}
+                onClick={action.onClick}
+                // 忙碌时**一律**禁用：生成/优化期间点"通过"会把半截产物审成定稿。
+                // ⚠️ 预览态也算"忙碌"（04 的判断）：那时编辑器里显示的是**历史正文**，
+                // 而"通过 / 重新生成"作用的却是工作稿 —— 让它们可点会让人以为
+                // 自己刚刚通过的是眼里那一版。要操作就先点侧栏的当前版回到编辑态。
+                disabled={busy || action.disabled}
+                title={action.title}
+                className={[
+                  'rounded-lg px-3 py-1.5 text-xs font-medium transition focus:outline-none focus-visible:ring-2 disabled:cursor-not-allowed',
+                  ACTION_VARIANTS[action.variant ?? 'secondary'],
+                ].join(' ')}
+              >
+                {action.label}
+              </button>
+            ))}
+          </footer>
+        )}
+      </div>
+
+      {/* ---------- 版本历史侧栏（04）----------
+          传进来才渲染。`generating-*` 那三屏不传，所以它们没有侧栏 —— 这是需求
+          §十二 的最后一条（"generating-* 页无版本侧栏"）。 */}
+      {versionPanel}
     </section>
   )
 }

@@ -14,6 +14,7 @@
  */
 
 import type { DocKind, ViewState } from '../types'
+import type { DocumentType } from '../types/document'
 
 /**
  * 三份产物的元信息。
@@ -41,6 +42,15 @@ export const DOC_META: Record<
      * `群聊周报助手-PRD（产品需求文档）.md`，长且啰嗦。
      */
     fileStem: string
+    /**
+     * 这一份产物在**版本接口**里的 `doc_type`。
+     *
+     * ⚠️ 它**不是** `DocKind`：内部视图键是 `api`，而对外的 `doc_type` 是 `api-docs`
+     * （后端 `document_version_repository.DOC_TYPES`）。这张表是这两个名字之间**唯一**
+     * 的映射处 —— 在别处手写 `'api-docs'` 字面量，错了只会表现为"接口文档那一份永远
+     * 没有版本"，而且不会有任何报错。
+     */
+    docType: DocumentType
   }
 > = {
   prd: {
@@ -50,6 +60,7 @@ export const DOC_META: Record<
     generateLabel: '生成 PRD',
     requiresPrd: false,
     fileStem: 'PRD',
+    docType: 'prd',
   },
   api: {
     title: '接口文档',
@@ -58,6 +69,7 @@ export const DOC_META: Record<
     generateLabel: '生成接口文档',
     requiresPrd: true,
     fileStem: '接口文档',
+    docType: 'api-docs',
   },
   prompts: {
     title: '提示词套件',
@@ -66,6 +78,7 @@ export const DOC_META: Record<
     generateLabel: '生成提示词套件',
     requiresPrd: true,
     fileStem: '提示词套件',
+    docType: 'prompts',
   },
 }
 

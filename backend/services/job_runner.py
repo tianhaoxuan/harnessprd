@@ -15,6 +15,22 @@ r"""Generation Job 的 **runner**：把 `document_service` 的生成器跑成后
 （`job_bus.unsubscribe` 不碰 `asyncio.Task`）。这正是需求要的
 "客户端断开 SSE 后，后台 runner 仍继续执行直至完成或失败"。
 
+## 收尾时写两个地方，**顺序不能反**
+
+    任务收尾（完成 / 失败 / 取消）
+      ├─ 1. 文档版本层（`sessions.documents.sync_from_job`）—— 升新版或就地更新 current
+      └─ 2. 会话镜像（`sessions.sync_*`）—— `session_data.documents.<kind>.content`
+
+先版本层、后镜像（需求 §七）：反过来会让刷新后的界面上"侧栏的版本"滞后于
+"编辑器里的正文"，而两者本该是同一次任务的结果。
+
+⚠️ **失败也写**（需求 §3）：只要留下了非空的半成品，版本照样写、metadata 里标
+`job_status=failed`，用户刷新后能看到写到哪了。优化任务的半成品必须是**拼回整篇**的
+结果（`_optimize_partial`），不能是那一节的片段 —— 那会把整篇替换成一段话。
+
+两条写入都是**尽力而为**（`_sync_version` / `_sync_session` 都吞异常只记日志）：
+任务的权威副本在 `generation_jobs` 里，落库失败不该把一个已经跑完的任务判成失败。
+
 ## 事件协议（对外契约）
 
 | 事件 | 载荷 | 什么时候发 |
@@ -76,6 +92,7 @@ from typing import Any
 from core.request_context import get_request_id
 from services.document_plan import DocumentPlanError, build_plan
 from services.document_service import DocumentScope, DocumentService
+from services.document_version_service import DocumentVersionService
 from services.job_bus import publish, publish_stream_end
 from services.job_models import (
     ARTIFACT_DOC_KIND,
@@ -202,6 +219,10 @@ async def run_job(
         jobs.update_job(job_id, status="failed", error="任务被取消（服务关停或显式取消）")
         state.flush(jobs, job_id, force=True)
         if is_optimize_artifact(record.artifact):
+            # 先把 partial 算出来：版本层与镜像用的是**同一个值**，
+            # 在 lambda 里各算一次会拼两遍（`_patched_document` 要重扫整篇）。
+            partial = _optimize_partial(record, state.draft)
+            _sync_version(sessions.documents, record, partial, job_status="failed")
             # 同 `_fail`：优化任务的草稿是"一节"，不能直接写进产物的 *Content
             _sync_session(
                 sessions,
@@ -209,11 +230,12 @@ async def run_job(
                     session_id=record.session_id,
                     job_id=job_id,
                     artifact=record.artifact,
-                    partial=_optimize_partial(record, state.draft),
+                    partial=partial,
                 ),
                 "优化取消",
             )
         else:
+            _sync_version(sessions.documents, record, state.draft, job_status="failed")
             _sync_session(
                 sessions,
                 lambda: sessions.sync_job_failed(
@@ -571,6 +593,9 @@ async def _finish(
         draft_content=content,
         result_json=json.dumps(result, ensure_ascii=False),
     )
+    # 需求 §七 的顺序：**先版本层，再镜像**。反过来会让刷新后的界面上"侧栏的版本"
+    # 滞后于"编辑器里的正文"，而两者本该是同一次任务的结果。
+    _sync_version(sessions.documents, record, content, review=review, summary=summary_payload)
     _sync_session(
         sessions,
         lambda: sessions.sync_job_completed(
@@ -625,6 +650,15 @@ async def _fail(
             {"content": partial or state.draft, "run_summary": summary_payload},
             ensure_ascii=False,
         ),
+    )
+    # 需求 §3：失败但留下了半成品时**也写版本层**（metadata 带 `job_status=failed`）。
+    # 优化路径用拼好的整篇（`partial`，可能为 None）；生成路径用原始草稿。
+    _sync_version(
+        sessions.documents,
+        record,
+        partial if is_optimize_artifact(record.artifact) else state.draft,
+        summary=summary_payload,
+        job_status="failed",
     )
     if is_optimize_artifact(record.artifact):
         _sync_session(
@@ -736,6 +770,7 @@ async def _finish_optimize(
             ensure_ascii=False,
         ),
     )
+    _sync_version(sessions.documents, record, content, summary=summary_payload)
     _sync_session(
         sessions,
         lambda: sessions.sync_optimize_completed(
@@ -787,6 +822,49 @@ def _optimize_partial(record: JobRecord, section_text: str) -> str | None:
     if not isinstance(payload.get("document_content"), str):
         return None
     return _patched_document(record, section_text)
+
+
+def _sync_version(
+    versions: DocumentVersionService,
+    record: JobRecord,
+    content: str | None,
+    *,
+    review: Mapping[str, Any] | None = None,
+    summary: Mapping[str, Any] | None = None,
+    job_status: str | None = None,
+) -> None:
+    """把这次任务的产物写进**文档版本层**（需求 §3）。**尽力而为**。
+
+    与 `_sync_session` 同一条理由：任务的权威副本在 `generation_jobs` 里，
+    版本层是本次新加的对外能力 —— 它出问题不该把一个已经跑完的任务判成失败，
+    也不该让用户看到"生成成功"却什么都没有（草稿仍在 job 表与会话镜像里）。
+
+    `content` 为空时**什么都不做**：版本层也不接受空正文，与其让它抛一下再被吞掉，
+    不如在这里就说清楚。
+
+    ⚠️ 优化任务的 `content` 必须是**拼好的整篇**（`_patched_document` 的产物），
+    **不是那一节的片段** —— 传片段会把整篇文档替换成一段话。
+
+    ⚠️ 失败路径也走它（`job_status="failed"`）：需求 §3 要求"失败但留下了半成品"时
+    仍然写版本，metadata 里标明这一版是残的，用户刷新后能看到写到哪了。
+
+    依赖从 `sessions.documents` 取（不是另开一个参数）：`SessionService` 持有版本层，
+    而 `start_job` 再穿一个参数下去会让自检脚本落进默认库（见 `session_service.__init__`）。
+    """
+    if not content or not content.strip():
+        return
+    try:
+        versions.sync_from_job(
+            session_id=record.session_id,
+            artifact=record.artifact,
+            content=content,
+            job_id=record.id,
+            review=review,
+            run_summary=summary,
+            job_status=job_status,
+        )
+    except Exception:  # noqa: BLE001 - 版本层失败不该毁掉已经跑完的任务
+        logger.exception("任务 %s 写入文档版本层失败（job 表与产物本身不受影响）", record.id)
 
 
 def _sync_session(sessions: SessionService, action: Any, label: str) -> None:

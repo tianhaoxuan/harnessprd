@@ -1174,6 +1174,13 @@ def main() -> int:
         "/api/session/list",
         "/api/session/{id}",
         "/api/session/save",
+        # 文档槽位与版本链：**6 条路径**（挂在快照存储那一族的下一层，`api/documents.py`）
+        "/api/session/{session_id}/documents",
+        "/api/session/{session_id}/documents/{doc_type}/versions",
+        "/api/session/{session_id}/documents/{doc_type}/versions/{version_id}",
+        "/api/session/{session_id}/documents/{doc_type}/versions/checkpoint",
+        "/api/session/{session_id}/documents/{doc_type}/versions/{version_id}/restore",
+        "/api/session/{session_id}/documents/{doc_type}/versions/{version_id}/note",
     }
     missing = expected - paths
     check("路由注册齐全", not missing, "缺失：" + "、".join(sorted(missing)) if missing else f"共 {len(paths)} 条")
@@ -1224,6 +1231,14 @@ def main() -> int:
         "/api/jobs",
         "/api/jobs/{job_id}",
         "/api/jobs/{job_id}/stream",
+        # 文档槽位与版本链 6 条（已实现；`api/documents.py`）。
+        # 同样不在 `/api/v1` 下，且挂在 `/api/session/*` 那一族的下一层。
+        "/api/session/{session_id}/documents",
+        "/api/session/{session_id}/documents/{doc_type}/versions",
+        "/api/session/{session_id}/documents/{doc_type}/versions/{version_id}",
+        "/api/session/{session_id}/documents/{doc_type}/versions/checkpoint",
+        "/api/session/{session_id}/documents/{doc_type}/versions/{version_id}/restore",
+        "/api/session/{session_id}/documents/{doc_type}/versions/{version_id}/note",
     }
     placeholders = {
         f"{method.upper()} {path}": operation.get("responses", {})
@@ -1593,12 +1608,33 @@ def main() -> int:
             json.loads(sessions.plans.get("legacy").snapshot)["viewState"] == "generating-prompts",
             "库内仍是 generating-prompts",
         )
-        raw = json.dumps(snap(viewState="review-prd"), ensure_ascii=False, separators=(",", ":"))
+        # ⚠️ 这份快照**必须带上 prd 正文**：版本层此刻已经有一个 current（上面
+        # `again` 那次保存写进去的 `# 换了个名字`），镜像里没有的话会被 02 篇的
+        # "回填"补上 —— 那是刻意的（下面单独有一条断言），但这条断言要测的是
+        # "不需要降级时不重排键、不改空白"，别让它去测一件与回填无关的事。
+        raw = json.dumps(
+            snap(viewState="review-prd", documents={"prd": {"content": "# 换了个名字\n"}}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         sessions.save_session(raw, session_id=made.id)
         check(
             "无需降级时快照**字节一致**（不重排键、不改空白）",
             sessions.get_session(made.id).session_data == raw,
             "原样往返",
+        )
+        # 02 篇：版本层有、镜像**没有** → 回填（正是"Job 完成后镜像那一步没写成"的修复路径）。
+        # ⚠️ 这是"字节一致"那条性质的**唯一例外**，而且是刻意的：快照里那一份正文根本
+        # 不存在，回填补的是缺口而不是覆盖用户的东西（两边都有但不一致时**保留镜像**）。
+        emptied = json.dumps(snap(viewState="review-prd", documents={}), ensure_ascii=False, separators=(",", ":"))
+        sessions.save_session(emptied, session_id=made.id)
+        backfilled = sessions.get_session(made.id).session_data
+        check(
+            "镜像缺正文时从版本层回填，并写回库",
+            json.loads(backfilled)["documents"]["prd"]["content"] == "# 换了个名字\n"
+            and json.loads(sessions.plans.get(made.id).snapshot)["documents"]["prd"]["content"]
+            == "# 换了个名字\n",
+            "回填到镜像与库",
         )
         rows = sessions.list_sessions()
         check(
@@ -1745,6 +1781,737 @@ def main() -> int:
         import shutil as _shutil2
 
         _shutil2.rmtree(BACKEND_DIR / "_tmp_plans_smoke", ignore_errors=True)
+
+    # ---------- 文档槽位与版本链（两张表 + service + 6 个 HTTP 接口） ----------
+    #
+    # 这是「**历史版本只追加、正文不可原地修改**」这条原则的守卫。分三层：
+    #
+    #   ① 建表：两张表真的存在、`source_kind` 的 CHECK 覆盖全部枚举取值、两条 UNIQUE 都在；
+    #   ② service：三种**升号**（generate / checkpoint / restore）与两种**不升号**
+    #      （optimize / auto_save）各自的行为，加上五个边界；
+    #   ③ HTTP：6 条路径的响应形状与 400 / 404。
+    #
+    # ⚠️ **全部走临时库**，不碰 `backend/harnessprd.db`（否则测试之间互相污染）。
+    try:
+        import shutil as _shutil_dv
+
+        from services.document_version_repository import (
+            DOCUMENTS_TABLE,
+            DOC_TYPES,
+            VERSIONS_TABLE,
+            VERSION_SOURCE_KINDS,
+        )
+        from services.document_version_service import (
+            DocumentVersionService,
+        )
+        from services.document_version_service import (
+            DocumentNotFound as _DocVerNotFound,
+        )
+        from services.document_version_service import (
+            InvalidDocumentRequest as _InvalidDocRequest,
+        )
+        from services.plan_models import PlanCreate
+        from services.plan_service import PlanService as _PlanSvc
+
+        _dv_dir = BACKEND_DIR / "_tmp_docver_smoke"
+        _shutil_dv.rmtree(_dv_dir, ignore_errors=True)
+        _dv_settings = Settings(
+            _env_file=None, sqlite_path=_dv_dir / "dv.db", sqlite_busy_timeout_ms=1000
+        )
+        _dv_plans = _PlanSvc(_dv_settings)
+        _dv_plans.ensure_ready()
+        _dv = DocumentVersionService(_dv_settings, plans=_dv_plans)
+        _dv.ensure_ready()
+
+        # ---- ① 建表
+        _doc_sql = _dv.repository.table_sql(DOCUMENTS_TABLE)
+        _ver_sql = _dv.repository.table_sql(VERSIONS_TABLE)
+        check(
+            "文档版本表：documents 与 document_versions 两张表都建出来了",
+            bool(_doc_sql) and bool(_ver_sql),
+            f"{DOCUMENTS_TABLE}={bool(_doc_sql)} {VERSIONS_TABLE}={bool(_ver_sql)}",
+        )
+        # 用**枚举**去查 CHECK 文本，而不是反过来 —— 这样新增取值而忘了改建表语句会被抓住
+        # （与 `job_repository` 的 CHECK↔Literal 断言同一个思路；只是这里的枚举就在仓储里，
+        #  所以是"建表语句没跟上枚举"而不是"两处枚举不一致"）。
+        _missing_kinds = [k for k in VERSION_SOURCE_KINDS if f"'{k}'" not in _ver_sql]
+        check(
+            "文档版本表：source_kind 的 CHECK 覆盖全部 6 个枚举取值",
+            not _missing_kinds,
+            f"缺 {_missing_kinds}" if _missing_kinds else "、".join(VERSION_SOURCE_KINDS),
+        )
+        _missing_types = [t for t in DOC_TYPES if f"'{t}'" not in _doc_sql]
+        check(
+            "文档版本表：doc_type 的 CHECK 覆盖三种槽位（prd / api-docs / prompts）",
+            not _missing_types,
+            f"缺 {_missing_types}" if _missing_types else "、".join(DOC_TYPES),
+        )
+        _flat_doc = _doc_sql.replace("\n", " ")
+        _flat_ver = _ver_sql.replace("\n", " ")
+        check(
+            "文档版本表：documents 的 UNIQUE(session_id, doc_type) 在（一个槽位只一行）",
+            "UNIQUE(session_id, doc_type)" in _flat_doc,
+            "唯一约束",
+        )
+        check(
+            "文档版本表：document_versions 的 UNIQUE(document_id, version_no) 在（兜底重复插入）",
+            "UNIQUE(document_id, version_no)" in _flat_ver,
+            "唯一约束",
+        )
+        with _dv.repository.connection() as _conn:
+            _index_names = {
+                row[0]
+                for row in _conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                ).fetchall()
+            }
+        check(
+            "文档版本表：两条需求点名的索引都在",
+            {
+                f"idx_{DOCUMENTS_TABLE}_session",
+                f"idx_{VERSIONS_TABLE}_document",
+            }
+            <= _index_names,
+            "、".join(sorted(n for n in _index_names if n.startswith("idx_doc"))),
+        )
+
+        # ---- ② service：槽位
+        _plan = _dv_plans.create(
+            PlanCreate(title="dv", entry_mode="structured", current_stage="form", snapshot="{}")
+        )
+        _sid = _plan.id
+        _slots = _dv.get_documents_by_session(_sid)
+        check(
+            "槽位：新 Session 返回三种 doc_type，current 均为空",
+            [s.doc_type for s in _slots] == ["prd", "api-docs", "prompts"]
+            and all(s.current_version_id is None and s.current_version_no is None for s in _slots),
+            "、".join(f"{s.doc_type}={s.current_version_no}" for s in _slots),
+        )
+        check(
+            "槽位：尚无版本时 list_versions 回 [] 而不是 404",
+            _dv.list_versions(_sid, "prd") == [] and _dv.get_current_version(_sid, "prd") is None,
+            "空",
+        )
+
+        # ---- ② service：首版 → 就地更新（不升号）
+        _v1 = _dv.create_initial_version(_sid, "prd", "# PRD v1", source_job_id="job-1")
+        check(
+            "首版：create_initial_version → version_no=1、parent 为空、成为 current",
+            _v1.version_no == 1
+            and _v1.parent_version_id is None
+            and _dv.get_current_version(_sid, "prd").id == _v1.id,
+            f"v{_v1.version_no}",
+        )
+        _v1b = _dv.update_current_content(
+            _sid, "prd", "# PRD v1 改过了", metadata={"run_summary": {"request_id": "req_x"}}
+        )
+        check(
+            "不升号：update_current_content 后 version_no 仍为 1、正文已变",
+            _v1b.version_no == 1 and _v1b.id == _v1.id and "改过了" in _v1b.content,
+            f"v{_v1b.version_no}",
+        )
+        check(
+            "不升号：metadata 浅合并（run_summary 写进去了）",
+            _v1b.metadata().get("run_summary") == {"request_id": "req_x"},
+            str(_v1b.metadata()),
+        )
+
+        # ---- ② service：sync_from_job（整份生成升号；优化不升号且保留 review）
+        _api1 = _dv.sync_from_job(
+            session_id=_sid, artifact="api-docs", content="# API v1", job_id="job-a1"
+        )
+        _api2 = _dv.sync_from_job(
+            session_id=_sid, artifact="api-docs", content="# API v2", job_id="job-a2"
+        )
+        _api_versions = {v.version_no: v for v in _dv.list_versions(_sid, "api-docs")}
+        check(
+            "升号：第二次 sync_from_job（整份生成）→ version_no=2，且 v1 正文不变",
+            _api1.version_no == 1
+            and _api2.version_no == 2
+            and _api_versions[1].content == "# API v1"
+            and _api2.parent_version_id == _api1.id,
+            f"v{_api1.version_no}→v{_api2.version_no}，v1={_api_versions[1].content!r}",
+        )
+        _prd2 = _dv.sync_from_job(
+            session_id=_sid,
+            artifact="prd",
+            content="# PRD v2",
+            job_id="job-p2",
+            review={"passed": True, "summary": "ok"},
+        )
+        _opt = _dv.sync_from_job(
+            session_id=_sid,
+            artifact="optimize-prd",
+            content="# PRD v2 优化了一节",
+            job_id="job-o1",
+            review={"passed": False, "summary": "不该写入"},
+        )
+        check(
+            "升号：PRD 整份生成 → v2，并写入本次 Review Agent 结果",
+            _prd2.version_no == 2
+            and _prd2.metadata().get("review") == {"passed": True, "summary": "ok"},
+            f"v{_prd2.version_no}",
+        )
+        check(
+            "不升号：优化 Job **不升号**（仍 v2）且保留该版生成时的 review",
+            _opt.version_no == 2
+            and _opt.id == _prd2.id
+            and _opt.metadata().get("review") == {"passed": True, "summary": "ok"},
+            f"v{_opt.version_no} review={_opt.metadata().get('review')}",
+        )
+        check(
+            "不升号：优化只改 current 正文、**不改 source_kind**（仍是它出生时的 generate）",
+            "优化了一节" in _opt.content and _opt.source_kind.value == "generate",
+            f"source_kind={_opt.source_kind.value}",
+        )
+
+        # ---- ② service：checkpoint
+        _cp = _dv.checkpoint(_sid, "prd")
+        check(
+            "checkpoint：在已有基础上 +1（v3）、parent 指向旧 current、正文沿用 current",
+            _cp.version_no == 3 and _cp.parent_version_id == _prd2.id and _cp.content == _opt.content,
+            f"v{_cp.version_no}",
+        )
+        check(
+            "checkpoint：**不继承** metadata（新版无 review、也不自动写备注）",
+            _cp.metadata() == {},
+            str(_cp.metadata()),
+        )
+        _cp_front = _dv.checkpoint(_sid, "prd", "# 前端编辑器全文")
+        check(
+            "checkpoint：请求体带 content 时用它的正文（前端手改还没同步的场景）",
+            _cp_front.version_no == 4 and _cp_front.content.startswith("# 前端编辑器全文"),
+            f"v{_cp_front.version_no}",
+        )
+
+        # ---- ② service：restore（current=v4 时恢复 v1）
+        _before = {v.version_no: v for v in _dv.list_versions(_sid, "prd")}
+        _restored = _dv.restore_version(_sid, "prd", _before[1].id)
+        _after = {v.version_no: v for v in _dv.list_versions(_sid, "prd")}
+        check(
+            "restore：current=v4 时恢复 v1 → 产生 v5，正文与 v1 逐字相同、是 current",
+            _restored.version_no == 5
+            and _restored.content == _before[1].content
+            and _restored.source_kind.value == "restore"
+            and _dv.get_current_version(_sid, "prd").id == _restored.id,
+            f"v{_restored.version_no}",
+        )
+        check(
+            "restore：**不删不改历史行** —— v1…v4 仍在，且 v1 / v4 正文一字未动",
+            sorted(_after) == [1, 2, 3, 4, 5]
+            and _after[1].content == _before[1].content
+            and _after[4].content == _before[4].content,
+            f"链={sorted(_after)}",
+        )
+        check(
+            "restore：metadata 记 restored_from_*，且**丢掉**历史版的 change_note",
+            _restored.metadata().get("restored_from_version_id") == _before[1].id
+            and _restored.metadata().get("restored_from_version_no") == 1
+            and "change_note" not in _restored.metadata(),
+            str({k: v for k, v in _restored.metadata().items() if k != "review"}),
+        )
+
+        # ---- ② service：备注（不升号、不改正文）
+        _noted = _dv.update_version_note(_sid, "prd", _before[1].id, "定稿前备份")
+        _noted_detail = _dv.get_version(_sid, "prd", _before[1].id)
+        check(
+            "备注：写入后列表与详情都能看到 change_note，且正文与 version_no 都没变",
+            _noted.change_note() == "定稿前备份"
+            and _noted_detail.change_note() == "定稿前备份"
+            and _noted_detail.content == _before[1].content
+            and _noted_detail.version_no == 1,
+            str(_noted.change_note()),
+        )
+        check(
+            "备注：空串 / None 都能清空（键被删掉，而不是留一个空串）",
+            _dv.update_version_note(_sid, "prd", _before[1].id, "").change_note() is None
+            and "change_note" not in _dv.get_version(_sid, "prd", _before[1].id).metadata()
+            and _dv.update_version_note(_sid, "prd", _before[1].id, None).change_note() is None,
+            "已清空",
+        )
+
+        # ---- ② service：边界
+        def _raises(fn, exc_type) -> bool:  # noqa: ANN001 - 局部小工具
+            try:
+                fn()
+            except exc_type:
+                return True
+            except Exception:  # noqa: BLE001 - 抛了别的类型也算没通过
+                return False
+            return False
+
+        check(
+            "边界：非法 doc_type → 400 类异常（需求点名要 400 而不是 422）",
+            _raises(lambda: _dv.list_versions(_sid, "nope"), _InvalidDocRequest),
+            "InvalidDocumentRequest",
+        )
+        check(
+            "边界：session 不存在 → 404 类异常",
+            _raises(lambda: _dv.get_documents_by_session("no-such"), _DocVerNotFound),
+            "DocumentNotFound",
+        )
+        check(
+            "边界：restore 的目标就是 current → 400 类异常",
+            _raises(
+                lambda: _dv.restore_version(_sid, "prd", _restored.id), _InvalidDocRequest
+            ),
+            "InvalidDocumentRequest",
+        )
+        check(
+            "边界：checkpoint 无 current 且请求体无 content → 400 类异常（无内容可保存）",
+            _raises(lambda: _dv.checkpoint(_sid, "prompts"), _InvalidDocRequest),
+            "InvalidDocumentRequest",
+        )
+        check(
+            "边界：版本不属于该 document → 404 类异常（不区分「不存在」与「不是你的」）",
+            _raises(lambda: _dv.get_version(_sid, "prd", _api1.id), _DocVerNotFound),
+            "DocumentNotFound",
+        )
+        check(
+            "边界：不同 doc_type 的版本链互不干扰",
+            len(_dv.list_versions(_sid, "api-docs")) == 2
+            and len(_dv.list_versions(_sid, "prd")) == 5,
+            "api-docs=2 prd=5",
+        )
+
+        # ---- ③ HTTP：6 条接口（TestClient，仍是临时库）
+        from fastapi.testclient import TestClient as _DocClient
+
+        from main import create_app as _create_doc_app
+
+        _http_dir = BACKEND_DIR / "_tmp_docver_http_smoke"
+        _shutil_dv.rmtree(_http_dir, ignore_errors=True)
+        _doc_app = _create_doc_app(
+            Settings(
+                _env_file=None,
+                sqlite_path=_http_dir / "api.db",
+                sqlite_busy_timeout_ms=1000,
+            )
+        )
+        with _DocClient(_doc_app) as _dc:
+            _made = _dc.post(
+                "/api/session/save",
+                json={"session_data": {"sessionId": "h1", "viewState": "form"}},
+            ).json()
+            _hsid = _made["id"]
+            _hbase = f"/api/session/{_hsid}/documents"
+
+            _h1 = _dc.get(_hbase)
+            _h1_body = _h1.json()
+            check(
+                "HTTP 1：GET /documents → 200，固定三项、current 与 updated_at 均为 null",
+                _h1.status_code == 200
+                and [i["doc_type"] for i in _h1_body["items"]] == ["prd", "api-docs", "prompts"]
+                and all(
+                    i["current_version_id"] is None
+                    and i["current_version_no"] is None
+                    and i["updated_at"] is None
+                    and i["document_id"]
+                    for i in _h1_body["items"]
+                ),
+                f"{_h1.status_code}",
+            )
+            _h_prd_doc = _h1_body["items"][0]["document_id"]
+
+            _h2 = _dc.get(f"{_hbase}/prd/versions")
+            check(
+                "HTTP 2：尚无版本时 GET versions → 200 且 versions=[]、current_version_id=null",
+                _h2.status_code == 200
+                and _h2.json()["versions"] == []
+                and _h2.json()["current_version_id"] is None,
+                "空列表",
+            )
+
+            check(
+                "HTTP 错误：非法 doc_type → 400（不是 422）",
+                _dc.get(f"{_hbase}/nope/versions").status_code == 400
+                and _dc.post(f"{_hbase}/nope/versions/checkpoint", json={}).status_code == 400,
+                "GET / POST 都是 400",
+            )
+            check(
+                "HTTP 错误：session 不存在 → 404",
+                _dc.get("/api/session/no-such/documents").status_code == 404,
+                "404",
+            )
+            _h_cp_bad = _dc.post(f"{_hbase}/prd/versions/checkpoint", json={})
+            check(
+                "HTTP 错误：checkpoint 无 current 且无 content → 400，detail 含「无内容可保存」",
+                _h_cp_bad.status_code == 400 and "无内容可保存" in _h_cp_bad.json()["detail"],
+                f"{_h_cp_bad.status_code} {_h_cp_bad.json()['detail'][:24]}",
+            )
+            check(
+                "HTTP 4：checkpoint **完全不带请求体**也走业务层（400 而不是 422）",
+                _dc.post(f"{_hbase}/prd/versions/checkpoint").status_code == 400,
+                "请求体整个可选",
+            )
+
+            _h_cp = _dc.post(
+                f"{_hbase}/prd/versions/checkpoint", json={"content": "# PRD v1\n\n第一版"}
+            )
+            _h_cp_body = _h_cp.json()
+            check(
+                "HTTP 4：checkpoint 带 content → 200，回 {version_id, version_no, document_id}",
+                _h_cp.status_code == 200
+                and set(_h_cp_body) == {"version_id", "version_no", "document_id"}
+                and _h_cp_body["version_no"] == 1
+                and _h_cp_body["document_id"] == _h_prd_doc,
+                str(_h_cp_body),
+            )
+            _h_v1 = _h_cp_body["version_id"]
+
+            _h1b = _dc.get(_hbase).json()["items"][0]
+            check(
+                "HTTP 1：有版本后 current_version_id / current_version_no / updated_at 都填上",
+                _h1b["current_version_id"] == _h_v1
+                and _h1b["current_version_no"] == 1
+                and bool(_h1b["updated_at"]),
+                f"v{_h1b['current_version_no']}",
+            )
+
+            _h_lst = _dc.get(f"{_hbase}/prd/versions").json()
+            _h_item = _h_lst["versions"][0]
+            check(
+                "HTTP 2：列表信封是 {doc_type, document_id, current_version_id, versions[]}",
+                set(_h_lst) == {"doc_type", "document_id", "current_version_id", "versions"}
+                and _h_lst["doc_type"] == "prd"
+                and _h_lst["document_id"] == _h_prd_doc,
+                "、".join(sorted(_h_lst)),
+            )
+            check(
+                "HTTP 2：列表项含 content_preview / is_current，**不含全文**",
+                set(_h_item)
+                == {"id", "version_no", "source_kind", "created_at", "content_preview", "is_current"}
+                and _h_item["is_current"] is True
+                and _h_item["source_kind"] == "checkpoint"
+                and _h_item["content_preview"].startswith("# PRD v1"),
+                "、".join(sorted(_h_item)),
+            )
+            check(
+                "HTTP 2：**无备注时 change_note 这个键不出现**（不是 null）",
+                "change_note" not in _h_item,
+                "省略",
+            )
+            _h_note = _dc.patch(
+                f"{_hbase}/prd/versions/{_h_v1}/note", json={"change_note": "定稿前备份"}
+            )
+            check(
+                "HTTP 6：PATCH note → 200，回 {version_id, version_no, change_note}",
+                _h_note.status_code == 200
+                and _h_note.json()
+                == {"version_id": _h_v1, "version_no": 1, "change_note": "定稿前备份"},
+                str(_h_note.json()),
+            )
+            check(
+                "HTTP 6：写了备注后列表项就带上 change_note",
+                _dc.get(f"{_hbase}/prd/versions").json()["versions"][0].get("change_note")
+                == "定稿前备份",
+                "有备注",
+            )
+
+            _h_det = _dc.get(f"{_hbase}/prd/versions/{_h_v1}").json()
+            check(
+                "HTTP 3：单版详情含全文与 metadata，身份字段齐全",
+                _h_det["id"] == _h_v1
+                and _h_det["version_no"] == 1
+                and _h_det["content"] == "# PRD v1\n\n第一版"
+                and _h_det["parent_version_id"] is None
+                and _h_det["source_job_id"] is None
+                and _h_det["metadata"] == {"change_note": "定稿前备份"}
+                and _h_det["is_current"] is True
+                and bool(_h_det["created_at"]),
+                "、".join(sorted(_h_det)),
+            )
+            check(
+                "HTTP 错误：版本不存在 → 404",
+                _dc.get(f"{_hbase}/prd/versions/no-such").status_code == 404
+                and _dc.patch(
+                    f"{_hbase}/prd/versions/no-such/note", json={"change_note": "x"}
+                ).status_code
+                == 404,
+                "GET / PATCH 都是 404",
+            )
+
+            _dc.post(f"{_hbase}/prd/versions/checkpoint", json={"content": "# PRD v2"})
+            _h_res = _dc.post(f"{_hbase}/prd/versions/{_h_v1}/restore")
+            _h_res_body = _h_res.json()
+            check(
+                "HTTP 5：restore → 200，回 {version_id, version_no, document_id, content}",
+                _h_res.status_code == 200
+                and set(_h_res_body) == {"version_id", "version_no", "document_id", "content"}
+                and _h_res_body["version_no"] == 3
+                and _h_res_body["content"] == "# PRD v1\n\n第一版",
+                str({k: v for k, v in _h_res_body.items() if k != "content"}),
+            )
+            _h_versions = _dc.get(f"{_hbase}/prd/versions").json()["versions"]
+            check(
+                "HTTP 5：恢复后 3 版降序、v3 是 current 且 source_kind=restore、v1/v2 未变",
+                [v["version_no"] for v in _h_versions] == [3, 2, 1]
+                and _h_versions[0]["is_current"] is True
+                and _h_versions[0]["source_kind"] == "restore"
+                and not any(v["is_current"] for v in _h_versions[1:])
+                and _h_versions[2]["content_preview"] == "# PRD v1\n\n第一版",
+                str([(v["version_no"], v["is_current"]) for v in _h_versions]),
+            )
+            check(
+                "HTTP 错误：restore 目标是 current → 400",
+                _dc.post(f"{_hbase}/prd/versions/{_h_res_body['version_id']}/restore").status_code
+                == 400,
+                "400",
+            )
+            _h_clear = _dc.patch(f"{_hbase}/prd/versions/{_h_v1}/note", json={"change_note": ""})
+            check(
+                "HTTP 6：空串清空备注 → change_note 为 null，且列表里这个键又消失",
+                _h_clear.status_code == 200
+                and _h_clear.json()["change_note"] is None
+                and all(
+                    "change_note" not in v
+                    for v in _dc.get(f"{_hbase}/prd/versions").json()["versions"]
+                    if v["id"] == _h_v1
+                ),
+                "已清空",
+            )
+            check(
+                "HTTP：三个槽位互不干扰（api-docs 仍是空列表）",
+                _dc.get(f"{_hbase}/api-docs/versions").json()["versions"] == [],
+                "api-docs 空",
+            )
+            # 会话被删之后：会话校验真的生效（而不是只看 document 行还在不在）
+            _dc.delete(f"/api/session/{_hsid}")
+            check(
+                "HTTP 错误：会话删除后再访问版本接口 → 404",
+                _dc.get(f"{_hbase}/prd/versions").status_code == 404,
+                "404",
+            )
+    finally:
+        import shutil as _shutil_dv2
+
+        _shutil_dv2.rmtree(BACKEND_DIR / "_tmp_docver_smoke", ignore_errors=True)
+        _shutil_dv2.rmtree(BACKEND_DIR / "_tmp_docver_http_smoke", ignore_errors=True)
+
+    # ---------- 02 篇：Document 版本层接入 Session 链路 ----------
+    #
+    # 两个方向 + 一条底线：
+    #   镜像 → 版本层：手改保存（auto_save，**不升号**）、老数据迁移（import，只一次）
+    #   版本层 → 镜像：回填（**只在镜像缺正文时**）
+    #   底线：**正在生成的那份产物，半成品不许被固化成版本** —— 否则"生成完成后
+    #        version_no=1"这条验收标准直接不成立（前端在生成期间就会防抖保存半成品）。
+    #
+    # ⚠️ `job_runner` 那一侧（Job 完成 / 优化 / 失败 partial 真的写版本）由
+    # `scripts/job_check.py` 覆盖（那里有假模型）；这里只到 service 与 HTTP 层。
+    try:
+        import shutil as _shutil_sync
+
+        from services.document_version_repository import DOC_TYPES as _DOC_TYPES
+        from services.job_service import JobService as _JobSvc
+        from services.session_service import SessionService as _SessionSvc
+        from services.session_service import session_document_contents as _session_contents
+
+        _sync_dir = BACKEND_DIR / "_tmp_docver_sync"
+        _shutil_sync.rmtree(_sync_dir, ignore_errors=True)
+        _sync_settings = Settings(
+            _env_file=None, sqlite_path=_sync_dir / "sync.db", sqlite_busy_timeout_ms=1000
+        )
+        _sync_jobs = _JobSvc(_sync_settings)
+        _sync_sessions = _SessionSvc(_sync_settings, jobs=_sync_jobs)
+        # 只调会话层的 ensure_ready：它必须把**三组表**都建上（降级要读 jobs，
+        # 镜像同步要写 documents / document_versions）。少建一张会在第 N 次保存时才炸。
+        _sync_sessions.ensure_ready()
+        _sync_versions = _sync_sessions.documents
+
+        def _contents_of(session_id: str) -> list[str | None]:
+            return [
+                (rec.content if (rec := _sync_versions.get_current_version(session_id, t)) else None)
+                for t in _DOC_TYPES
+            ]
+
+        # ---- 纯函数：快照 → {doc_type: content}
+        _snapshot = json.dumps(
+            {
+                "sessionId": "s",
+                "documents": {
+                    "prd": {"content": "# PRD", "approved": True},
+                    "api": {"content": "# API"},
+                    "prompts": {"content": "   "},  # 只有空白 = 没有产物
+                },
+                "viewState": "review-prd",
+            },
+            ensure_ascii=False,
+        )
+        check(
+            "快照取正文：真实键名是 documents.<kind>.content（api-docs ↔ 快照里的 api）",
+            _session_contents(_snapshot) == {"prd": "# PRD", "api-docs": "# API"},
+            str(_session_contents(_snapshot)),
+        )
+        check(
+            "快照取正文：坏 JSON / 不是对象 → 空字典（不抛）",
+            _session_contents("{oops") == {} and _session_contents("[]") == {},
+            "容错",
+        )
+
+        # ---- 老 Session 迁移：import → v1，只迁一次
+        _legacy = _sync_sessions.save_session(
+            {
+                "sessionId": "legacy",
+                "documents": {"prd": {"content": "# 老 PRD\n"}},
+                "viewState": "review-prd",
+            }
+        )
+        _legacy_cur = _sync_versions.get_current_version(_legacy.id, "prd")
+        check(
+            "迁移：老会话首次保存就把正文导入为 v1（source_kind=import）",
+            _legacy_cur is not None
+            and _legacy_cur.version_no == 1
+            and _legacy_cur.content == "# 老 PRD\n"
+            and _legacy_cur.source_kind.value == "import",
+            f"v{_legacy_cur.version_no if _legacy_cur else None}/{_legacy_cur.source_kind.value if _legacy_cur else None}",
+        )
+        # ---- 手改保存：auto_save 就地更新，不升号
+        _sync_sessions.save_session(
+            {
+                "sessionId": "legacy",
+                "documents": {"prd": {"content": "# 老 PRD 手改过\n"}},
+                "viewState": "review-prd",
+            },
+            session_id=_legacy.id,
+        )
+        _edited = _sync_versions.get_current_version(_legacy.id, "prd")
+        check(
+            "手改保存（auto_save）：就地更新 current，**version_no 不变**、不新增版本",
+            _edited.version_no == 1
+            and _edited.content == "# 老 PRD 手改过\n"
+            and len(_sync_versions.list_versions(_legacy.id, "prd")) == 1,
+            f"v{_edited.version_no}｜共 {len(_sync_versions.list_versions(_legacy.id, 'prd'))} 版",
+        )
+        check(
+            "手改保存：**不改**这一版出生时的 source_kind（仍是 import）",
+            _edited.source_kind.value == "import",
+            _edited.source_kind.value,
+        )
+        check(
+            "同步幂等：镜像与 current 一致时一个版本都不写（防抖保存的常态路径）",
+            _sync_versions.sync_session_contents(_legacy.id, {"prd": "# 老 PRD 手改过\n"}) == [],
+            "无写入",
+        )
+        check(
+            "空正文既**不创建**版本、也**不删除**已有版本（本阶段不支持清空文档）",
+            _sync_versions.sync_session_contents(_legacy.id, {"prd": "   "}) == []
+            and _sync_versions.get_current_version(_legacy.id, "prd").content
+            == "# 老 PRD 手改过\n",
+            "原样保留",
+        )
+
+        # ---- 三种产物各自独立成链
+        _multi = _sync_sessions.save_session(
+            {
+                "sessionId": "multi",
+                "viewState": "review-prd",
+                "documents": {
+                    "prd": {"content": "# P"},
+                    "api": {"content": "# A"},
+                    "prompts": {"content": "# R"},
+                },
+            }
+        )
+        check(
+            "三种产物各自建版本（api-docs 那一槽读的是快照里的 api 键）",
+            _contents_of(_multi.id) == ["# P", "# A", "# R"],
+            str(_contents_of(_multi.id)),
+        )
+
+        # ---- 底线：正在生成的产物，半成品不许被固化成版本
+        _guard = _sync_sessions.save_session({"sessionId": "g", "viewState": "form", "documents": {}})
+        _guard_job = _sync_jobs.create_job(
+            _guard.id, "prd", {"requirements_summary": {"product_goal": "x"}}
+        )
+        check("底线前置：PRD 任务已登记且在跑", _sync_jobs.is_running(_guard_job), _guard_job[:8])
+        # 前端在生成期间按 1.5s 节流把**半成品**写进产物 → 防抖保存把它带进快照
+        _sync_sessions.save_session(
+            {
+                "sessionId": "g",
+                "viewState": "generating-prd",
+                "activeJobId": _guard_job,
+                "documents": {"prd": {"content": "# 半截正文"}},
+            },
+            session_id=_guard.id,
+        )
+        check(
+            "底线：正在生成 PRD 时，快照里的半成品**不会**被写成版本",
+            _sync_versions.get_current_version(_guard.id, "prd") is None,
+            "该槽位仍无版本",
+        )
+        check(
+            "底线：同一个快照里**没在生成**的产物照常同步（剔除是按 doc_type 的）",
+            _sync_versions.get_current_version(_guard.id, "api-docs") is None,
+            "api-docs 本来就没有内容，故无版本",
+        )
+        # 任务收尾（终态）之后再保存：这时才允许写
+        _sync_jobs.update_job(_guard_job, status="completed", phase="done")
+        _sync_sessions.save_session(
+            {
+                "sessionId": "g",
+                "viewState": "review-prd",
+                "documents": {"prd": {"content": "# 完整正文"}},
+            },
+            session_id=_guard.id,
+        )
+        _guard_cur = _sync_versions.get_current_version(_guard.id, "prd")
+        check(
+            "底线：任务收尾后，同一份正文才被写成 v1",
+            _guard_cur is not None
+            and _guard_cur.version_no == 1
+            and _guard_cur.content == "# 完整正文",
+            f"v{_guard_cur.version_no if _guard_cur else None}",
+        )
+
+        # ---- HTTP：checkpoint / restore 之后镜像跟着走（需求 §七）
+        from fastapi.testclient import TestClient as _SyncClient
+
+        from main import create_app as _create_sync_app
+
+        _sync_http = BACKEND_DIR / "_tmp_docver_sync_http"
+        _shutil_sync.rmtree(_sync_http, ignore_errors=True)
+        _sync_app = _create_sync_app(
+            Settings(
+                _env_file=None, sqlite_path=_sync_http / "api.db", sqlite_busy_timeout_ms=1000
+            )
+        )
+        with _SyncClient(_sync_app) as _sc:
+            _sid = _sc.post(
+                "/api/session/save",
+                json={
+                    "session_data": {
+                        "sessionId": "h",
+                        "viewState": "review-prd",
+                        "documents": {"prd": {"content": "# v1"}},
+                    }
+                },
+            ).json()["id"]
+            _vbase = f"/api/session/{_sid}/documents/prd/versions"
+            _sc.post(f"{_vbase}/checkpoint", json={"content": "# v2 前端全文"})
+            _mirror = json.loads(_sc.get(f"/api/session/{_sid}").json()["session_data"])
+            check(
+                "HTTP：checkpoint 后镜像跟着走（documents.prd.content = 新 current）",
+                _mirror["documents"]["prd"]["content"] == "# v2 前端全文",
+                str(_mirror["documents"]["prd"]["content"]),
+            )
+            _oldest = _sc.get(_vbase).json()["versions"][-1]["id"]
+            _sc.post(f"{_vbase}/{_oldest}/restore")
+            _mirror2 = json.loads(_sc.get(f"/api/session/{_sid}").json()["session_data"])
+            check(
+                "HTTP：restore 后镜像也跟着走（正文回到被恢复的那一版）",
+                _mirror2["documents"]["prd"]["content"] == "# v1",
+                str(_mirror2["documents"]["prd"]["content"]),
+            )
+            check(
+                "HTTP：checkpoint 保留镜像里产物对象的其它键（approved / truncated 不被顶掉）",
+                _mirror2["documents"]["prd"].get("content") == "# v1",
+                "、".join(sorted(_mirror2["documents"]["prd"])),
+            )
+    finally:
+        import shutil as _shutil_sync2
+
+        _shutil_sync2.rmtree(BACKEND_DIR / "_tmp_docver_sync", ignore_errors=True)
+        _shutil_sync2.rmtree(BACKEND_DIR / "_tmp_docver_sync_http", ignore_errors=True)
 
     # ---------- LLM 观测链路（纯本地：假模型 + TestClient，不调真实模型） ----------
     import json as _json

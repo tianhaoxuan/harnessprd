@@ -17,6 +17,7 @@ from fastapi import Depends, Request
 from core.config import Settings, get_settings
 from services.conversation_service import ConversationService
 from services.document_service import DocumentService
+from services.document_version_service import DocumentVersionService
 from services.job_service import JobService
 from services.session_service import SessionService
 
@@ -57,8 +58,24 @@ def get_session_service(request: Request) -> SessionService:
     return SessionService()
 
 
+def get_document_version_service(request: Request) -> DocumentVersionService:
+    """文档槽位与版本链业务层。
+
+    ⚠️ 与 `get_session_service` / `get_job_service` 同一条理由：**优先取
+    `app.state.document_version_service`**，否则 `create_app(settings)` 造的临时库会被绕过
+    （`get_settings()` 是进程级单例），测试于是写到默认的 `backend/harnessprd.db` 上。
+    """
+    service = getattr(request.app.state, "document_version_service", None)
+    if isinstance(service, DocumentVersionService):
+        return service
+    return DocumentVersionService()
+
+
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 ConversationServiceDep = Annotated[ConversationService, Depends(get_conversation_service)]
 DocumentServiceDep = Annotated[DocumentService, Depends(get_document_service)]
+DocumentVersionServiceDep = Annotated[
+    DocumentVersionService, Depends(get_document_version_service)
+]
 JobServiceDep = Annotated[JobService, Depends(get_job_service)]
 SessionServiceDep = Annotated[SessionService, Depends(get_session_service)]

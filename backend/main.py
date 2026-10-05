@@ -21,11 +21,14 @@
     /api/v1/conversation/*   对话阶段：题目下发（**已实现**）、流式回复与产物生成（**已实现**）
     /api/v1/sessions/*       会话生命周期 / 表单草稿 / 事件（唯一变更入口）/ 文档 / 对话历史（占位，501）
     /api/session/*           会话**快照存储**：list / {id} / save / delete（**已实现**，4 条）
+    /api/session/{id}/documents/*  文档槽位与**版本链**：槽位摘要 / 版本列表 / 单版详情 /
+                             checkpoint / restore / 备注（**已实现**，6 条）
     /api/jobs/*              生成任务（Generation Job）：创建 / 快照 / 订阅 SSE（**已实现**，3 条）
     /api/v1/config           运行配置（占位，501）
 
 ⚠️ `/api/session/*` **刻意不带版本前缀**：路径是需求给定的，而它与 `/api/v1/sessions/*`
 那组不是一回事（一组是"存整份工作台快照"，一组是设计里的状态机接口面）。见 `api/session.py`。
+文档版本接口（`api/documents.py`）挂在同一族的下一层，理由相同。
 """
 
 from __future__ import annotations
@@ -37,6 +40,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.documents import (
+    document_not_found_handler,
+    invalid_document_request_handler,
+)
+from api.documents import router as documents_router
 from api.health import router as health_router
 from api.jobs import router as jobs_router
 from api.router import api_router
@@ -46,6 +54,11 @@ from core.config import Settings, get_settings
 from core.logging import configure_logging
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from services.document_version_service import (
+    DocumentNotFound,
+    DocumentVersionService,
+    InvalidDocumentRequest,
+)
 from services.job_runner import shutdown as shutdown_job_runner
 from services.job_service import DuplicateRunningJob, JobNotFound, JobService
 from services.token_estimator import BudgetExceededError
@@ -87,6 +100,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 生成任务表（同一库文件里的第二张表）。**启动即建表**，与方案表一起。
     job_service: JobService = app.state.job_service
     job_service.ensure_ready()
+    # 文档槽位与版本链表（同一库文件里的第三、四张表）。与上面两张一起建。
+    # ⚠️ **必须在这里也建**：`SessionService.ensure_ready()` 只负责它自己读到的那两张
+    # （plans / generation_jobs），版本表若漏建，报错点是第一次访问版本接口时的
+    # `no such table: documents` —— 离"少调了一次 ensure_ready"这个原因很远。
+    document_versions: DocumentVersionService = app.state.document_version_service
+    document_versions.ensure_ready()
     # 上一轮进程留下的 pending / running 任务永远不会有 runner 接管了（`asyncio.create_task`
     # 活不过重启），所以**启动时如实标记中断**，而不是让界面永远显示"生成中"。
     _stale = job_service.fail_stale_jobs()
@@ -133,6 +152,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 但测试注入的临时库就只对其中一半生效 —— 那正是最难查的一类污染）。
     app.state.job_service = JobService(settings)
     app.state.session_service = SessionService(settings, jobs=app.state.job_service)
+    # 文档槽位与版本链（api/documents.py）。建表同样在 lifespan 里做。
+    # 与另外两个一样挂在 `app.state` 上，好让 `create_app(settings)` 造的临时库
+    # 对**所有**依赖注入生效（`get_settings()` 是进程级单例，绕过 app.state 就写错库）。
+    app.state.document_version_service = DocumentVersionService(settings)
 
     # 请求工号：先于业务中间件注册，让**所有**响应都带上 X-Request-ID，
     # 并让后续任意深度的 LLM 调用都能从上下文读到它。
@@ -160,6 +183,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 原因见 `api/session.py`：它与 `/api/v1/sessions/*` 那组占位接口不是一回事。
     app.include_router(session_router)
 
+    # 文档槽位与版本链（6 条）——挂在快照存储那一族的下一层
+    # （`/api/session/{id}/documents/*`，router 自带前缀），所以同样不加 /api/v1。
+    app.include_router(documents_router)
+
     # 生成任务（3 条，`/api/jobs/*`）——同样**不在 /api/v1 下**（需求给定的路径），
     # router 自带前缀。这是「生成必须是后台任务」的落地入口：POST 只登记任务并返回
     # job_id，执行在后台协程里跑，断开 SSE 不影响它。
@@ -168,6 +195,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 会话不存在的语义是 **404**。异常处理器只能挂在 app 上（挂不到 router 上），
     # 所以在这里注册；路由函数因此保持"纯转发"，不必每条都写 try/except。
     app.add_exception_handler(SessionNotFound, session_not_found_handler)
+    # 文档版本接口的两类失败：查不到 → 404、请求在当前状态下做不到 → 400。
+    # 两个处理器定义在 `api/documents.py`（与 `session_not_found_handler` 同一形状），
+    # 因为 FastAPI 的异常处理器只能挂在 app 上、挂不到 router 上。
+    app.add_exception_handler(DocumentNotFound, document_not_found_handler)
+    app.add_exception_handler(InvalidDocumentRequest, invalid_document_request_handler)
 
     async def job_not_found_handler(_: Request, exc: Exception) -> JSONResponse:
         """任务不存在 → **404**（与 `SessionNotFound` 同口径）。"""

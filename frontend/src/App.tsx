@@ -2,11 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertCircle, ArrowLeft, Download, Eraser, FileText, Loader2, RefreshCw, Sparkles } from 'lucide-react'
 
 import ChatInput from './components/ChatInput'
-import DocumentReview, {
+import {
   countContentChars,
   type DocumentAction,
   type OptimizeRequest,
 } from './components/DocumentReview'
+// 04：审阅面板 + 版本历史侧栏的合成体。App 只传业务 props ——
+// 版本 hook 与侧栏组件**一行都不在这一层**（全在
+// `components/DocumentReviewWithVersions.tsx` 里）。
+import DocumentReviewWithVersions from './components/DocumentReviewWithVersions'
 // ⚠️ 这里只借 `FormStep` 的类型与校验函数：**第一步的界面已经换成 `StructuredForm`**
 // （结构化录入）。`FormStep`（20 题逐题渲染）仍保留在仓库里，想切回去把下面这行换成
 // 默认导入、并把 `<StructuredForm .../>` 换回 `<FormStep .../>` 即可。
@@ -2908,9 +2912,29 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
               }}
             />
           )}
-          <DocumentReview
+          <DocumentReviewWithVersions
             className="min-h-0 flex-1"
             title={DOC_META[activeDoc].title}
+            // 04：版本接口要的是**服务端会话 id**（`plans` 那一行的 id），
+            // 也就是 `savedId` —— 不是本地生成的 `conversationId`。还没落库时为 null，
+            // 那时 `versionsEnabled` 之外的 `enabled` 也会是 false，一个请求都不发。
+            sessionId={savedId ?? undefined}
+            docType={DOC_META[activeDoc].docType}
+            // 生成中不挂版本侧栏（需求 §十二最后一条）：生成期间列表本来就没变化。
+            //
+            // ⚠️ **两个来源都要看，只看 `isGenerating` 是错的**（实测抓到）：它是**本地
+            // state**，只在"本页点了生成"之后为真；而刷新页面后它恒为 false，那一屏靠的是
+            // 服务端写进快照的 `viewState='generating-*'`（有任务在跑时后端**不**降级，
+            // 正是为了让前端知道要重连）。只看前者的话，"生成到一半刷新"会误挂出版本侧栏
+            // —— 而那一刻侧栏里的版本还是旧的，点它会跟正在跑的任务抢同一份产物。
+            versionsEnabled={
+              !(activeDoc && DOC_META[activeDoc].generating === viewState) &&
+              !(isGenerating && generatingKind === activeDoc)
+            }
+            // 任务空闲时刷一次版本列表：优化是流式的，盯着布尔值会让整个生成过程反复请求。
+            jobIdle={!jobGen.isJobRunning}
+            // §6.5 的老数据回退：v1 是迁移导入的、metadata 里没有 review 时用它。
+            reviewResult={prdReviewResult}
             content={readDoc(activeDoc)}
             streamingContent={streamingDoc}
             status={statusFor(activeDoc)}

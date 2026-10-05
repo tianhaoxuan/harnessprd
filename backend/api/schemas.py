@@ -47,6 +47,17 @@ from services.job_models import (
 # 报错还是一句很难懂的"Input should be a valid ... instance of SessionSummary"（已实测踩到）。
 from services.session_models import SessionSummary as StoredSessionSummary
 
+# 文档槽位与版本链的领域模型 + 枚举，同理复用（定义在 services/，此处不重写字段清单）。
+# ⚠️ 枚举定义在 `document_version_repository`（它同时是两张表 CHECK 约束的取值来源）——
+# 单一来源，不需要 `smoke_check.py` 再补一条"两处是否一致"的断言。
+from services.document_version_repository import DocType, VersionSourceKind
+from services.document_version_service import (
+    CONTENT_PREVIEW_CHARS,
+    DocumentSlot,
+    DocumentVersionRecord,
+    content_preview,
+)
+
 __all__ = [
     # 枚举（定义在 services/state.py，此处复用）
     "DialogueStage",
@@ -91,6 +102,17 @@ __all__ = [
     "CreateJobRequest",
     "CreateJobResponse",
     "JobSnapshotView",
+    # 文档槽位与版本链（`/api/session/{id}/documents/*`）
+    "DocumentCheckpointRequest",
+    "DocumentCheckpointResponse",
+    "DocumentRestoreResponse",
+    "DocumentSlotListView",
+    "DocumentSlotView",
+    "DocumentVersionDetailView",
+    "DocumentVersionListView",
+    "DocumentVersionNoteRequest",
+    "DocumentVersionNoteResponse",
+    "DocumentVersionSummaryView",
 ]
 
 
@@ -702,6 +724,188 @@ class SessionStoreListView(BaseModel):
         default_factory=list,
         description="摘要列表，按 updated_at 倒序；**不含 session_data**",
     )
+
+
+# ---------------------------------------------------------------- 文档槽位与版本链
+# 路由：`/api/session/{session_id}/documents/*`（6 条，见 `api/documents.py`）。
+#
+# ⚠️ 路径**不在 `/api/v1` 下** —— 与 `/api/session/*`、`/api/jobs/*` 同族（需求给定的路径），
+# 所以 `main.py` 里单独挂、不加版本前缀。
+#
+# 与上面两个区同理：这里只放**传输层才需要**的形状。领域模型在
+# `services/document_version_service.py`（`DocumentSlot` / `DocumentVersionRecord`），
+# 本区不复制它们的字段定义，只决定"哪些字段对外可见"（`from_slot` / `from_record`）。
+#
+# 三条刻意的取舍：
+#
+# 1. **列表项不含全文**（只给 `content_preview`）。侧栏一次要列出几十版，带上全文就是
+#    几十份 Markdown 白传；要看全文走单版详情接口。
+# 2. **`change_note` 用 `exclude_if` 而不是 `exclude_none`**：需求要的是"无备注时**省略**这个键"，
+#    而 `exclude_none` 会连 `current_version_id: null` 一起吃掉 —— 那是需求明确要求保留的字段
+#    （§6.1 的示例里就是 `null`）。
+# 3. `source_kind` 直接复用 `services` 的枚举（不是 `str`）：这样 OpenAPI 里能选出合法值，
+#    而不是让调用方去猜有哪些取值。
+
+
+class DocumentSlotView(BaseModel):
+    """一个文档槽位的摘要（**不含正文**）。"""
+
+    doc_type: DocType
+    document_id: str
+    current_version_id: str | None = Field(
+        default=None, description="指向当前生效的版本；**尚未生成任何版本时为 null**"
+    )
+    current_version_no: int | None = Field(default=None, description="尚未生成时同样为 null")
+    updated_at: str | None = Field(
+        default=None,
+        description="**当前版本的**最近更新时间。尚无版本时为 null —— 槽位行本身可能是刚建的，"
+        "把它的创建时间当更新时间会让「从没生成过」看起来像「刚更新过」",
+    )
+
+    @classmethod
+    def from_slot(cls, slot: DocumentSlot) -> DocumentSlotView:
+        return cls(
+            doc_type=slot.doc_type,
+            document_id=slot.id,
+            current_version_id=slot.current_version_id,
+            current_version_no=slot.current_version_no,
+            updated_at=slot.updated_at if slot.has_version else None,
+        )
+
+
+class DocumentSlotListView(BaseModel):
+    """`GET .../documents` 的信封。**固定三项**（prd / api-docs / prompts），顺序固定。"""
+
+    items: list[DocumentSlotView] = Field(
+        default_factory=list,
+        description="固定三项：prd、api-docs、prompts。**没有版本也返回**，只是 current 为 null",
+    )
+
+
+class DocumentVersionSummaryView(BaseModel):
+    """版本列表项：**不含全文**，只有预览与用户备注。"""
+
+    id: str
+    version_no: int
+    source_kind: VersionSourceKind
+    created_at: str
+    content_preview: str = Field(
+        description=f"正文前 {CONTENT_PREVIEW_CHARS} 字。**仅供内部与后续扩展**，"
+        "侧栏不拿它当自动摘要展示 —— 那是 `change_note` 的位置"
+    )
+    is_current: bool
+    change_note: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="用户备注（`metadata.change_note`）。**没有备注时这个键不出现**",
+    )
+
+    @classmethod
+    def from_record(
+        cls, record: DocumentVersionRecord, *, current_version_id: str | None
+    ) -> DocumentVersionSummaryView:
+        return cls(
+            id=record.id,
+            version_no=record.version_no,
+            source_kind=record.source_kind,
+            created_at=record.created_at,
+            content_preview=content_preview(record.content),
+            is_current=record.id == current_version_id,
+            change_note=record.change_note(),
+        )
+
+
+class DocumentVersionListView(BaseModel):
+    """`GET .../versions` 的响应：列表 + 槽位身份（前端据此知道"当前是哪一版"）。"""
+
+    doc_type: DocType
+    document_id: str
+    current_version_id: str | None = None
+    versions: list[DocumentVersionSummaryView] = Field(
+        default_factory=list, description="按 version_no **降序**；尚无版本时是空数组"
+    )
+
+
+class DocumentVersionDetailView(BaseModel):
+    """`GET .../versions/{version_id}` 的响应：**含全文**，供预览用。"""
+
+    id: str
+    version_no: int
+    source_kind: VersionSourceKind
+    content: str
+    source_job_id: str | None = Field(
+        default=None, description="生成这一版的 `generation_jobs.id`；checkpoint / restore 为 null"
+    )
+    parent_version_id: str | None = Field(
+        default=None, description="切换前的那一版；**首版为 null**"
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="`run_summary` / `review` / `change_note` / `restored_from_version_*`；"
+        "未产生的字段一律省略",
+    )
+    created_at: str
+    is_current: bool
+
+    @classmethod
+    def from_record(
+        cls, record: DocumentVersionRecord, *, current_version_id: str | None
+    ) -> DocumentVersionDetailView:
+        return cls(
+            id=record.id,
+            version_no=record.version_no,
+            source_kind=record.source_kind,
+            content=record.content,
+            source_job_id=record.source_job_id,
+            parent_version_id=record.parent_version_id,
+            metadata=record.metadata(),
+            created_at=record.created_at,
+            is_current=record.id == current_version_id,
+        )
+
+
+class DocumentCheckpointRequest(BaseModel):
+    """`POST .../versions/checkpoint` 的请求体。**整个请求体可选**。"""
+
+    content: str | None = Field(
+        default=None,
+        description="前端当前编辑器全文。**不传则用服务端 current 版本的正文** —— "
+        "所以「只是打个标记」的调用不必把上万字传一遍",
+    )
+
+
+class DocumentCheckpointResponse(BaseModel):
+    """checkpoint 的回执：**只回身份，不回全文**（调用方本来就有）。"""
+
+    version_id: str
+    version_no: int
+    document_id: str
+
+
+class DocumentRestoreResponse(BaseModel):
+    """restore 的回执：比 checkpoint 多一个 `content`（供 Session 镜像同步）。"""
+
+    version_id: str
+    version_no: int
+    document_id: str
+    content: str = Field(description="新版本的正文（= 被恢复那一版的正文）")
+
+
+class DocumentVersionNoteRequest(BaseModel):
+    """`PATCH .../versions/{version_id}/note` 的请求体。"""
+
+    change_note: str | None = Field(
+        default=None,
+        description="用户备注。**空串或省略 = 清空备注**（`metadata.change_note` 这个键会被删掉）",
+    )
+
+
+class DocumentVersionNoteResponse(BaseModel):
+    """备注写入回执。`change_note` 为 `null` 表示"现在没有备注"（含刚被清空）。"""
+
+    version_id: str
+    version_no: int
+    change_note: str | None = None
 
 
 # ---------------------------------------------------------------- Generation Job（`/api/jobs/*`）

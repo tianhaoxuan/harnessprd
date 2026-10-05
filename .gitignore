@@ -52,8 +52,9 @@ Thumbs.db
 *.db-wal
 *.db-shm
 # smoke / 临时自检用的库目录（正常跑完会自己删；崩了也不该进仓库）
-backend/_tmp_plans_smoke/
-backend/_tmp_jobs_check/
+# 用通配而不是逐个列：自检脚本每加一段就多一个 `_tmp_*` 目录，
+# 漏列的那一个会在崩溃后被 `git status` 报成待提交文件。
+backend/_tmp_*/
 # tiktoken 的 BPE 词表缓存（第一次算 token 预算时下载，约 1.6 MB）。
 # 正常落在系统临时目录；在受限环境里 `tempfile.gettempdir()` 会解析成相对路径，
 # 于是它出现在跑服务时的工作目录下（`backend/`）。纯缓存，不该进仓库。

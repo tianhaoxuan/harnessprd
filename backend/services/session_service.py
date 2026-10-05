@@ -49,11 +49,17 @@ from collections.abc import Collection, Mapping
 from typing import Any
 
 from core.config import Settings
+from services.document_version_repository import DOC_TYPES
+from services.document_version_service import (
+    DocumentVersionRecord,
+    DocumentVersionService,
+)
 from services.job_models import (
     ARTIFACT_DOC_KIND,
     ARTIFACT_GENERATING_VIEW,
     ARTIFACT_REVIEW_VIEW,
     PRD_REVIEW_RESULT_KEY,
+    content_artifact_of,
     is_optimize_artifact,
 )
 from services.job_service import JobService
@@ -213,6 +219,47 @@ def parse_prd_title(session_data: str, fallback: str) -> str:
     return fallback
 
 
+def session_document_contents(session_data: str) -> dict[str, str]:
+    """从快照里取出三种产物的正文 → `{doc_type: content}`（只要**有内容**的那些）。
+
+    ## ⚠️ 真实形状是 `documents.<kind>.content`，不是需求里写的 `prdContent`
+
+    需求 §2 / §4 把这三个字段写成 `prdContent` / `apiDocsContent` / `promptsContent`。
+    那三个名字是前端 `App.tsx` 的 **React state 变量名**（`useState`），**不是快照里的键** ——
+    真正落库的形状由 `buildSnapshot()` 决定：
+
+        { ..., "documents": { "prd": {"content": ..., "approved": ...},
+                              "api": {"content": ...},
+                              "prompts": {"content": ...} }, ... }
+
+    所以三个字段的落点是 `documents.prd.content` / `documents.api.content` /
+    `documents.prompts.content`。⚠️ 注意中间那个是 **`api`**，不是 `api-docs`
+    —— 对外的 `api-docs` 到内部的 `api` 由 `job_models.ARTIFACT_DOC_KIND` 定义一次，
+    本函数用 `doc_kind_for()` 取它，不另写一张表。
+
+    空串 / 全空白一律当"没有"：与前端 `buildSnapshot()` 的 `if (!content.trim()) continue`
+    一致（只有空白的产物与没有产物是一回事）。
+    """
+    try:
+        parsed = json.loads(session_data)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, Mapping):
+        return {}
+    documents = parsed.get("documents")
+    if not isinstance(documents, Mapping):
+        return {}
+    contents: dict[str, str] = {}
+    for doc_type in DOC_TYPES:
+        entry = documents.get(doc_kind_for(doc_type))
+        if not isinstance(entry, Mapping):
+            continue
+        content = entry.get("content")
+        if isinstance(content, str) and content.strip():
+            contents[doc_type] = content
+    return contents
+
+
 def derive_summary_fields(session_data: str) -> tuple[str | None, str | None]:
     """从快照推导摘要列：`(entry_mode, current_stage)`。
 
@@ -245,6 +292,7 @@ class SessionService:
         settings: Settings | None = None,
         plans: PlanService | None = None,
         jobs: JobService | None = None,
+        document_versions: DocumentVersionService | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._plans = plans or PlanService(self._settings)
@@ -252,6 +300,16 @@ class SessionService:
         # 依赖方向是 **session → job**，job 那一侧不反向依赖会话（`job_repository` 只懂 SQL），
         # 所以这里不存在循环导入。
         self._jobs = jobs or JobService(self._settings)
+        # 文档版本层：保存/读取会话时要把它与 `session_data` 镜像对齐（02 篇）。
+        # 方向同样是 **session → documents**。反向（documents → session）会成环，
+        # 所以 `document_version_service` 里刻意不 import 本模块（它的异常也自带一套）。
+        #
+        # ⚠️ 本类**自己持有**并对外暴露（`sessions.documents`）而不是让调用方另传一个：
+        # `job_runner` 收尾时要写版本层，而从 `start_job(jobs=…, sessions=…)` 再穿一个
+        # 参数下去，会在自检脚本里落进 `get_settings()` 的**默认库**
+        # （`job_check.py` 只注入 `SessionService(settings)`，临时库就只对一半生效）。
+        # 与 `deps.py` 反复强调的那条污染陷阱是同一件事。
+        self._documents = document_versions or DocumentVersionService(self._settings)
 
     @property
     def plans(self) -> PlanService:
@@ -261,16 +319,26 @@ class SessionService:
     def jobs(self) -> JobService:
         return self._jobs
 
+    @property
+    def documents(self) -> DocumentVersionService:
+        """文档版本层（`job_runner` 收尾时用它写版本，见 `services/job_runner.py`）。"""
+        return self._documents
+
     def ensure_ready(self) -> None:
         """建表（幂等）。应用启动时调用 —— 见 `main.py` 的 lifespan。
 
-        ⚠️ **两张表都要建**：本层的降级判断要读 `generation_jobs`
-        （"这个 job 还在跑吗"）。只建方案表的话，`get_session()` / `save_session()`
-        会以 `no such table: generation_jobs` 炸掉 —— 而报错点离原因很远
-        （在第 N 次保存时才暴露）。自检脚本就是这么踩到的。
+        ⚠️ **三层表都要建**，而不是只建方案表：
+
+        - `generation_jobs`：本层的降级判断要读它（"这个 job 还在跑吗"）；
+        - `documents` / `document_versions`：本层的 `save_session` / `get_session` 要写它
+          （镜像同步与老数据迁移），`job_runner` 也通过 `sessions.documents` 写它。
+
+        少建一张的表现是 `no such table: …`，而报错点离原因很远（在第 N 次保存、
+        或某个任务收尾时才暴露）。`job_check.py` 有一条断言专门盯这件事。
         """
         self._plans.ensure_ready()
         self._jobs.ensure_ready()
+        self._documents.ensure_ready()
 
     # ------------------------------------------------------------ 读
 
@@ -293,6 +361,11 @@ class SessionService:
 
         ⚠️ `running_job_ids` 必须传：没有它，正在后台生成的任务会被当成孤儿态降级掉，
         前端于是不会去重连 SSE（需求 §十一 的关键一条）。
+
+        ⚠️ **本接口会写库**，两处，而且都只在真有必要时写（见 `_align_documents_on_read`）：
+        老 Session 补一个 v1（`source_kind=import`），以及把版本层有、镜像没有的正文回填。
+        需求 §5 建议把它放在 save 路径以减少 GET 的副作用，但同一节又要求"打开旧方案应
+        直接出现 v1，无需用户操作" —— 那条只有在读路径上做才**不依赖前端防抖保存真的会跑**。
         """
         record = self._plans.get(session_id)
         if record is None:
@@ -300,6 +373,7 @@ class SessionService:
         text, original, kind = downgrade_session_data(
             record.snapshot, running_job_ids=self.running_job_ids(session_id)
         )
+        text = self._align_documents_on_read(session_id, text)
         return SessionLoad(
             **record.model_dump(exclude={"snapshot"}),
             session_data=text,
@@ -344,6 +418,8 @@ class SessionService:
                     snapshot=text,
                 )
             )
+            # 会话先落库，再同步版本层 —— 版本层的 `ensure_document` 要校验会话存在。
+            self._sync_documents_after_save(new_id, text)
             return SessionSaveResult(id=record.id, created=True, title=record.title)
 
         updated = self._plans.update(
@@ -352,6 +428,7 @@ class SessionService:
         )
         if updated is None:
             raise SessionNotFound(f"会话不存在：{session_id}")
+        self._sync_documents_after_save(session_id, text)
         # ⚠️ 这里**不传 title** —— 更新不改标题（见模块 docstring 的规则二）。
         return SessionSaveResult(id=updated.id, created=False, title=updated.title)
 
@@ -359,6 +436,170 @@ class SessionService:
         """删除。不存在 → `SessionNotFound`（HTTP 层 404）。"""
         if not self._plans.delete(session_id):
             raise SessionNotFound(f"会话不存在：{session_id}")
+
+    # ------------------------------------------------------------ 文档版本层同步（02 篇）
+    #
+    # 写入链路（需求 §七）——**两个方向，顺序都是「先版本层、再镜像」**：
+    #
+    #     Job 完成 / 失败（job_runner）
+    #       → sync_from_job(...)             版本层：升新版或就地更新
+    #       → sync_job_completed(...)        镜像：documents.<kind>.content
+    #
+    #     用户手改，前端防抖保存（本层 save_session）
+    #       → 会话先落库
+    #       → maybe_migrate_from_session     老数据补 v1（import）
+    #       → sync_session_contents          镜像 → current（auto_save，**不升号**）
+    #
+    # ⚠️ **镜像与版本层的对齐是"尽力而为"**：`session_data` 才是用户正在编辑的那份数据，
+    # 版本层是本次新加的对外能力。版本层出问题不该让"保存"这个动作返回 500 ——
+    # 那时镜像已经落库了，用户会以为没存上，然后反复重试。
+    # `job_runner._sync_session` 对会话同步是这个口径，这里反过来对版本同步用同一条。
+
+    def _generating_doc_types(self, session_id: str) -> set[str]:
+        """正在被生成任务写入的 `doc_type`（这些**不许**从镜像同步进版本层）。
+
+        ⚠️ **为什么必须剔除**：前端在生成期间会把**半成品**按 1.5 秒节流写进产物
+        （`useGenerationJob`），而防抖保存（800ms / 最长 2s）又会把半成品存进
+        `session_data`。照单同步的话，这份产物的**第一个版本就是一段半截正文** ——
+        验收标准里"生成完成后 `version_no=1`"会直接不成立，侧栏历史也会被半成品污染。
+        这份产物的正主是那个 Job，收尾时由 `job_runner` 写权威版本。
+
+        与 `downgrade_session_data` 的 `running_job_ids` 是**同一条判断依据**（有任务在跑），
+        只是用途不同：那边决定"降不降级"，这边决定"写不写版本"。
+
+        读不到任务表时返回**全部** doc_type（= 本轮一个版本都不写）：宁可少写一次，
+        也不要把半成品固化成历史版本。
+        """
+        try:
+            running = self._jobs.list_running_for_session(session_id)
+        except Exception:  # noqa: BLE001 - 读任务表失败不该让保存/读取失败
+            logger.exception("读在跑的任务失败：本轮跳过版本同步（避免把半成品写成版本）")
+            return set(DOC_TYPES)
+        return {content_artifact_of(job.artifact) for job in running}
+
+    def _sync_documents_after_save(self, session_id: str, session_data: str) -> None:
+        """保存后把正文同步进版本层：**先迁移老数据，再把本次改动写进 current**。
+
+        顺序不能反（需求 §4）：迁移只处理"没有 current 版本"的槽位，先跑它，
+        本次手改才会走 `update_current_content` 而不是又插一版。
+
+        ⚠️ 需求 §4 说这一步在"`conn.commit` 之前"—— 本项目的 `PlanService` 没有对外暴露
+        事务（每次 `create`/`update` 各开一条连接），所以顺序是**会话先落库、再同步版本层**。
+        这也是必需的：`ensure_document` 要校验会话存在，先建会话行它才过得去。
+        """
+        contents = self._syncable_contents(session_id, session_data)
+        if not contents:
+            return
+        try:
+            self._migrate_session_documents_if_needed(session_id, contents)
+            self._sync_session_content_to_documents(session_id, contents)
+        except Exception:  # noqa: BLE001 - 版本层失败不该把已落库的保存判成失败
+            logger.exception(
+                "会话 %s 已保存，但同步文档版本层失败（产物与镜像不受影响）", session_id
+            )
+
+    def _align_documents_on_read(self, session_id: str, session_data: str) -> str:
+        """读路径上的版本层对齐（需求 §5 / §6）。返回**可能已写回**的快照文本。
+
+        两件事：
+
+        1. **迁移**：老 Session 有正文但没有版本 → 导入成 v1（`source_kind=import`，只做一次）；
+        2. **回填**：版本层有正文、而镜像**没有**（键缺失 / 空串）→ 回填进镜像。
+
+        两件都不会每次都产生写（对齐好了就是纯读）。
+
+        ⚠️ 回填**只填镜像缺的那些**，绝不用版本层的旧正文去覆盖镜像里已有的正文。
+        需求 §6 的原话是"以 document current 为准覆盖镜像并写回 DB"，但 §4 的写入顺序是
+        「先写镜像、再同步版本」—— 一旦版本同步失败（本层是尽力而为），镜像就会比版本新，
+        那时"以版本为准"会把用户刚改的正文**静默换回旧版**。所以方向取"只补缺"：
+        两边不一致时保留镜像，由下一次保存把镜像推进版本层。
+        """
+        contents = self._syncable_contents(session_id, session_data)
+        try:
+            self._migrate_session_documents_if_needed(session_id, contents)
+            missing = self._missing_session_contents(session_id, session_data)
+            if not missing:
+                return session_data
+            patch = {"documents": {doc_kind_for(dt): {"content": c} for dt, c in missing.items()}}
+            written = self._patch_session(session_id, patch)
+        except Exception:  # noqa: BLE001 - 读路径上的对齐失败不该让查询 500
+            logger.exception("读取会话时对齐文档版本层失败（返回未改动的快照）")
+            return session_data
+        if written is None:
+            # 会话在读到写的这一瞬间没了（并发删除）：如实返回降级后的快照即可
+            return session_data
+        logger.info(
+            "会话 %s 的快照从文档版本层回填了 %s（镜像里原本没有）",
+            session_id,
+            "、".join(doc_kind_for(dt) for dt in missing),
+        )
+        return written
+
+    def _syncable_contents(self, session_id: str, session_data: str) -> dict[str, str]:
+        """镜像里**可以**同步进版本层的正文（剔除正在生成的那些产物）。
+
+        剔除只作用于**镜像 → 版本层**这个方向；回填（版本层 → 镜像）要看镜像的真实内容，
+        所以那边单独用 `session_document_contents`（不剔除）。
+        """
+        contents = session_document_contents(session_data)
+        blocked = self._generating_doc_types(session_id)
+        if not blocked:
+            return contents
+        return {dt: text for dt, text in contents.items() if dt not in blocked}
+
+    def _migrate_session_documents_if_needed(
+        self, session_id: str, contents: Mapping[str, str]
+    ) -> list[DocumentVersionRecord]:
+        """老 Session 一次性迁移（需求 §5）。语义与"要不要迁"全在版本层。
+
+        这一层只负责"把快照里的正文抠出来"（`contents`），判断与落库委派给
+        `DocumentVersionService.maybe_migrate_from_session` —— 规则只有一份。
+        """
+        return self._documents.maybe_migrate_from_session(session_id, contents)
+
+    def _sync_session_content_to_documents(
+        self, session_id: str, contents: Mapping[str, str]
+    ) -> list[DocumentVersionRecord]:
+        """把镜像里的手改正文同步进 current（`source_kind=auto_save`，**不升号**）。"""
+        return self._documents.sync_session_contents(session_id, contents)
+
+    def _missing_session_contents(
+        self, session_id: str, session_data: str
+    ) -> dict[str, str]:
+        """版本层有、镜像**没有**的正文 → `{doc_type: content}`。
+
+        用**未剔除**的镜像内容判断"有没有"：正在生成的那份产物，镜像里是半成品，
+        它**存在**，所以不该被版本层的旧正文回填掉。
+        """
+        present = session_document_contents(session_data)
+        missing: dict[str, str] = {}
+        for doc_type in DOC_TYPES:
+            if doc_type in present:
+                continue
+            current = self._documents.get_current_version(session_id, doc_type)
+            if current is not None and current.content.strip():
+                missing[doc_type] = current.content
+        return missing
+
+    def sync_document_content(self, session_id: str, doc_type: str, content: str) -> bool:
+        """把版本层的 current 正文写回 `session_data` 镜像（`documents.<kind>.content`）。
+
+        给 `api/documents.py` 的 checkpoint / restore 用（需求 §七）：这两个动作用户是
+        在侧栏上点的，改的是 current，镜像必须跟着走，否则同一个会话里"侧栏显示的版本"
+        与"编辑器里的正文"会立刻不一致。
+
+        返回是否命中（会话不存在 → `False`，**不抛**）：版本层那边已经改好了，
+        为一个镜像写失败把接口判成 500 只会让用户以为版本没保存上。
+        """
+        written = self._patch_session(
+            session_id, {"documents": {doc_kind_for(doc_type): {"content": content}}}
+        )
+        if written is None:
+            logger.warning(
+                "checkpoint/restore 后镜像同步时会话 %s 已不存在（版本已写入）", session_id
+            )
+            return False
+        return True
 
     # ------------------------------------------------------------ 任务同步（Generation Job）
     #
@@ -499,8 +740,12 @@ class SessionService:
         self,
         session_id: str,
         patch: Mapping[str, Any],
-    ) -> bool:
-        """把 `patch` 合并进快照并落库。返回是否命中（会话不存在 → `False`，不抛）。
+    ) -> str | None:
+        """把 `patch` 合并进快照并落库。返回**落库后的快照原文**；会话不存在 → `None`（不抛）。
+
+        返回值从"是否命中"改成"新的快照文本"（02 篇）：读路径上的回填要把**它写进去的那份**
+        原样返回给调用方，否则 `get_session` 还得再查一次库（而两次读之间可能有别的写入者）。
+        三个既有调用方都不看返回值，所以这次改动不影响它们。
 
         **为什么是合并而不是覆盖**：前端那份快照里有 `messages` / `form` / `entryMode` /
         `roundIndex` 等一堆与产物无关的字段，覆盖式写入会把它们清空 ——
@@ -517,7 +762,7 @@ class SessionService:
         record = self._plans.get(session_id)
         if record is None:
             logger.warning("任务同步时会话已不存在（session=%s），跳过这次同步", session_id)
-            return False
+            return None
         try:
             parsed = json.loads(record.snapshot)
         except json.JSONDecodeError:  # pragma: no cover - 入库前已过 normalize_snapshot
@@ -547,7 +792,7 @@ class SessionService:
             session_id,
             PlanUpdate(entry_mode=entry_mode, current_stage=current_stage, snapshot=text),
         )
-        return updated is not None
+        return text if updated is not None else None
 
 
 def doc_kind_for(artifact: str) -> str:

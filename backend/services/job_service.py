@@ -190,6 +190,16 @@ class JobService:
     def list_running(self) -> list[JobRecord]:
         return [JobRecord(**row) for row in self._repository.list_by_status(("pending", "running"))]
 
+    def list_running_for_session(self, session_id: str) -> list[JobRecord]:
+        """这个会话下**正在跑**的任务（**带 `artifact`**，不只 id）。
+
+        与 `running_ids_for_sessions` 的差别就是那两个字段：会话层在同步文档版本时要知道
+        "正在生成的是**哪一份**产物"（那一份的半成品不许被固化成版本），
+        而只拿到一串 id 是答不出来的。判重用的 `list_running(session_id)` 在仓储上，
+        这里把同一份结果包成 `JobRecord` 返回，免得调用方直接伸手进仓储。
+        """
+        return [JobRecord(**row) for row in self._repository.list_running(session_id)]
+
     def running_ids_for_sessions(self, session_ids: Sequence[str]) -> set[str]:
         """给会话降级判断用：这些会话下还有哪些任务在跑（见 `session_service`）。"""
         return self._repository.running_ids_for_sessions(session_ids)
