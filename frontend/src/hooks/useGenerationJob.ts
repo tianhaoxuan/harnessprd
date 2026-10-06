@@ -233,8 +233,11 @@ export function useGenerationJob(options: UseGenerationJobOptions): GenerationJo
     (artifact: JobArtifact, phase: string, running: boolean) => {
       if (!running) return
       if (artifact !== 'prd') {
-        // 另两份产物没有"机器审查"这一步：步骤条一次性给全，等 done 时收尾
-        if (artifact === 'api-docs') obs.beginApiDocsGeneration()
+        // 05 篇：这两份产物**也有了**"机器审查"这一步。刷新/重连时 `snapshot.phase`
+        // 可能是 `reviewing` —— 那时要停在第 2 格，否则用户看到的是"在生成"（第一格）
+        // 而实际进度条该在审查那一段。
+        if (phase === 'reviewing') obs.beginGenerationReview(artifact)
+        else if (artifact === 'api-docs') obs.beginApiDocsGeneration()
         else obs.beginPromptsGeneration()
         return
       }
@@ -373,7 +376,18 @@ export function useGenerationJob(options: UseGenerationJobOptions): GenerationJo
               }
             },
             onPhase: (event) => {
-              if (artifact !== 'prd') return
+              // ---------- 05 篇：接口文档 / 提示词也有"机器审查"这一段了 ----------
+              // 后端在生成完之后会再调一次模型做审查，并先发 `review_started`
+              // （见 `job_runner._review_generated_document`）。不处理它的话，
+              // 用户在那一二十秒里看到的是一个**完全没动静**的步骤条（第一格已打勾、
+              // 第二格永远不亮）—— 正是 `generationSteps` 里那个"曾经有过又被删掉"的
+              // 第二步要避免的观感。
+              if (artifact !== 'prd') {
+                if (event.phase === 'review_started') {
+                  obs.beginGenerationReview(artifact)
+                }
+                return
+              }
               // ⚠️ `rewrite_started` = 服务端**已把草稿清空**、从零写下一稿。
               // 客户端的累积必须跟着清 —— 不清就会把两稿拼在一起，而拼起来的文档
               // 看起来是完整的（没有语法错误，只是前后矛盾）。v1 并没有丢：

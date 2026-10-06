@@ -52,7 +52,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -70,6 +70,7 @@ from core.prompts import (
 )
 from core.questions import load_questions
 from services.conversation_service import format_form_data, message_text
+from services.api_docs_review_agent import build_api_docs_review_messages
 from services.job_models import ARTIFACT_DOC_KIND, is_optimize_artifact
 from services.llm import LlmConfigError, StreamOutcome, finish_reason_of, is_truncated
 from services.llm_factory import get_llm, track
@@ -86,6 +87,8 @@ from services.prompts import (
     PRD_GENERATION_PROMPT,
     PROMPTS_GENERATION_PROMPT,
 )
+from services.prompts_review_agent import build_prompts_review_messages
+from services.review_verdict import normalize_review_verdict
 from services.skill_loader import (
     SkillBundle,
     SkillConfigError,
@@ -1182,6 +1185,67 @@ class DocumentService:
             logger.warning("PRD 审核判了不通过但没给 issues，按通过处理")
             return None
         return [issue for issue in issues if isinstance(issue, dict)]
+
+    # ------------------------------------------------- 生成后审查（05 篇：接口文档 / 提示词）
+
+    async def review_api_docs(self, *, prd_content: str, content: str) -> dict[str, Any]:
+        """审一遍**刚生成好的接口文档**。返回归一化结论（**一定会返回**，不返回 None）。
+
+        与 PRD 审查的三处刻意差异：
+        1. **不重写**（产品决定）：结论只展示，正文照交 —— 所以这里没有"issues 非空则改写"
+           那条回路，调用方拿到什么就展示什么；
+        2. 解析失败 / 调用失败 → `review_skipped=True` + `passed=True`，**不判不通过**：
+           一个跑挂的审查器没有资格说产物不合格（与 `_review_prd` 的既有约定一致）；
+        3. 返回值里**自带 `review_model` 与 `review_skipped`**，省得调用方去摸 `_settings`。
+        """
+        return await self._review_generated(
+            build=lambda: build_api_docs_review_messages(prd_content=prd_content, content=content),
+            step=LlmStep.API_DOCS_REVIEW,
+        )
+
+    async def review_prompts(
+        self, *, prd_content: str, content: str, api_docs_content: str = ""
+    ) -> dict[str, Any]:
+        """审一遍**刚生成好的提示词套件**。约定同上。
+
+        `api_docs_content` 为空是合法状态（用户跳过了接口文档），审核员会按
+        "没有接口文档可比对"来审 —— 见 `prompts_review_agent` 的说明。
+        """
+        return await self._review_generated(
+            build=lambda: build_prompts_review_messages(
+                prd_content=prd_content, content=content, api_docs_content=api_docs_content
+            ),
+            step=LlmStep.PROMPTS_REVIEW,
+        )
+
+    async def _review_generated(
+        self, *, build: Callable[[], list[BaseMessage]], step: LlmStep
+    ) -> dict[str, Any]:
+        """生成后审查的**公共实现**（两个产物共用，省得两份解析各写一遍）。
+
+        异常**不往上抛**：审查是"附加结论"，它失败不该让一份已经写好的正文作废
+        （正文已经落库、也已经推给前端了）。失败与解析失败走同一条路：标 `review_skipped`。
+
+        `build` 收成一个**惰性函数**是为了把它也罩进同一个 try：提示词文件缺失之类的
+        构建期错误（`load_prompt` 抛 `FileNotFoundError`）同样要被降级成"未审核"，
+        而不是把一个跑完的任务判成失败。
+        """
+        review_model = self._settings.review_llm_active_model
+        try:
+            messages = build()
+            response = await track(self.review_model, step).ainvoke(messages)
+            verdict = _extract_json_object(message_text(response))
+        except Exception as exc:  # noqa: BLE001 - 见 docstring
+            logger.warning("%s 审查没跑成（%s），本次按未审核处理", step.value, exc)
+            return {
+                "passed": True,
+                "issues": [],
+                "summary": None,
+                "review_model": review_model,
+                "review_skipped": True,
+            }
+        normalized = normalize_review_verdict(verdict)
+        return {**normalized, "review_model": review_model, "review_skipped": False}
 
     # ------------------------------------------------------------ 文档修订
 

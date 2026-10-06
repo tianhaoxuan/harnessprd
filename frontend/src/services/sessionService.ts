@@ -31,6 +31,7 @@
 
 import type { SessionData } from '../App'
 import type { DocKind } from '../types'
+import type { ArtifactLineage } from '../types/lineage'
 
 /** 会话存储接口的前缀。**不在 `/api/v1` 下**（后端 `api/session.py` 自带这个前缀）。 */
 export const SESSION_API_BASE = '/api/session'
@@ -180,6 +181,43 @@ export async function saveSession(
   })
   if (!outcome.ok || !outcome.data) {
     console.error('[sessionService] 保存失败，状态码：', outcome.status)
+    return null
+  }
+  return outcome.data
+}
+
+/**
+ * 交付包（05 篇）：`GET /api/session/{id}/export` → zip 字节流。
+ *
+ * ⚠️ **不能走 `requestJson`**：那条路会 `response.json()`，而这里是二进制。
+ * 文件名优先取 `Content-Disposition` 的 `filename*=UTF-8''`（后端给的中文名），
+ * 拿不到就退回一个安全的默认名 —— 联合类型里 `fetch` 的 `headers.get` 一定存在，
+ * 所以不必判空。
+ */
+export async function fetchDeliveryZip(
+  id: string,
+): Promise<{ blob: Blob; fileName: string }> {
+  const response = await fetch(`${SESSION_API_BASE}/${encodeURIComponent(id)}/export`)
+  if (!response.ok) {
+    throw new Error(`导出失败（HTTP ${response.status}）`)
+  }
+  const disposition = response.headers.get('Content-Disposition') ?? ''
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(disposition)?.[1]
+  const plain = /filename="([^"]+)"/i.exec(disposition)?.[1]
+  const fileName = encoded ? decodeURIComponent(encoded) : (plain ?? 'harnessprd-delivery.zip')
+  return { blob: await response.blob(), fileName }
+}
+
+/**
+ * 三份产物的版本与上游关系（05 篇）。失败返回 `null`（**调用方必须判空**）。
+ *
+ * 只读、幂等：审核页打开或任务收尾后拉一次，用来显示"上游更新了，这一份可能过期"。
+ * 文案由后端给（见 `types/lineage.ts` 的说明），前端不自己拼。
+ */
+export async function fetchArtifactLineage(id: string): Promise<ArtifactLineage | null> {
+  const outcome = await requestJson<ArtifactLineage>(`/${encodeURIComponent(id)}/artifact-lineage`)
+  if (!outcome.ok || !outcome.data) {
+    console.warn('[sessionService] 取产物溯源信息失败，状态码：', outcome.status)
     return null
   }
   return outcome.data

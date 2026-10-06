@@ -49,7 +49,32 @@ MAX_PENDING_MARKS = 5
 _CST = timezone(timedelta(hours=8))
 
 #: `=== FILE: xxx ===` 多文件分隔行（提示词套件的输出契约）。
-_FILE_MARKER = re.compile(r"^===\s*FILE:\s*(.+?)\s*===\s*$", re.MULTILINE)
+PROMPT_FILE_MARKER = re.compile(r"^===\s*FILE:\s*(.+?)\s*===\s*$", re.MULTILINE)
+
+#: 兼容旧名（本模块内部与历史调用点用的是私有名）。
+_FILE_MARKER = PROMPT_FILE_MARKER
+
+
+def split_prompt_files(text: str) -> list[tuple[str, str]]:
+    """把提示词套件按 `=== FILE: xxx ===` 拆成 `[(相对路径, 正文)]`。
+
+    **这是全仓库唯一一份拆分实现**（05 篇收敛的）：导出交付包要按文件落盘，
+    质量报告要按文件名判五类 —— 两处各写一份正则，迟早出现"报告说齐了、导出少了两个文件"。
+    前端那份手写实现（`services/zip.ts` 的 `splitPromptSuite`）随交付包改走后端而删除。
+
+    没有分隔行时返回**空列表**（调用方决定是"整份存放"还是"当作不合格"）——
+    这个函数不猜。
+    """
+    matches = list(PROMPT_FILE_MARKER.finditer(text))
+    if not matches:
+        return []
+    files: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        name = match.group(1).strip()
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        files.append((name, text[start:end].strip()))
+    return files
 
 #: 接口条目标题：`### POST /api/v1/...`（允许多余的前缀如 `### 3.1 POST /...`）。
 _ENDPOINT_HEADING = re.compile(

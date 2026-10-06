@@ -87,7 +87,9 @@ class LlmStep(str, Enum):
     PRD_REVIEW = "prd_review"
     PRD_REWRITE = "prd_rewrite"
     API_DOCS_GENERATE = "api_docs_generate"
+    API_DOCS_REVIEW = "api_docs_review"
     PROMPTS_GENERATE = "prompts_generate"
+    PROMPTS_REVIEW = "prompts_review"
     DOCUMENT_OPTIMIZE = "document_optimize"
 
 

@@ -967,18 +967,50 @@ def offline() -> None:
             gate_job = jobs.create_job(gate_session, gate_artifact, {"prd_content": gate_prd})
             # 分片计划不同（api=3 片 / prompts=3 片），多给几份同样的草稿：
             # `_ScriptedModel` 用完之后会重复最后一份
+            #
+            # 05 篇：`reviews` 现在**不再为空** —— 生成完会再调一次模型做审查，
+            # 那次 `ainvoke` 消费的就是这里的第一条。给一份**带 issues 的**结论，
+            # 才能验到"审查结论真的流进了 metadata.review"（给空列表的话
+            # `_ScriptedModel` 会 IndexError → 被降级成 review_skipped，反而验不到）。
+            gate_review = json.dumps(
+                {
+                    "passed": False,
+                    "summary": "覆盖不全：导出类接口缺失",
+                    "issues": [
+                        {
+                            "severity": "HIGH",  # 大小写不该影响归一化
+                            "section": "## 第 6 章 接口清单",
+                            "problem": "PRD 的 FR-04 导出没有对应接口",
+                            "suggestion": "补一条 POST /api/v1/exports",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
             gate_model = _ScriptedModel(
                 drafts=[[f"# {gate_doc_type} 正文", "\n\n## 第 1 章 文档信息\n\n占位"]] * 4,
-                reviews=[],
+                reviews=[gate_review],
             )
-            asyncio.run(
-                run_job(
-                    gate_job,
-                    jobs=jobs,
-                    sessions=sessions,
-                    documents=DocumentService(model=gate_model),
-                )
-            )
+            # 订阅一次：既要验 metadata，也要验**事件序列**（05 篇验收 4 的"有 Review phase"）
+            # ⚠️ 这段跑在 `offline()` 这个**同步**函数里，所以起一个局部 async 帮手再用
+            # `asyncio.run` 驱动（与上面 `pipe` 同一个理由）；直接在这里 `await` 是语法错误。
+            async def _drive(job: str, documents: Any) -> list[dict[str, Any]]:
+                collected: list[dict[str, Any]] = []
+                with job_bus.subscription(job) as sub:
+                    task = start_job(job, jobs=jobs, sessions=sessions, documents=documents)
+                    while True:
+                        item = await sub.queue.get()
+                        if item.get("type") == job_bus.STREAM_END_TYPE:
+                            break
+                        collected.append(item)
+                    await task
+                return collected
+
+            gate_events = asyncio.run(_drive(gate_job, DocumentService(model=gate_model)))
+            gate_names = [str(item.get("type")) for item in gate_events]
+            gate_phases = [
+                str(item.get("phase")) for item in gate_events if item.get("type") == "phase"
+            ]
             gate_record = jobs.get_job(gate_job)
             gate_cur = sessions.documents.get_current_version(gate_session, gate_doc_type)
             gate_meta = ((gate_cur.metadata().get("quality_gate") if gate_cur else None) or {})
@@ -991,6 +1023,37 @@ def offline() -> None:
                 and bool(gate_meta.get("checks")),
                 f"{gate_record.status}｜gate={gate_meta.get('passed')}/{gate_meta.get('score')}"
                 f" checks={len(gate_meta.get('checks') or [])}",
+            )
+
+            # ---------- 05 篇：生成后审查（一次，不 Rewrite） ----------
+            gate_review_meta = ((gate_cur.metadata().get("review") if gate_cur else None) or {})
+            check(
+                f"[{gate_artifact}] 有 Review phase（SSE 发 review_started）且 review 事件在 done 之前",
+                "review_started" in gate_phases
+                and "review" in gate_names
+                and gate_names.index("review") < gate_names.index("done"),
+                "、".join(gate_names[-6:]),
+            )
+            check(
+                f"[{gate_artifact}] 审查结论写进 metadata.review（severity 归一化成小写 high）",
+                gate_review_meta.get("passed") is False
+                and gate_review_meta.get("review_skipped") is False
+                and gate_review_meta.get("summary") == "覆盖不全：导出类接口缺失"
+                and [
+                    (item.get("severity"), item.get("section"), item.get("suggestion"))
+                    for item in gate_review_meta.get("issues") or []
+                ]
+                == [("high", "## 第 6 章 接口清单", "补一条 POST /api/v1/exports")],
+                json.dumps(gate_review_meta, ensure_ascii=False)[:160],
+            )
+            check(
+                f"[{gate_artifact}] 审查不通过**仍然交付正文**（不 Rewrite，正文照写在 done 里）",
+                "正文" in gate_record.draft_content
+                and any(
+                    item.get("type") == "done" and item.get("content") == gate_record.draft_content
+                    for item in gate_events
+                ),
+                f"正文 {len(gate_record.draft_content)} 字符",
             )
         # prompts 的 gate 应当拿到了 PRD 上下文：那一条不再是 skipped
         _prompts_cur = sessions.documents.get_current_version(gate_session, "prompts")

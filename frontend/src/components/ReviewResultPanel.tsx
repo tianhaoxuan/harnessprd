@@ -127,6 +127,13 @@ export default function ReviewResultPanel({ review, className = '' }: ReviewResu
               重写有上限，改满一轮就停（避免无限循环），所以可能仍有未改完的意见。
             </p>
           )}
+          {review.summary && (
+            // 05 篇：接口文档 / 提示词的审查会给一句话总结（PRD 那条没有这个字段）。
+            // 放在最下面当"结论一句"：有 issues 时用户先看清单，没 issues 时它就是全部内容。
+            <p data-testid="review-summary" className="text-[11px] text-slate-500">
+              {review.summary}
+            </p>
+          )}
         </div>
       )}
     </div>

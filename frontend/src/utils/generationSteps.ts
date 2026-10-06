@@ -26,16 +26,23 @@ export const PRD_STEP_DEFS = [
 ] as const
 
 /**
- * 接口文档与提示词套件**只有一步**。
+ * 接口文档与提示词套件**两步**：先分片生成正文，再机器审查一次。
  *
- * 曾经这里跟 PRD 一样写了第二个"机器审查"步 —— 那是错的：后端这两条流只有
- * `api_docs_generate` / `prompts_generate` 一次模型调用，没有审查阶段，
- * 于是那一步永远停在"待办"，直到 `done` 时**两步同时打勾**，
- * 等于当着用户的面声称"做过机器审查"。宁可只显示真实发生的那一步。
+ * ⚠️ 这里**曾经写过第二步又被删掉**，05 篇又加回来 —— 两次都不是反复：
+ * 删是因为当时后端这两条流**只有一次模型调用、没有审查阶段**，那一步永远停在"待办"，
+ * 直到 `done` 时两步同时打勾，等于当着用户的面声称"做过机器审查"；
+ * 加回来是因为 05 篇真的给这两条接上了审查（`api_docs_review_agent` /
+ * `prompts_review_agent`，各一次、不 Rewrite），现在它是**真实发生**的一步。
  */
-export const API_DOCS_STEP_DEFS = [{ id: 'generate', label: '生成接口文档' }] as const
+export const API_DOCS_STEP_DEFS = [
+  { id: 'generate', label: '生成接口文档' },
+  { id: 'review', label: '机器审查' },
+] as const
 
-export const PROMPTS_STEP_DEFS = [{ id: 'generate', label: '生成提示词套件' }] as const
+export const PROMPTS_STEP_DEFS = [
+  { id: 'generate', label: '生成提示词套件' },
+  { id: 'review', label: '机器审查' },
+] as const
 
 /** 审查阶段的说明：没有正文输出，不解释用户会以为卡死（实测踩过）。 */
 export const REVIEW_STEP_HINT = '正在对照需求审查文档，通常需要 10–30 秒…'
@@ -85,12 +92,22 @@ export function createApiDocsGeneratingSteps(): StepItem[] {
   return build(API_DOCS_STEP_DEFS, 0, 0)
 }
 
+/** 05 篇：进入"机器审查"这一格（第一格生成已完成）。 */
+export function markApiDocsReviewing(): StepItem[] {
+  return build(API_DOCS_STEP_DEFS, 1, 1)
+}
+
 export function markApiDocsStepsDone(): StepItem[] {
   return build(API_DOCS_STEP_DEFS, -1, API_DOCS_STEP_DEFS.length)
 }
 
 export function createPromptsGeneratingSteps(): StepItem[] {
   return build(PROMPTS_STEP_DEFS, 0, 0)
+}
+
+/** 05 篇：提示词套件进入"机器审查"这一格。 */
+export function markPromptsReviewing(): StepItem[] {
+  return build(PROMPTS_STEP_DEFS, 1, 1)
 }
 
 export function markPromptsStepDone(): StepItem[] {

@@ -271,7 +271,7 @@ async def run_job(
     if is_optimize_artifact(record.artifact):
         await _finish_optimize(job_id, record, jobs, sessions, run, outcome, state, content)
         return
-    await _finish(job_id, record, jobs, sessions, run, outcome, state, content)
+    await _finish(job_id, record, jobs, sessions, service, run, outcome, state, content)
 
 
 # ---------------------------------------------------------------- 消费生成器
@@ -500,6 +500,57 @@ async def _on_stage(
     await publish(job_id, event)
 
 
+#: 生成后需要**机器审查**的产物（05 篇）。PRD 不在这里：它那条是"写 → 审 → 改"的回路，
+#: 审查已经嵌在 `generate_prd_with_review_events` 里了，不是收尾时才补一次。
+_REVIEWED_ARTIFACTS = frozenset({"api-docs", "prompts"})
+
+
+async def _review_generated_document(
+    job_id: str,
+    record: JobRecord,
+    jobs: JobService,
+    service: DocumentService,
+    state: _DraftState,
+    content: str,
+) -> dict[str, Any]:
+    """对**刚生成好的整篇文档**审一次，返回归一化结论（**一定会返回**）。
+
+    与 PRD 那条回路的三处不同：
+    1. **审完就完了，不 Rewrite**（产品决定）：下游产物的返工成本比 PRD 低，
+       而且自动改写会让用户失去"到底改了什么"的控制权；
+    2. **审的是拼好的整篇**：接口文档 / 提示词是多分片生成的，只有收尾时才有整篇
+       （所以在 runner 收尾、不在 `document_service` 的流里）；
+    3. 失败不抛：`service.review_api_docs()` 内部已经把异常降级成 `review_skipped`，
+       这里只负责把结论**发出去 + 存下来**。
+
+    ⚠️ 阶段事件必须**先发**：审查是一次没有正文输出的模型调用，不发 `review_started`
+    的话，用户在那一二十秒里看到一个完全没动静的进度条（实测踩过：以为卡死了）。
+    """
+    payload = record.payload()
+    prd_content = str(payload.get("prd_content") or "")
+
+    db_phase, sse_phase = PHASE_MAP["reviewing"]
+    state.flush(jobs, job_id, extra={"phase": db_phase}, force=True)
+    await publish(job_id, {"type": "phase", "phase": sse_phase})
+
+    if record.artifact == "api-docs":
+        review = await service.review_api_docs(prd_content=prd_content, content=content)
+    else:
+        api_content = payload.get("api_docs_content")
+        review = await service.review_prompts(
+            prd_content=prd_content,
+            content=content,
+            api_docs_content=api_content if isinstance(api_content, str) else "",
+        )
+
+    state.review = review
+    state.flush(
+        jobs, job_id, extra={"review_json": json.dumps(review, ensure_ascii=False)}, force=True
+    )
+    await publish(job_id, {"type": "review", "content": review})
+    return review
+
+
 def _review_from_stage(stage: Mapping[str, Any]) -> dict[str, Any] | None:
     """从阶段事件里抠出**审查结论**（`review` 事件载荷 / 库里的 `review_json`）。
 
@@ -551,6 +602,7 @@ async def _finish(
     record: JobRecord,
     jobs: JobService,
     sessions: SessionService,
+    service: DocumentService,
     run: Any,
     outcome: StreamOutcome,
     state: _DraftState,
@@ -560,6 +612,12 @@ async def _finish(
     review = state.review
     revision_applied = state.rewrites > 0
 
+    # ---------- 05 篇：接口文档 / 提示词套件的**生成后审查**（一次，不 Rewrite）----------
+    # 放在 flush(phase=done) **之前**：审查是这一趟的一部分，用户应当先看到"正在审查"，
+    # 再看到 done。反过来（先 done 再审查）会出现"已完成的任务又跳回审查中"。
+    if record.artifact in ("api-docs", "prompts"):
+        review = await _review_generated_document(job_id, record, jobs, service, state, content)
+
     state.flush(jobs, job_id, extra={"phase": "done"}, force=True)
     if revision_applied:
         # 让 run_summary 也带上"这趟改写过了"（否则只能从 done 的字段里看）
@@ -567,6 +625,8 @@ async def _finish(
     summary_payload = _finalize(run)
     # 结构校验针对**最终正文**（PRD 走到这里时 rewrite 已经做完，工单 §七 要求 gate 看最终稿）
     gate = _quality_gate_for(record, content)
+    # 上游版本快照：接口文档/提示词套件记下它们基于哪一版 PRD（05 篇的过期提示靠它）
+    derived = _derived_from(sessions, record)
 
     done_payload: dict[str, Any] = {
         "type": "done",
@@ -594,6 +654,8 @@ async def _finish(
         # 只进**落库的结果**（`GET /api/jobs/{id}` 能查到），不进 SSE 的 `done` 帧：
         # 界面上的质量报告是从版本 metadata 读的，动 SSE 契约没有收益。
         result["quality_gate"] = gate
+    if derived is not None:
+        result["derived_from"] = derived
     jobs.update_job(
         job_id,
         status="completed",
@@ -610,6 +672,7 @@ async def _finish(
         review=review,
         summary=summary_payload,
         quality_gate=gate,
+        derived_from=derived,
     )
     _sync_session(
         sessions,
@@ -854,6 +917,7 @@ def _sync_version(
     review: Mapping[str, Any] | None = None,
     summary: Mapping[str, Any] | None = None,
     quality_gate: Mapping[str, Any] | None = None,
+    derived_from: Mapping[str, Any] | None = None,
     job_status: str | None = None,
 ) -> None:
     """把这次任务的产物写进**文档版本层**（需求 §3）。**尽力而为**。
@@ -885,6 +949,7 @@ def _sync_version(
             review=review,
             run_summary=summary,
             quality_gate=quality_gate,
+            derived_from=derived_from,
             job_status=job_status,
         )
     except Exception:  # noqa: BLE001 - 版本层失败不该毁掉已经跑完的任务
@@ -896,6 +961,46 @@ def _sync_version(
 #: 需要跑结构校验的产物。取值就是版本层的 `doc_type` —— 而 `content_artifact_of()`
 #: 给出来的正是它（`optimize-api-docs` → `api-docs`），所以**不另写一张映射表**。
 _GATE_DOC_TYPES = frozenset({"prd", "api-docs", "prompts"})
+
+
+#: 有**上游文档**的产物：接口文档来自 PRD，提示词套件来自 PRD（+ 可选的接口文档）。
+#: PRD 自己从结构化摘要生成，没有文档级上游，所以不在这里。
+_DERIVED_DOC_TYPES = frozenset({"api-docs", "prompts"})
+
+
+def _derived_from(sessions: SessionService, record: JobRecord) -> dict[str, Any] | None:
+    """上游版本快照（05 篇）—— 写进版本 metadata，用来回答"这份产物基于哪一版 PRD"。
+
+    PRD 之后升版了，界面据此提示"接口文档可能已过期"（**只提示，不阻断**）。
+    没有它的话，用户只能凭记忆判断"我这份接口文档是不是对着旧 PRD 生成的"。
+
+    ⚠️ 取不到上游版本时返回 `None` 而不是写一个空壳：`derived_from` 存在就意味着
+    "有可比的上游版本号"，写个 `prd_version_no=None` 的壳会让过期判断算不出结论，
+    还让界面误以为"这份产物有追溯信息"。
+    """
+    doc_type = content_artifact_of(record.artifact)
+    if doc_type not in _DERIVED_DOC_TYPES:
+        return None
+
+    snapshot: dict[str, Any] = {}
+    prd = sessions.documents.get_current_version(record.session_id, "prd")
+    if prd is not None:
+        snapshot["prd_version_id"] = prd.id
+        snapshot["prd_version_no"] = prd.version_no
+
+    if doc_type == "prompts":
+        api_content = record.payload().get("api_docs_content")
+        if isinstance(api_content, str) and api_content.strip():
+            api_docs = sessions.documents.get_current_version(record.session_id, "api-docs")
+            if api_docs is not None:
+                snapshot["api_docs_version_id"] = api_docs.id
+                snapshot["api_docs_version_no"] = api_docs.version_no
+        else:
+            # 用户跳过接口文档直接生成提示词：**明确记下来**。导出交付包的 manifest
+            # 要说清"这份提示词没有对应的接口文档"，而不是留一个查不出原因的空白。
+            snapshot["api_docs_skipped"] = True
+
+    return snapshot or None
 
 
 def _gate_context(record: JobRecord) -> dict[str, Any]:

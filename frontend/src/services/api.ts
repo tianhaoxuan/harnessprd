@@ -151,8 +151,19 @@ export interface PrdGenerationStage {
   stage: 'writing' | 'reviewing' | 'rewriting' | 'done'
   /** 第几稿（从 1 起） */
   round?: number
-  /** 本次要修的问题（`rewriting` 时带上一轮的审核意见） */
-  issues?: Array<{ section?: string; problem?: string; suggestion?: string }>
+  /**
+   * 本次要修的问题（`rewriting` 时带上一轮的审核意见）。
+   *
+   * `severity`（05 篇）：**只有接口文档 / 提示词那两条审查会给** ——
+   * PRD 审查的提示词输出 `{section, problem, suggestion}`，没有这一档。
+   * 所以它是可选的，界面读不到时按"没分级"处理。
+   */
+  issues?: Array<{
+    severity?: 'high' | 'medium' | 'low'
+    section?: string
+    problem?: string
+    suggestion?: string
+  }>
   /** 给人看的一句话（界面直接显示） */
   detail?: string
   /** `done` 时为 true 表示审核输出不可解析、本次按通过处理 */

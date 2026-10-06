@@ -42,6 +42,8 @@ import ArtifactProgressBar from './components/ArtifactProgressBar'
 // 页面里不该出现"步骤怎么变、秒表怎么走"这类与业务流程无关的代码。
 import ClarificationContextPanel from './components/ClarificationContextPanel'
 import ClarificationStatusBadge from './components/ClarificationStatusBadge'
+import BaselineConfirmBanner from './components/BaselineConfirmBanner'
+import StaleArtifactBanner from './components/StaleArtifactBanner'
 import ClarificationWarnBanner from './components/ClarificationWarnBanner'
 import GenerationStepper from './components/GenerationStepper'
 import RunSummaryPanel from './components/RunSummaryPanel'
@@ -81,14 +83,23 @@ import { downloadBlob, downloadFile, safeFileName } from './services/download'
 // 于是 `loaded.title` / `loaded.interruptedKind` 报"属性不存在"，看不出真正原因。
 import {
   debouncedSaveSession,
+  fetchArtifactLineage,
+  fetchDeliveryZip,
   flushPendingSave,
   loadSession as loadRemoteSession,
   saveSession as saveRemoteSession,
 } from './services/sessionService'
-import { buildZip, splitPromptSuite, type ZipEntry } from './services/zip'
 // 三份产物的元信息表（`DOC_META` / `DOC_ORDER` / `DOC_RUN_TYPES`）已搬到 `utils/docMeta`：
 // `utils/jobViews` 也要用它把 Job 的 artifact 映射成视图，而它 import 本文件就成环了。
 import { DOC_META, DOC_ORDER, DOC_RUN_TYPES } from './utils/docMeta'
+// 需求基线（05 篇）：确认之后才允许生成下游产物，改过 PRD 就失效。判据是纯函数，可离线断言。
+import {
+  contentFingerprint,
+  describeBaseline,
+  localTimestamp,
+  shouldRevokeBaseline,
+  type BaselineSnapshot,
+} from './utils/baseline'
 // 顶栏「产出物」的格子怎么裁剪、怎么点亮：**纯函数**，所以状态由内容推导而不另存一份
 // （刷新后不会出现"进度条说做完了、正文却是空的"），也可以离线断言。
 import {
@@ -100,6 +111,7 @@ import {
 import { confirmGenerateDespiteClarificationWarning } from './utils/clarificationConfirm'
 import { assessClarificationState } from './utils/clarificationState'
 import type { JobReview } from './types/job'
+import type { ArtifactLineage } from './types/lineage'
 import {
   STEPS,
   type ChatMessage,
@@ -257,6 +269,31 @@ export interface SessionData {
    * 读的时候用 `formSubViewForEntryMode(entryMode)` 推导即可（需求 §八）。
    */
   formSubView?: FormSubView
+  /**
+   * ---------- 需求基线（05 篇）----------
+   *
+   * 用户通读 PRD 之后点「确认需求基线」，**绑定当时那一版**（版本 id + 编号 + 正文指纹），
+   * 下游的接口文档 / 提示词生成才被解锁。改过 PRD 就失效（见 `utils/baseline.ts`）。
+   *
+   * ⚠️ 这五个字段**必须由前端写进快照**（与 `activeJobId` / `prdReviewResult` 同一条理由）：
+   * 前端每次自动保存是整份覆盖，不带它们就等于把服务端刚写的那份抹掉 ——
+   * 而**后端也会读它**：`POST /api/jobs` 拿它做门禁（未确认基线创建下游任务 → 400）。
+   * 所以这不仅是界面状态，是**跨端契约的一半**。
+   */
+  prdBaselineConfirmed?: boolean
+  /** 确认时刻（带时区偏移的 ISO，给人看的） */
+  prdBaselineConfirmedAt?: string | null
+  /** 确认时那一版 PRD 的版本 id（版本行变了 → 失效） */
+  prdBaselineVersionId?: string | null
+  /** 确认时那一版的编号（界面上显示「基于 PRD v2」） */
+  prdBaselineVersionNo?: number | null
+  /**
+   * 确认时那一版正文的指纹（`contentFingerprint`）。
+   *
+   * 为什么要它：用户在确认之后**就地手改** PRD 时版本行不会变，只有正文变了 ——
+   * 没有指纹就发现不了，界面会一直显示"已确认基线"而下游产物已经对不上。
+   */
+  prdBaselineContentHash?: string | null
   updatedAt: string
 }
 
@@ -799,6 +836,31 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
   }, [])
   /** PRD 的审查结论（落快照，刷新后仍能显示审核徽标）。 */
   const [prdReviewResult, setPrdReviewResult] = useState<JobReview | null>(null)
+
+  /**
+   * ---------- 需求基线（05 篇）----------
+   *
+   * 一个对象而不是五个 state：它们**要么一起有、要么一起没有**（确认时同时写、
+   * 失效时同时清），拆成五个就迟早出现"confirmed 清了、版本号还留着"的中间态，
+   * 而那种快照会让后端门禁放行、界面却显示未确认。
+   *
+   * `baselineRef` 与 state 同步：判定失效发生在 `writeDoc` 里（编辑器每次改动都走它），
+   * 而那个回调必须是稳定身份（它被 `useGenerationJob` 收着），不能依赖 state。
+   */
+  const [baseline, setBaseline] = useState<BaselineSnapshot>({})
+  const baselineRef = useRef<BaselineSnapshot>({})
+  const [baselineBusy, setBaselineBusy] = useState(false)
+  const applyBaseline = useCallback((next: BaselineSnapshot) => {
+    baselineRef.current = next
+    setBaseline(next)
+  }, [])
+  const baselineInfo = useMemo(() => describeBaseline(baseline), [baseline])
+  /**
+   * 三份产物的版本与上游关系（05 篇）。审核页打开、任务收尾后各拉一次。
+   * `null` = 还没拉到 / 拉失败 —— 界面那时**不显示过期提示**（宁可少提示，
+   * 也不要凭过期数据说"你这份文档过期了"）。
+   */
+  const [lineage, setLineage] = useState<ArtifactLineage | null>(null)
   /**
    * 会话"第一次待写"的时刻（`null` = 当前没有待写）。
    *
@@ -853,11 +915,32 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     [prdContent, apiDocsContent, promptsContent],
   )
 
-  const writeDoc = useCallback((kind: DocKind, content: string) => {
-    if (kind === 'prd') setPrdContent(content)
-    else if (kind === 'api') setApiDocsContent(content)
-    else setPromptsContent(content)
-  }, [])
+  const writeDoc = useCallback(
+    (kind: DocKind, content: string) => {
+      if (kind === 'prd') {
+        setPrdContent(content)
+        // ---------- 05 篇：PRD 正文变了 → 需求基线失效 ----------
+        // 四条路都会走到这里（**一个判据点**，不必四处撒钩子）：
+        //   ① 用户在编辑器里手改（每次 onContentChange）；
+        //   ② 重新生成 PRD（任务推的增量与终稿）；
+        //   ③ PRD 优化完成（改的也是这份正文）；
+        //   ④ 从版本历史「恢复此版本」（`DocumentReviewWithVersions` 恢复成功后
+        //      通过 `onContentChange` 写回工作稿）。
+        // 判据是**指纹**（见 `utils/baseline.ts`）：撤销一次就够，之后
+        // `prdBaselineConfirmed` 已经是 false，`shouldRevokeBaseline` 直接返回 false，
+        // 所以不会每敲一个字弹一次提示。
+        if (shouldRevokeBaseline(baselineRef.current, null, content)) {
+          applyBaseline({})
+          setNotice?.({
+            text: 'PRD 已改动，需求基线失效 —— 重新通读并确认后，才能再生成接口文档与提示词。',
+            warn: true,
+          })
+        }
+      } else if (kind === 'api') setApiDocsContent(content)
+      else setPromptsContent(content)
+    },
+    [applyBaseline],
+  )
 
   /**
    * 推导某一份产物当前的状态。
@@ -1005,6 +1088,15 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       // 这正是"刷新即重连"的入口（本机自用那条路；V2 编辑态走下面那个远程加载 effect）。
       applyActiveJobId(data.activeJobId ?? null)
       restorePrdReview(data.prdReviewResult)
+      // 需求基线（05 篇）：与 `prdReviewResult` 同一条理由 —— 它落快照，
+      // 恢复时**必须写回**，否则刷新之后所有下游按钮都变回禁用（用户会以为自己的确认丢了）。
+      applyBaseline({
+        prdBaselineConfirmed: data.prdBaselineConfirmed,
+        prdBaselineConfirmedAt: data.prdBaselineConfirmedAt,
+        prdBaselineVersionId: data.prdBaselineVersionId,
+        prdBaselineVersionNo: data.prdBaselineVersionNo,
+        prdBaselineContentHash: data.prdBaselineContentHash,
+      })
       // 入口（04）：老会话按**它自己快照里的** `entryMode` 落地，不再看 localStorage。
       // 快照里有 `formSubView` 就优先用，没有就用 `entryMode` 推导（需求 §八）。
       if (data.entryMode) {
@@ -1128,6 +1220,15 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       // 漏了它，刷新后会停在一个永远不动的"生成中"。
       applyActiveJobId(data.activeJobId ?? null)
       restorePrdReview(data.prdReviewResult)
+      // 需求基线（05 篇）：与 `prdReviewResult` 同一条理由 —— 它落快照，
+      // 恢复时**必须写回**，否则刷新之后所有下游按钮都变回禁用（用户会以为自己的确认丢了）。
+      applyBaseline({
+        prdBaselineConfirmed: data.prdBaselineConfirmed,
+        prdBaselineConfirmedAt: data.prdBaselineConfirmedAt,
+        prdBaselineVersionId: data.prdBaselineVersionId,
+        prdBaselineVersionNo: data.prdBaselineVersionNo,
+        prdBaselineContentHash: data.prdBaselineContentHash,
+      })
       // 入口（04）：老会话按**它自己快照里的** `entryMode` 落地，不再看 localStorage。
       // 快照里有 `formSubView` 就优先用，没有就用 `entryMode` 推导（需求 §八）。
       if (data.entryMode) {
@@ -1253,6 +1354,14 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
         // （见 `activeJobIdRef` 的说明）。
         activeJobId: activeJobIdRef.current,
         prdReviewResult,
+        // 需求基线（05 篇）：**必须由前端写进快照**。后端 `POST /api/jobs` 会读它做门禁
+        // （未确认基线创建 api-docs / prompts 任务 → 400），而前端每次自动保存是整份覆盖
+        // —— 不带这几个字段就等于把用户刚点过的「确认需求基线」抹掉，下一次生成直接 400。
+        prdBaselineConfirmed: baseline.prdBaselineConfirmed,
+        prdBaselineConfirmedAt: baseline.prdBaselineConfirmedAt ?? null,
+        prdBaselineVersionId: baseline.prdBaselineVersionId ?? null,
+        prdBaselineVersionNo: baseline.prdBaselineVersionNo ?? null,
+        prdBaselineContentHash: baseline.prdBaselineContentHash ?? null,
         // 入口（04）：这两项也**必须由前端写进快照** —— 服务端的
         // `derive_summary_fields()` 读的就是 `entryMode`（填 `plans.entry_mode` 那一列），
         // 而整份覆盖意味着"前端不带它 = 把它抹掉"。不带的话列表页的入口标签
@@ -1278,6 +1387,8 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       // ⚠️ **不放 `activeJobId`**：它从 ref 读，所以这个回调不必因为它换身份
       // （依赖数组里的 state 只用于"确认快照形状要带这个字段"这件事本身）。
       prdReviewResult,
+      // 需求基线（05 篇）：与 `prdReviewResult` 同理 —— 它落快照，所以回流时必须是新值。
+      baseline,
       readDoc,
     ],
   )
@@ -2260,71 +2371,44 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
   )
 
   /**
-   * 一键打包下载三份产物（zip）。
+   * 导出**交付包**（zip）。
    *
-   * 三个刻意的决定：
-   * 1. **提示词套件按 `=== FILE: ===` 拆成单个文件**放进 zip —— 它本来就是
-   *    "多文件产物"，整份下下来还得让用户自己手动切；拆不出来（老产物没有分隔行）
-   *    就整份放一个文件，并在通知里如实说明。
-   * 2. **没有的产物不占位、也不失败**：只打包已有的，通知里点名"还没生成的是哪几份"。
-   *    直接失败会被当成按钮坏了；静默少文件则会被当成产物齐了。
-   * 3. **打包在本地做**（见 `services/zip.ts`）：离线可用，也不把产物再传回服务端。
+   * ## 05 篇：从"前端自己打包"改成"后端出交付包"
+   *
+   * 之前是前端拿三份正文 + `services/zip.ts` 手写 deflate/CRC 组包。改到后端（`GET
+   * /api/session/{id}/export`）换来三样东西：
+   *
+   * 1. **包里有 README.md 与 manifest.json** —— 这个 ZIP 是要发给别人的，对方只看得到
+   *    三个 `.md` 不知道哪份是终稿、质检哪几项没过、PRD 改过之后下游跟上没有。
+   *    而这些信息（版本号、`derived_from`、`quality_gate`、`review`）**在后端的版本
+   *    metadata 里**，前端要么多发几个请求、要么只能用界面内存态那一份（刷新就没了）；
+   * 2. **拿的是版本层的 current**，不是编辑器里的工作稿 —— 用户可能正开着某一版预览；
+   * 3. **少一份实现**：`services/zip.ts` 那 230 行手写压缩随之删除。
+   *
+   * 提示词套件按 `=== FILE: ===` 拆成单个文件的能力**保留**：后端写成包里的
+   * `prompts/` 目录（拆分规则只留后端一份，见 `quality_gate.split_prompt_files`）。
    */
   const handleDownloadBundle = useCallback(() => {
-    const folder = safeFileName((submitted?.product_name ?? '').trim(), 'harnessprd-产物')
-    const entries: ZipEntry[] = []
-    const missing: DocKind[] = []
-    let suiteNote = ''
-    for (const kind of DOC_ORDER) {
-      const content = readDoc(kind).trim()
-      if (!content) {
-        missing.push(kind)
-        continue
-      }
-      if (kind === 'prompts') {
-        const files = splitPromptSuite(content)
-        if (files.length > 0) {
-          for (const file of files) {
-            entries.push({
-              path: `${folder}/${DOC_META.prompts.fileStem}/${file.path}`,
-              content: file.content,
-            })
-          }
-          suiteNote = `提示词套件拆成 ${files.length} 个文件`
-          continue
-        }
-        suiteNote = '提示词套件没有分隔行，整份存放'
-      }
-      entries.push({ path: `${folder}/${DOC_META[kind].fileStem}.md`, content })
-    }
-    if (entries.length === 0) {
-      setNotice({ text: '三份产物都还没有内容，没有可打包的东西。', warn: true })
+    if (!savedId) {
+      setNotice({ text: '还没保存到服务端，暂时没有可导出的交付包。', warn: true })
       return
     }
     setBundleBusy(true)
     void (async () => {
       try {
-        const bytes = await buildZip(entries)
-        downloadBlob(
-          `${folder}-三份产物.zip`,
-          new Blob([bytes as BlobPart], { type: 'application/zip' }),
-        )
+        const { blob, fileName } = await fetchDeliveryZip(savedId)
+        downloadBlob(fileName, blob)
         setNotice({
-          text:
-            `已打包 ${entries.length} 个文件（${(bytes.length / 1024).toFixed(1)} KB` +
-            `${suiteNote ? '，' + suiteNote : ''}）；` +
-            (missing.length > 0
-              ? `还没生成：${missing.map((k) => DOC_META[k].title).join('、')}`
-              : '三份产物齐全'),
-          warn: missing.length > 0,
+          text: `已导出交付包 ${fileName}（${(blob.size / 1024).toFixed(1)} KB）：含 README、manifest 与已有产物。`,
+          warn: false,
         })
       } catch (error) {
-        setNotice({ text: `打包失败：${describeApiError(error)}`, warn: true })
+        setNotice({ text: `导出交付包失败：${describeApiError(error)}`, warn: true })
       } finally {
         setBundleBusy(false)
       }
     })()
-  }, [readDoc, submitted])
+  }, [savedId])
 
   /** 用户编辑产物正文。 */
   const handleDocChange = useCallback(    (kind: DocKind, content: string) => {
@@ -2515,6 +2599,84 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
    * 而那条链条约束在服务端是会 422 的（这里先拦住，免得白跑一趟）。
    * 想看后面几步用调试跳转行，那是**显式的逃生口**，不混进正常按钮里。
    */
+  // ---------------------------------------------------------------- 需求基线（05 篇）
+
+  /**
+   * 拉一次产物溯源信息（三份产物的版本号 + 上游快照 + 过期文案）。
+   *
+   * 时机：审核页打开时、任务收尾后（`jobGen.isJobRunning` 由真变假）。
+   * 为什么不常驻轮询：版本号只在**任务完成**或**恢复历史版本**时才会变，
+   * 而这两种情况上面两条都覆盖了。
+   */
+  const refreshLineage = useCallback(async () => {
+    if (!savedId) return
+    const next = await fetchArtifactLineage(savedId)
+    if (next) setLineage(next)
+  }, [savedId])
+
+  const prevJobRunningRef = useRef(false)
+  useEffect(() => {
+    const running = jobGen.isJobRunning
+    if (prevJobRunningRef.current && !running) void refreshLineage()
+    prevJobRunningRef.current = running
+  }, [jobGen.isJobRunning, refreshLineage])
+  // 审核页打开时也拉一次：刷新后 `isJobRunning` 一直是 false，那条边沿永远不会触发。
+  useEffect(() => {
+    if (viewState.startsWith('review-') && savedId) void refreshLineage()
+  }, [viewState, savedId, refreshLineage])
+
+  /**
+   * 确认需求基线：**绑定当前 PRD 那一版**（版本 id + 编号 + 正文指纹）。
+   *
+   * ⚠️ 版本号必须问后端要（`artifact-lineage`）：前端手上没有"PRD 的当前版本 id"——
+   * 版本列表是按 `doc_type` 一次查一份的，而这里要的是**权威当前版**，
+   * 不是用户正在预览的那一版（预览态下确认基线更该绑 current）。
+   *
+   * 拉不到版本号也照样确认（`version_id` / `version_no` 记 `null`）：那时按**指纹**判失效，
+   * 比"因为拿不到版本号就不让确认"要好 —— 后者会让用户在接口挂了的时候彻底走不下去。
+   */
+  const confirmPrdBaseline = useCallback(async () => {
+    setBaselineBusy(true)
+    try {
+      const next = await fetchArtifactLineage(savedId ?? '')
+      const prd = next?.documents.prd
+      applyBaseline({
+        prdBaselineConfirmed: true,
+        prdBaselineConfirmedAt: localTimestamp(),
+        prdBaselineVersionId: prd?.version_id ?? null,
+        prdBaselineVersionNo: prd?.version_no ?? null,
+        prdBaselineContentHash: contentFingerprint(prdContent),
+      })
+      // 顺手把溯源信息也用上：刚确认过，界面上的过期提示该按最新版本算
+      if (next) setLineage(next)
+      setNotice({
+        text: `已确认需求基线${prd?.version_no ? `（PRD v${prd.version_no}）` : ''} —— 现在可以生成接口文档与提示词了。`,
+        warn: false,
+      })
+    } catch (error) {
+      setNotice({ text: `确认需求基线失败（${describeApiError(error)}）`, warn: true })
+    } finally {
+      setBaselineBusy(false)
+    }
+  }, [applyBaseline, prdContent, savedId])
+
+  /** 当前该显示的那条过期提示（按产物取；`null` = 没有提示）。 */
+  const staleFor = useCallback(
+    (kind: DocKind): string | null => {
+      if (!lineage) return null
+      if (kind === 'api') return lineage.stale.api_docs?.stale ? lineage.stale.api_docs.message : null
+      if (kind === 'prompts') return lineage.stale.prompts?.stale ? lineage.stale.prompts.message : null
+      return null
+    },
+    [lineage],
+  )
+
+  /** PRD 审查里 high 级问题的条数（确认基线的风险提示用）。 */
+  const highIssueCount = useMemo(
+    () => (prdReviewResult?.issues ?? []).filter((issue) => issue.severity === 'high').length,
+    [prdReviewResult],
+  )
+
   const docActionsFor = useCallback(
     (kind: DocKind): DocumentAction[] => {
       const stage = STAGE_ACTIONS[kind]
@@ -2606,9 +2768,16 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
           // 覆盖风险由 `title` 说清楚（改文案会让同一颗按钮在不同会话里叫两个名字）。
           label: '生成接口文档 →',
           variant: allApproved ? 'secondary' : 'primary',
-          title: apiDocsContent.trim()
-            ? '会重新生成并覆盖现有接口文档 —— 想只改一节请用接口文档页的「AI 优化」'
-            : '直接开后台生成任务：团队接口规范与参考示例由后端技能包全量注入，不需要确认',
+          // ---------- 05 篇：需求基线是**下游生成的前置条件** ----------
+          // 界面在这里禁用 + 旁边一条 amber 横幅说明原因（`BaselineConfirmBanner`）；
+          // 后端 `POST /api/jobs` 用同一条规则兜底（未确认 → 400）。两处判据一致，
+          // 前端这层是为了"让用户看得见原因"，不是为了替代后端。
+          disabled: !baselineInfo.confirmed,
+          title: !baselineInfo.confirmed
+            ? '请先在上方确认需求基线 —— 接口文档从这份 PRD 推导，确认过再生成才对得上你认可的那一版需求'
+            : apiDocsContent.trim()
+              ? '会重新生成并覆盖现有接口文档 —— 想只改一节请用接口文档页的「AI 优化」'
+              : '直接开后台生成任务：团队接口规范与参考示例由后端技能包全量注入，不需要确认',
           // ⚠️ **先把 PRD 标成已通过**，再往下生成。不通过就生成会走进死胡同：
           // 生成不看"通过"标志（`handleGenerateDocument` 只要求有 `prd_content`），
           // 但**下一步的「通过」看**（`STAGE_ACTIONS.api.upstream === 'prd'`）——
@@ -2623,7 +2792,11 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
           key: 'skip-api-docs',
           label: '跳过接口文档，直接生成提示词',
           variant: entryMode === 'structured' ? 'link' : 'secondary',
-          title: '提示词套件会缺少接口清单与字段契约那部分细节',
+          // 与上面同一条前置：提示词也是从 PRD 推导的，跳过接口文档不等于跳过基线确认
+          disabled: !baselineInfo.confirmed,
+          title: !baselineInfo.confirmed
+            ? '请先在上方确认需求基线'
+            : '提示词套件会缺少接口清单与字段契约那部分细节',
           onClick: () => {
             // ⚠️ 只在"这条入口本来会生成接口文档"时问一句。`prompts-debug` 本来就是
             // 跳过接口文档的入口（见 `ENTRY_MODES` 的 hint），在那里再问一遍是噪音。
@@ -2668,6 +2841,8 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       entryMode,
       prdContent,
       apiDocsContent,
+      // 05 篇：两个下游按钮的可用性看它（未确认需求基线 → 禁用）
+      baselineInfo.confirmed,
     ],
   )
 
@@ -3167,6 +3342,47 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
                   onCopyRequestId={copyErrorRequestId}
                 />
               ) : undefined
+            }
+            // ---------- 05 篇：交付链路的两条提示 ----------
+            // 都放在 `warnSlot`（步骤条之下、正文之上）：它们是"动手之前该知道的事"，
+            // 而不是"读完之后要处理的结果"。生成中不显示 —— 那时按钮本来就不可点。
+            warnSlot={
+              isGenerating && generatingKind === activeDoc ? undefined : (
+                <>
+                  {/* 需求基线：只在 PRD 页 —— 它是链路的起点，下游两页不需要再确认一遍 */}
+                  {activeDoc === 'prd' && (
+                    <BaselineConfirmBanner
+                      confirmed={baselineInfo.confirmed}
+                      label={baselineInfo.label}
+                      highIssueCount={highIssueCount}
+                      busy={baselineBusy}
+                      onConfirm={() => void confirmPrdBaseline()}
+                    />
+                  )}
+                  {/* 过期提示：接口文档 / 提示词各按自己的上游比较（文案由后端给） */}
+                  {activeDoc !== 'prd' && staleFor(activeDoc) && (
+                    <StaleArtifactBanner
+                      message={staleFor(activeDoc) ?? ''}
+                      artifactLabel={DOC_META[activeDoc].title}
+                      busy={isGenerating && generatingKind === activeDoc}
+                      onRegenerate={() => {
+                        // 重新生成走现有的 Job 流程。⚠️ 若 PRD 已经升版，基线也已经失效
+                        // （改 PRD 就撤销），那时后端会 400 拦下 —— 前端在这里先说明白，
+                        // 不让用户白点一次。
+                        if (!baselineInfo.confirmed) {
+                          setNotice({
+                            text: '需求基线已失效（PRD 变更后需要重新确认）—— 请先到 PRD 页通读并确认基线。',
+                            warn: true,
+                          })
+                          setViewState('review-prd')
+                          return
+                        }
+                        void handleGenerateDocument(activeDoc)
+                      }}
+                    />
+                  )}
+                </>
+              )
             }
             // 传 `undefined` 而不是空组件：否则插槽判断为真，正文下面会多一个空的 `mx-4`
             // ⚠️ `streaming` 必须传：任务化之后 `run_summary` 仍是**收尾前**发的那一帧，

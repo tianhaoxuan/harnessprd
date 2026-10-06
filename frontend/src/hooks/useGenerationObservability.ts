@@ -29,7 +29,9 @@ import {
   finalizePrdStepsFromSummary,
   getStepFailureLabel,
   mapPrdPhaseToSteps,
+  markApiDocsReviewing,
   markApiDocsStepsDone,
+  markPromptsReviewing,
   markPromptsStepDone,
   type StepItem,
 } from '../utils/generationSteps'
@@ -78,6 +80,13 @@ export interface GenerationObservability {
   beginPrdGeneration: () => void
   beginApiDocsGeneration: () => void
   beginPromptsGeneration: () => void
+  /**
+   * 进入"机器审查"这一格（05 篇）。`artifact` 取 `api-docs` / `prompts`。
+   *
+   * 为什么收一个字符串而不是两个函数：它只用来**选步骤条定义**，
+   * 加第三个被审查的产物时改这里一处即可，不必再往接口上加成员。
+   */
+  beginGenerationReview: (artifact: string) => void
   /** AI 优化（单请求，`part 1/1`）：步骤条与三个 `begin*` 不同，但汇总/失败要同一套。 */
   beginOptimizeGeneration: () => void
 
@@ -182,6 +191,19 @@ export function useGenerationObservability(): GenerationObservability {
   const beginPromptsGeneration = useCallback(() => {
     setGenerationSteps(createPromptsGeneratingSteps())
     setGenerationHint('正在分片生成提示词套件，可能需要一两分钟…')
+  }, [])
+  /**
+   * 进入"机器审查"这一步（05 篇：接口文档 / 提示词**生成完之后**的那一次审查）。
+   *
+   * 每一步都从 `create*GeneratingSteps()` 出发（两格全待办），审查开始时第一格标完成、
+   * 第二格标进行中 —— 与 PRD 的 `mapPrdPhaseToSteps('reviewing')` 同一个观感。
+   *
+   * ⚠️ 文案用 `REVIEW_STEP_HINT`：审查是**没有正文输出**的一次调用，
+   * 不解释的话用户看着不动的进度条会以为卡死（PRD 那条实测踩过）。
+   */
+  const beginGenerationReview = useCallback((artifact: string) => {
+    setGenerationSteps(artifact === 'api-docs' ? markApiDocsReviewing() : markPromptsReviewing())
+    setGenerationHint(REVIEW_STEP_HINT)
   }, [])
   /** AI 优化：单请求（后端按 `1/1` 记账），所以只有一行"正在重写这一节"。 */
   const beginOptimizeGeneration = useCallback(() => {
@@ -307,6 +329,7 @@ export function useGenerationObservability(): GenerationObservability {
     beginPrdGeneration,
     beginApiDocsGeneration,
     beginPromptsGeneration,
+    beginGenerationReview,
     beginOptimizeGeneration,
     handleContextUsage,
     handleRunSummary,

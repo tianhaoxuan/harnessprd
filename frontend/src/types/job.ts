@@ -55,6 +55,13 @@ export type JobReviewIssue = NonNullable<PrdGenerationStage['issues']>[number]
 export interface JobReview {
   passed: boolean
   issues: JobReviewIssue[]
+  /**
+   * 一句话总结（05 篇：接口文档 / 提示词的审查输出里带）。
+   *
+   * ⚠️ PRD 那一条**没有**这个字段（它的提示词输出 `{ok, issues}`）—— 所以是可选的，
+   * 界面读不到就不显示那一行。
+   */
+  summary?: string | null
   /** 审到第几稿 */
   round?: number | null
   /** 这一稿是哪个模型审的（服务端给，便于发现"第二双眼睛"静默回落） */

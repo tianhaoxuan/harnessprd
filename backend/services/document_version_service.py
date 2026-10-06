@@ -597,6 +597,7 @@ class DocumentVersionService:
         review: Mapping[str, Any] | None = None,
         run_summary: Mapping[str, Any] | None = None,
         quality_gate: Mapping[str, Any] | None = None,
+        derived_from: Mapping[str, Any] | None = None,
         job_status: str | None = None,
     ) -> DocumentVersionRecord:
         """Job 收尾时把产物落成一个版本 —— `job_runner` 调的就是这个方法。
@@ -616,9 +617,9 @@ class DocumentVersionService:
         `optimize-prd` 任务）。需求 §2 那张 `ARTIFACT_TO_DOC_TYPE` 表就是
         `job_models.content_artifact_of`，本层不另抄一份。
 
-        `review` **只在 PRD 的整份生成时写入**（需求 §7）：优化不重新审稿，
-        不带 `review` 就不会覆盖旧值（`merge_metadata` 是浅合并），
-        界面上的"审核通过 / 还有 N 条意见"因此不会凭空消失。
+        `review` 在**整份生成**时写入。05 篇之前这里写的是「**只在 PRD** 的整份生成时写入」——
+        那时只有 PRD 有审查环节；现在接口文档与提示词套件也各审一次（`api_docs_review_agent` /
+        `prompts_review_agent`），所以那个 doc_type 判断去掉了，只留"优化不写"这一条。
 
         `job_status="failed"` 用于"任务失败但留下了半成品"那条路径（需求 §3）：
         版本照写（用户刷新后能看到写到哪了），但在 metadata 里标明这一版是残的。
@@ -630,6 +631,11 @@ class DocumentVersionService:
         | 谁产出 | LLM（Review Agent） | 纯代码规则 |
         | 哪些产物有 | 只有 PRD 的整份生成 | **三份产物都跑**（含优化、含失败路径） |
         | 覆盖语义 | 只在没有值时写 | **每次都覆盖**（它描述的是"眼前这份正文"） |
+
+        `derived_from`（05 篇）是**上游版本快照**：接口文档记下它基于哪一版 PRD、
+        提示词套件再额外记下它基于哪一版接口文档。它只在**整份生成**时写（优化不改上游），
+        而且与 `quality_gate` 相反 —— 优化时**不传它就保持原值**（浅合并），这是对的：
+        优化后的正文还是从那一版 PRD 推导来的。
         """
         doc_type = self._require_doc_type(content_artifact_of(artifact))
         slot = self.ensure_document(session_id, doc_type)
@@ -644,8 +650,13 @@ class DocumentVersionService:
         # （正文已经换成新的了，报告还说旧的那份合格）。
         if quality_gate:
             metadata["quality_gate"] = dict(quality_gate)
+        if derived_from:
+            metadata["derived_from"] = dict(derived_from)
         optimize = is_optimize_artifact(artifact)
-        if review and doc_type == "prd" and not optimize:
+        if review and not optimize:
+            # ⚠️ 不再限定 doc_type == "prd"（05 篇改了）：三份产物现在都有审查环节。
+            # 优化仍然不写：它不重新审稿，而"不传 review"就保留了那一版出生时的结论
+            # （浅合并），界面上的「审核通过 / 还有 N 条意见」因此不会凭空消失。
             metadata["review"] = dict(review)
 
         with self._repository.connection() as conn:

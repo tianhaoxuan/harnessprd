@@ -160,15 +160,22 @@ export default function DocumentReviewWithVersions({
   const preview = versions.preview
   const currentItem = versions.versions.find((item) => item.is_current)
   const focused = preview ?? versions.currentDetail
-  const review =
-    docType === 'prd'
-      ? selectSidebarReview({
-          focused,
-          focusedKind: preview?.source_kind ?? currentItem?.source_kind,
-          focusedVersionNo: preview?.version_no ?? versions.currentVersionNo,
-          fallback: reviewResult,
-        })
-      : null
+  /**
+   * 审查意见（05 篇：**三份产物都有**了）。
+   *
+   * 改造前这里写死了 `docType === 'prd' ? ... : null` —— 那时只有 PRD 有审查环节。
+   * 现在接口文档与提示词各审一次（`api_docs_review_agent` / `prompts_review_agent`），
+   * 结论同样落在 `metadata.review` 里，所以三份都按同一套规则取。
+   *
+   * ⚠️ 老数据回退（`fallback`）仍然只有 PRD 有：那个 `prdReviewResult` 是
+   * **会话快照**里的字段，v1 迁移导入的 PRD 只有它没有 metadata.review。
+   */
+  const review = selectSidebarReview({
+    focused,
+    focusedKind: preview?.source_kind ?? currentItem?.source_kind,
+    focusedVersionNo: preview?.version_no ?? versions.currentVersionNo,
+    fallback: docType === 'prd' ? reviewResult : null,
+  })
   const qualityGate = selectSidebarQualityGate(focused)
 
   /**

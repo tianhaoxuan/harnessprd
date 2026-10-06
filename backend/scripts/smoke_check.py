@@ -1224,6 +1224,10 @@ def main() -> int:
         "/api/session/list",
         "/api/session/{id}",
         "/api/session/save",
+        # 交付包导出（05 篇，已实现；`api/session.py`）。它返回的是 zip 字节流，
+        # 不是 JSON —— 声明在路由的 `responses` 里。
+        "/api/session/{id}/export",
+        "/api/session/{id}/artifact-lineage",
         # 生成任务 3 条（Generation Job，已实现；`api/jobs.py`）。
         # 三条路径都由路由自带 `/api/jobs` 前缀，**不在 `/api/v1` 下**（需求给定）。
         "/api/jobs",
@@ -2730,8 +2734,13 @@ def main() -> int:
     steps = [s.value for s in LlmStep]
     check(
         "step 枚举齐全且是 snake_case（禁止业务里写字面量）",
-        len(steps) == 11 and len(set(steps)) == 11 and all(s == s.lower() and " " not in s for s in steps),
+        len(steps) == 13 and len(set(steps)) == 13 and all(s == s.lower() and " " not in s for s in steps),
         "、".join(steps),
+    )
+    check(
+        "05 篇新增的两个审查步骤在枚举里（接口文档 / 提示词各一次，不写字面量）",
+        {"api_docs_review", "prompts_review"} <= set(steps),
+        "、".join(sorted(item for item in steps if item.endswith("_review"))),
     )
 
     check(
@@ -3474,6 +3483,282 @@ def main() -> int:
         _ctx_probe == {"prd_content": _qg_prd},
         json.dumps(sorted(_ctx_probe), ensure_ascii=False),
     )
+
+    # ---------- 05 篇：需求基线门禁 + 交付包导出 ----------
+    # 这一段单起一个**临时库的 app**：基线门禁要真写会话（`POST /api/session/save`），
+    # 挂在默认库上会污染开发用的 backend/harnessprd.db。
+    import io as _io5  # noqa: PLC0415
+    import shutil as _shutil5  # noqa: PLC0415
+    import zipfile as _zipfile5  # noqa: PLC0415
+
+    from fastapi.testclient import TestClient as _Client5  # noqa: PLC0415
+
+    from main import create_app as _create_app5  # noqa: PLC0415
+    from services.delivery_export_service import (  # noqa: PLC0415
+        build_delivery_zip,
+        delivery_file_name,
+    )
+    from services.delivery_guards import (  # noqa: PLC0415
+        BASELINE_GATED_ARTIFACTS,
+        BaselineNotConfirmed,
+        assert_can_create_job,
+        baseline_confirmed,
+    )
+
+    # ---- ① 纯函数：四种组合（这是门禁规则本身，不依赖 HTTP）
+    _guard_cases = [
+        ("api-docs", {"prdBaselineConfirmed": True}, True),
+        ("api-docs", {"prdBaselineConfirmed": False}, False),
+        ("api-docs", {}, False),
+        ("api-docs", None, False),
+        # 宽松转换是**故意不做**的：字符串 "true" / 数字 1 都算未确认（失败方向要安全）
+        ("api-docs", {"prdBaselineConfirmed": "true"}, False),
+        ("api-docs", {"prdBaselineConfirmed": 1}, False),
+        # 不受管的产物一律放行（PRD 从结构化摘要来，没有上游文档）
+        ("prd", {}, True),
+        ("optimize-api-docs", {}, True),
+        ("optimize-prompts", {}, True),
+    ]
+    _guard_results: list[str] = []
+    for _artifact, _data, _expected in _guard_cases:
+        try:
+            assert_can_create_job(artifact=_artifact, session_data=_data)
+            _allowed = True
+        except BaselineNotConfirmed:
+            _allowed = False
+        if _allowed != _expected:
+            _guard_results.append(f"{_artifact}/{_data}→{_allowed}")
+    check(
+        "需求基线门禁：八种组合都对（只认严格 True；只拦 api-docs / prompts 的**生成**）",
+        not _guard_results and BASELINE_GATED_ARTIFACTS == {"api-docs", "prompts"},
+        "、".join(_guard_results) or "、".join(sorted(BASELINE_GATED_ARTIFACTS)),
+    )
+    check(
+        "需求基线门禁：只认严格 True（\"true\" / 1 / 缺键都不算确认）",
+        baseline_confirmed({"prdBaselineConfirmed": True}) is True
+        and baseline_confirmed({"prdBaselineConfirmed": "true"}) is False
+        and baseline_confirmed({"prdBaselineConfirmed": 1}) is False
+        and baseline_confirmed({}) is False
+        and baseline_confirmed(None) is False,
+    )
+
+    # ---- ② HTTP：未确认基线开 api-docs Job → 400（05 篇验收 7）
+    _exp_dir = BACKEND_DIR / "_tmp_export_smoke"
+    _shutil5.rmtree(_exp_dir, ignore_errors=True)
+    _exp_app = _create_app5(
+        Settings(_env_file=None, sqlite_path=_exp_dir / "api.db", sqlite_busy_timeout_ms=1000)
+    )
+    with _Client5(_exp_app) as _exp_client:
+        def _save_session(flag: bool) -> str:
+            return _exp_client.post(
+                "/api/session/save",
+                json={
+                    "session_data": json.dumps(
+                        {
+                            "sessionId": "x",
+                            "formVersion": "1.2",
+                            "form": {"product_name": "群聊周报助手"},
+                            "messages": [],
+                            "roundIndex": 0,
+                            "documents": {
+                                "prd": {"content": "# PRD\n\n## 1. 产品概述\n\n这是正文。"}
+                            },
+                            "viewState": "review-prd",
+                            "entryMode": "structured",
+                            "prdBaselineConfirmed": flag,
+                            "prdBaselineConfirmedAt": "2026-10-07T00:00:00+08:00"
+                            if flag
+                            else None,
+                            "prdBaselineVersionId": "v1" if flag else None,
+                            "prdBaselineVersionNo": 1 if flag else None,
+                            "updatedAt": "2026-10-07T00:00:00.000+08:00",
+                        },
+                        ensure_ascii=False,
+                    )
+                },
+            ).json()["id"]
+
+        _unconfirmed = _save_session(False)
+        _blocked = _exp_client.post(
+            "/api/jobs",
+            json={
+                "session_id": _unconfirmed,
+                "artifact": "api-docs",
+                "payload": {"prd_content": "# PRD\n"},
+            },
+        )
+        check(
+            "需求基线门禁：未确认基线开 api-docs Job → **400**（不是 422/409/503）",
+            _blocked.status_code == 400 and "基线" in _blocked.text,
+            f"{_blocked.status_code} {_blocked.text[:70]}",
+        )
+        _blocked_prompts = _exp_client.post(
+            "/api/jobs",
+            json={
+                "session_id": _unconfirmed,
+                "artifact": "prompts",
+                "payload": {"prd_content": "# PRD\n"},
+            },
+        )
+        check(
+            "需求基线门禁：提示词套件同样被拦（两条下游生成用同一条规则）",
+            _blocked_prompts.status_code == 400,
+            str(_blocked_prompts.status_code),
+        )
+        _allowed_prd = _exp_client.post(
+            "/api/jobs",
+            json={
+                "session_id": _unconfirmed,
+                "artifact": "prd",
+                "payload": {"requirements_summary": {"product_name": "x"}},
+            },
+        )
+        check(
+            "需求基线门禁：PRD 生成**不受管**（它是链路的起点，没有上游基线可确认）",
+            _allowed_prd.status_code != 400,
+            f"status={_allowed_prd.status_code}",
+        )
+
+        # ---- ③ HTTP：导出交付包（05 篇验收 6）
+        _confirmed = _save_session(True)
+        _export = _exp_client.get(f"/api/session/{_confirmed}/export")
+        check(
+            "交付包：GET /api/session/{id}/export 返回 application/zip",
+            _export.status_code == 200
+            and _export.headers.get("content-type") == "application/zip"
+            and _export.content[:2] == b"PK",
+            f"{_export.status_code} {_export.headers.get('content-type')}",
+        )
+        check(
+            "交付包：文件名 {产品名}-delivery.zip，中文名走 RFC 5987（同时留 ASCII 兜底）",
+            "filename*=UTF-8''" in (_export.headers.get("content-disposition") or "")
+            and 'filename="harnessprd-delivery.zip"' in (_export.headers.get("content-disposition") or ""),
+            _export.headers.get("content-disposition", ""),
+        )
+        _zip = _zipfile5.ZipFile(_io5.BytesIO(_export.content))
+        _names = _zip.namelist()
+        check(
+            "交付包：README.md + manifest.json 必须在，三份 md 按有无内容取舍",
+            "README.md" in _names
+            and "manifest.json" in _names
+            and "PRD.md" in _names
+            and "Prompts.md" not in _names,  # 这份会话没生成过提示词
+            "、".join(_names),
+        )
+        check(
+            "交付包：文件名校验会把路径分隔符与开头点去掉（`../../etc/passwd` 出不去）",
+            delivery_file_name("../../etc/passwd") == "etcpasswd-delivery.zip"
+            and delivery_file_name("") == "harnessprd-delivery.zip"
+            and delivery_file_name("   ") == "harnessprd-delivery.zip"
+            and delivery_file_name("群聊周报助手") == "群聊周报助手-delivery.zip",
+            delivery_file_name("../../etc/passwd"),
+        )
+        _manifest = json.loads(_zip.read("manifest.json"))
+        check(
+            "交付包 manifest：字段名与工单一致（product_name/session_id/exported_at/entry_mode/documents/stale_warnings）",
+            {
+                "product_name",
+                "session_id",
+                "exported_at",
+                "entry_mode",
+                "documents",
+                "stale_warnings",
+            }
+            <= set(_manifest)
+            and _manifest["product_name"] == "群聊周报助手"
+            and _manifest["session_id"] == _confirmed
+            and set(_manifest["documents"]) == {"prd", "api_docs", "prompts"},
+            "、".join(sorted(_manifest)),
+        )
+        check(
+            "交付包 manifest：记了基线确认状态（人工确认过的需求基线要随包带上）",
+            _manifest["baseline"]["confirmed"] is True
+            and _manifest["baseline"]["confirmed_at"] == "2026-10-07T00:00:00+08:00",
+            json.dumps(_manifest["baseline"], ensure_ascii=False),
+        )
+        check(
+            "交付包 manifest：没生成过的产物 present=false（不是假装有一份）",
+            _manifest["documents"]["prompts"]["present"] is False
+            and _manifest["documents"]["prd"]["present"] is True,
+            f"prompts={_manifest['documents']['prompts']['present']}",
+        )
+        _readme = _zip.read("README.md").decode("utf-8")
+        check(
+            "交付包 README：给不熟悉项目的人看的东西都在（阅读顺序 / 版本表 / 缺失说明 / 出处）",
+            "## 阅读顺序" in _readme
+            and "## 每一份的版本与生成时间" in _readme
+            and "本包中缺失的文档" in _readme
+            and "由 harnessprd 导出" in _readme,
+            f"{len(_readme)} 字符",
+        )
+
+        # ---- ④ 服务层：derived_from → 过期提示 + 质检摘要进 manifest
+        _lineage_session = _save_session(True)
+        _documents = _exp_app.state.session_service.documents
+        _prd_v1 = _documents.get_current_version(_lineage_session, "prd")
+        _api_v1 = _documents.sync_from_job(
+            session_id=_lineage_session,
+            artifact="api-docs",
+            content="# 接口文档\n\n## 第 6 章 接口清单\n",
+            derived_from={"prd_version_id": _prd_v1.id, "prd_version_no": _prd_v1.version_no},
+            quality_gate=run_quality_gate("api-docs", "# 接口文档\n\n## 第 6 章 接口清单\n"),
+            review={"passed": False, "summary": "导出接口缺失", "issues": [{"severity": "high"}]},
+        )
+        # PRD 升到 v2 → 接口文档立刻变成"基于 v1"
+        _documents.sync_from_job(
+            session_id=_lineage_session, artifact="prd", content="# PRD v2\n\n## 1. 产品概述\n"
+        )
+        _snapshot = json.loads(_exp_client.get(f"/api/session/{_lineage_session}").json()["session_data"])
+        _zip2_bytes, _ = build_delivery_zip(
+            documents=_documents, session_id=_lineage_session, snapshot=_snapshot
+        )
+        _zip2 = _zipfile5.ZipFile(_io5.BytesIO(_zip2_bytes))
+        _manifest2 = json.loads(_zip2.read("manifest.json"))
+        check(
+            "交付包：PRD 升版后 manifest 出现过期提示，且文案指出版本号",
+            _manifest2["stale_warnings"]
+            and "PRD 已更新至 v2" in _manifest2["stale_warnings"][0]
+            and "接口文档基于 v1" in _manifest2["stale_warnings"][0],
+            "；".join(_manifest2["stale_warnings"]) or "（没有提示）",
+        )
+        check(
+            "交付包：manifest 带 derived_from 与 quality_gate / review 摘要（机读的质检信息）",
+            _manifest2["documents"]["api_docs"]["derived_from"]["prd_version_no"] == 1
+            and _manifest2["documents"]["api_docs"]["quality_gate"]["passed"] is False
+            and _manifest2["documents"]["api_docs"]["review"]["issue_count"] == 1
+            and _manifest2["documents"]["api_docs"]["review"]["summary"] == "导出接口缺失",
+            json.dumps(_manifest2["documents"]["api_docs"], ensure_ascii=False)[:150],
+        )
+        _readme2 = _zip2.read("README.md").decode("utf-8")
+        check(
+            "交付包 README：过期提示与未通过项摘要都写进去了（人读的那份也要有）",
+            "## 过期提示" in _readme2
+            and "PRD 已更新至 v2" in _readme2
+            and "## 未通过项摘要" in _readme2
+            and "机器审查 1 条" in _readme2,
+            f"{len(_readme2)} 字符",
+        )
+        del _api_v1
+
+        # ---- ⑤ 辅助 API：artifact-lineage（前端算"过期"缺的那一半数据）
+        _lineage = _exp_client.get(f"/api/session/{_lineage_session}/artifact-lineage").json()
+        check(
+            "artifact-lineage：给出三份产物的当前版本号 + 上游快照（前端据此算过期）",
+            _lineage["documents"]["prd"]["version_no"] == 2
+            and _lineage["documents"]["api_docs"]["version_no"] == 1
+            and _lineage["documents"]["api_docs"]["derived_from"]["prd_version_no"] == 1,
+            json.dumps(
+                {k: v["version_no"] for k, v in _lineage["documents"].items()}, ensure_ascii=False
+            ),
+        )
+        check(
+            "artifact-lineage：过期标志与文案**与交付包同一份实现**（界面上看到的话 = 包里写的话）",
+            _lineage["stale"]["api_docs"]["stale"] is True
+            and _lineage["stale"]["api_docs"]["message"] == _manifest2["stale_warnings"][0]
+            and _lineage["stale"]["prompts"]["stale"] is False,
+            _lineage["stale"]["api_docs"]["message"],
+        )
+    _shutil5.rmtree(_exp_dir, ignore_errors=True)
 
     print()
     if FAILURES:

@@ -29,8 +29,11 @@
 
 from __future__ import annotations
 
+import json
+from urllib.parse import quote
+
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from api.deps import SessionServiceDep
 from api.schemas import (
@@ -39,6 +42,7 @@ from api.schemas import (
     SessionSaveResponse,
     SessionStoreListView,
 )
+from services.delivery_export_service import build_delivery_zip, build_lineage
 from services.session_models import SessionLoad
 from services.session_service import SessionNotFound
 
@@ -98,3 +102,56 @@ async def delete_session(id: str, service: SessionServiceDep) -> SessionDeleteRe
     """删除指定会话。**不存在 → 404**（由 `session_not_found_handler` 统一转换）。"""
     service.delete_session(id)
     return SessionDeleteResponse(ok=True)
+
+
+@router.get("/{id}/artifact-lineage", summary="三份产物的版本与上游关系（05 篇）")
+async def artifact_lineage(id: str, service: SessionServiceDep) -> dict:
+    """给审核页算"下游产物是否过期"用。
+
+    为什么不让前端自己算：版本列表接口是按 `doc_type` 一次查一份的，站在接口文档页时
+    前端手上**没有 PRD 的当前版本号** —— 那正是比较所需的另一半。这里一次给全，
+    并把过期文案也一起给（文案只在后端一处实现，与交付包里的提示一字不差）。
+
+    返回：`{session_id, documents: {prd|api_docs|prompts: {...}}, stale: {api_docs|prompts: {stale, message}}}`
+    """
+    session = service.get_session(id)
+    snapshot = json.loads(session.session_data or "{}")
+    return build_lineage(documents=service.documents, session_id=id, snapshot=snapshot)
+
+
+@router.get(
+    "/{id}/export",
+    summary="导出交付包（ZIP）",
+    response_class=Response,
+    responses={200: {"content": {"application/zip": {}}, "description": "交付包 ZIP 字节流"}},
+)
+async def export_delivery(id: str, service: SessionServiceDep) -> Response:
+    """把三份产物打成一个交付包：`README.md` + `manifest.json` + 三份 md（+ `prompts/` 拆分）。
+
+    为什么是 **GET** 而不是 POST：它**不改任何状态**（只读版本层与会话快照），
+    产出是一个文件。GET 还能让"在新标签页打开这个地址"直接触发下载。
+
+    ⚠️ 组包**全在服务层**（`services/delivery_export_service.py`），这里只做两件事：
+    取会话快照、把字节和文件名塞进响应。路由里不算业务（同本模块其他四条）。
+
+    ⚠️ 文件名可能含中文（`{产品名}-delivery.zip`），所以按 RFC 5987 写成
+    `filename*=UTF-8''...`，同时留一个 ASCII 的 `filename=` 兜底 —— 老浏览器只认后者，
+    只给 `filename*=UTF-8''` 的话它会用一个乱码名字保存。
+    """
+    session = service.get_session(id)
+    snapshot = json.loads(session.session_data or "{}")
+    data, file_name = build_delivery_zip(
+        documents=service.documents, session_id=id, snapshot=snapshot
+    )
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="harnessprd-delivery.zip"; '
+                f"filename*=UTF-8''{quote(file_name)}"
+            ),
+            # 交付包里有 manifest 的版本号，缓存住会让用户拿到旧的
+            "Cache-Control": "no-store",
+        },
+    )

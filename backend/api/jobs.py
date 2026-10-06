@@ -36,6 +36,7 @@ router 自带 `/api/jobs` 前缀，`main.py` 里**不再加** `/api/v1`。
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
@@ -51,6 +52,7 @@ from api.conversation import (
 )
 from api.deps import DocumentServiceDep, JobServiceDep, SessionServiceDep
 from api.schemas import CreateJobRequest, CreateJobResponse, JobSnapshotView
+from services.delivery_guards import BaselineNotConfirmed, assert_can_create_job
 from services.job_bus import STREAM_END_TYPE, subscription
 from services.job_models import TERMINAL_STATUSES, JobSnapshot
 from services.job_runner import start_job
@@ -70,25 +72,40 @@ async def create_job(
 ) -> CreateJobResponse:
     """登记一个后台生成任务，**立刻**返回 `job_id`。
 
-    四道前置检查，全部在创建**之前**完成：
+    五道前置检查，全部在创建**之前**完成：
 
     1. **会话必须存在** → 否则任务无从同步进度，且 `GET /api/jobs/{id}` 拿到的
        任务会指向一个不存在的会话（`SessionNotFound` → 404）；
     2. **缺 Key 直接 503**（`_ensure_llm_ready`）：与 `/conversation/*-stream` 同一约定
        （F6.5）。不这么做的后果是"创建成功、任务立刻失败"，
        用户拿到一个 job_id 和一条 error，比当场被拒更难查；
-    3. **同会话 + 同产物已有在跑的任务 → 409**（`DuplicateRunningJob`，服务层判定）；
-    4. payload 的必需键（`CreateJobRequest` 的校验器 → 422）。
+    3. **需求基线已确认 → 否则 400**（05 篇，`services/delivery_guards.py`）：
+       接口文档与提示词都从 PRD 推导，PRD 还没被确认就生成它们，拿到的是
+       "看起来完整、其实对着旧需求"的产物。**只拦生成，不拦优化**；
+    4. **同会话 + 同产物已有在跑的任务 → 409**（`DuplicateRunningJob`，服务层判定）；
+    5. payload 的必需键（`CreateJobRequest` 的校验器 → 422）。
+
+    ⚠️ 检查 3 排在 503 **之后**：缺 Key 是"这台机器根本跑不了"，比"顺序不对"更该先说
+    （否则用户会去点确认基线，然后再撞一次 503）。排在 409 **之前**：两者同时成立时
+    "先去确认基线"是更可操作的那句。
 
     ⚠️ 这里**不创建 SSE 流**：创建与订阅是两条独立的请求。这样刷新页面（丢掉订阅）
     不会影响任务，重连只需要再发一次 `GET .../stream`。
     """
     try:
-        sessions.get_session(payload.session_id)
+        session = sessions.get_session(payload.session_id)
     except SessionNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     _ensure_llm_ready(documents)
+
+    try:
+        assert_can_create_job(
+            artifact=payload.artifact,
+            session_data=json.loads(session.session_data or "{}"),
+        )
+    except BaselineNotConfirmed as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     job_id = jobs.create_job(payload.session_id, payload.artifact, payload.payload)
     # 丢进后台：**本请求不等它**。任务在库里的状态才是权威（前端靠 GET /stream 追）。
