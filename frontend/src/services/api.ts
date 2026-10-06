@@ -27,6 +27,7 @@ import type {
  * 决定与理由见 `HANDOFF.md` §11 第 8 条。
  */
 import type { ContextUsage, RunSummary } from '../types'
+import { parseClarifyEnvelope } from '../utils/clarificationState'
 
 /**
  * 流里带出来的**结构化**错误。
@@ -638,18 +639,13 @@ export async function optimizeDocumentStream(
  * `null` 让调用方按"还不知道"处理。只在能完整解析时才给结论。
  *
  * @returns `'asking'` / `'done'`；解析不出来（半截、被 ``` 包裹、字段缺失）返回 `null`
+ *
+ * ⚠️ 实现**委托给 `utils/clarificationState.parseClarifyEnvelope()`**（03 篇）：
+ * 那个函数解析的是同一个信封、还要多取 `questions` / `open_questions`。两处各写一份
+ * `stage_status` 解析必然漂移（一个认、另一个不认，表现为"顶栏说收口了、按钮还灰着"）。
  */
 export function readDialogueStageStatus(raw: string): 'asking' | 'done' | null {
-  const text = raw.trim()
-  if (!text.startsWith('{')) return null
-  try {
-    const parsed: unknown = JSON.parse(text)
-    if (typeof parsed !== 'object' || parsed === null) return null
-    const status = (parsed as { stage_status?: unknown }).stage_status
-    return status === 'asking' || status === 'done' ? status : null
-  } catch {
-    return null
-  }
+  return parseClarifyEnvelope(raw)?.stageStatus ?? null
 }
 
 /**

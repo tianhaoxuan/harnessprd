@@ -183,6 +183,14 @@ def offline() -> None:
             "每种 artifact 的必填键都在白名单里（漏了会被路由层 422 挡住，根本跑不到 runner）",
             all(set(PAYLOAD_REQUIRED_KEYS[a]) <= set(PAYLOAD_ALLOWED_KEYS[a]) for a in JOB_ARTIFACTS),
         )
+        # 03 篇：澄清"收口没收口"**不进后端契约** —— PRD 任务的必填键只有结构化摘要。
+        # 钉住它是因为：任何"必须澄清完成"之类的必填键，都会让"带着警告生成"变成 422，
+        # 而那正是那一篇刻意允许的动作（前端 warning + confirm，服务端不设第二道硬门）。
+        check(
+            "PRD 任务的必填键只有结构化摘要（澄清是否收口不进后端契约）",
+            tuple(PAYLOAD_REQUIRED_KEYS["prd"]) == ("requirements_summary",),
+            f"prd 必填 = {list(PAYLOAD_REQUIRED_KEYS['prd'])}",
+        )
         check(
             "冲突组：优化 artifact 与同文档的生成 artifact 互斥（含它自己）",
             all(

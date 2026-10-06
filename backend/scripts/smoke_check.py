@@ -2792,6 +2792,20 @@ def main() -> int:
             str(_health.headers.get("X-Request-ID")),
         )
 
+        # 03 篇：缺 requirements_summary 的 PRD 任务在**创建时**就被拒（422），
+        # 不留给 runner 变成一个"拿到了 job_id 才失败"的任务。
+        # ⚠️ session_id 刻意用不存在的：**422 必须发生在 404 之前**（请求体校验先于处理函数）
+        # —— 否则用户会收到一个与真实问题无关的"会话不存在"，查错方向全错。
+        _no_summary = _client.post(
+            "/api/jobs",
+            json={"session_id": "smoke-no-such-session", "artifact": "prd", "payload": {}},
+        )
+        check(
+            "缺 requirements_summary 的 PRD 任务创建即 422（校验先于 404）",
+            _no_summary.status_code == 422,
+            f"status={_no_summary.status_code}",
+        )
+
     # ---------- 跨分片合并：一份产物 = 一个 run ----------
     # 前端按分片计划循环发 3 次请求，此前 run_summary 是"每请求一份"——界面显示的是
     # **最后一片**的统计，按 request_id 查日志只能查到 1/3 的 llm_step。

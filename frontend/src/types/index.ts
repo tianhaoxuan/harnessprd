@@ -147,6 +147,39 @@ export type DocStatus =
   | 'stale'
   | 'failed'
 
+// ---------------------------------------------------------------- 澄清状态（03 篇）
+
+/**
+ * 澄清对话的收口状态。**纯启发式算出来的**（见 `utils/clarificationState.ts`），
+ * 不是服务端状态机推进的结果 —— 会话层落地后应当改读 `snapshot.step`。
+ *
+ * | 值 | 含义 |
+ * | --- | --- |
+ * | `ready` | 末条 AI 明确收口，或用户刚回复且没有待确认项 |
+ * | `awaiting_user_reply` | 末条是 AI，且它提了待回复的问题 |
+ * | `collecting` | 仍在收集信息（既没收口、也没解析出明确问题） |
+ */
+export type ClarificationStatus = 'ready' | 'collecting' | 'awaiting_user_reply'
+
+/**
+ * 澄清状态评估结果（顶栏 badge + 生成前的二次确认都用它）。
+ *
+ * ⚠️ **它不是"能不能生成"的判据**：`needsConfirmBeforeGenerate` 只决定
+ * 「按钮要不要警示 + 点它要不要先问一句」，不决定 disabled。真正不能生成的只有一种情况
+ * —— 没有结构化摘要（那由 `handleGeneratePrdWithSync` 兜底）。
+ */
+export interface ClarificationState {
+  status: ClarificationStatus
+  /** 从 AI 末条解析出的待确认问题（结构化优先，启发式兜底），最多 5 条 */
+  openQuestions: string[]
+  /** 给人看的提醒，如「尚未在对话中补充说明」；非空也会触发确认 */
+  warnings: string[]
+  /** 顶栏文案，如「澄清进行中 · 2 个待确认」 */
+  statusLabel: string
+  /** 点「生成 PRD」时是否需要先弹一次确认 */
+  needsConfirmBeforeGenerate: boolean
+}
+
 // ---------------------------------------------------------------- 对话流（SSE）
 
 /** 对话阶段。与后端 `backend/services/state.py` 的 `DialogueStage` 一致。 */

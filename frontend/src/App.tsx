@@ -41,6 +41,7 @@ import ArtifactProgressBar from './components/ArtifactProgressBar'
 // 四个展示组件 + 一个 hook。**组件只负责摆放，state 全在 hook 里** ——
 // 页面里不该出现"步骤怎么变、秒表怎么走"这类与业务流程无关的代码。
 import ClarificationContextPanel from './components/ClarificationContextPanel'
+import ClarificationStatusBadge from './components/ClarificationStatusBadge'
 import ClarificationWarnBanner from './components/ClarificationWarnBanner'
 import GenerationStepper from './components/GenerationStepper'
 import RunSummaryPanel from './components/RunSummaryPanel'
@@ -57,7 +58,6 @@ import {
   // **都已经不在这里用了**：产物生成与 AI 优化都改走 `POST /api/jobs`（后台任务）。
   // 那几个前台接口后端仍保留（标了 deprecated），但前端不再调用。
   getQuestions,
-  readDialogueStageStatus,
   startConversationStream,
   syncSummaryFromConversation,
   type PrdGenerationStage,
@@ -96,6 +96,9 @@ import {
   type ArtifactContents,
   type ArtifactId,
 } from './utils/artifactProgress'
+// 澄清状态（03 篇）：启发式评估 + 生成前的二次确认。两者都是纯函数/纯文案，可离线断言。
+import { confirmGenerateDespiteClarificationWarning } from './utils/clarificationConfirm'
+import { assessClarificationState } from './utils/clarificationState'
 import type { JobReview } from './types/job'
 import {
   STEPS,
@@ -1707,25 +1710,17 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
   // ---------------------------------------------------------------- 产物生成 / 优化
 
   /**
-   * 对话是否已经聊完 —— 决定对话页「生成 PRD」按钮的显隐。
+   * 澄清状态（03 篇）：对话收口了吗、还有几个待确认。
    *
-   * ⚠️ **判据是模型自报的 `stage_status`，也就是"让模型自判阶段"。**
-   * `docs/对话阶段设计.md` §8 第 5 项明确要求阶段由**服务端**推进、不让模型自判；
-   * 现在没有 `SessionStore`、服务端不下发任何东西，所以这是**唯一的可用信号**。
-   * 会话层落地后应改成读 `snapshot.step` / `snapshot.actions`。
+   * 纯启发式、零额外模型调用，随 `messages` 重算（见 `utils/clarificationState.ts`）。
+   * ⚠️ **它不参与 `canStartPrd`** —— 它只决定顶栏 badge 与"生成前要不要问一句"。
    *
-   * 另外两条是防御性的：没有对话内容、或者还有流在跑，都不该放行。
+   * 顺带说明：改造前这里还有一个 `dialogueFinished`（`stage_status === 'done'` 且不在流中），
+   * 专门用来卡生成按钮。现在「聊完没有」这件事由本状态统一表达（它内部就看
+   * `stage_status`），所以那个布尔量删掉了 —— 两个派生量并存必然出现"badge 说收口、
+   * 按钮却还灰着"这种自相矛盾。
    */
-  const lastAiMessage = useMemo(() => {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      if (messages[index].role === 'ai') return messages[index]
-    }
-    return null
-  }, [messages])
-
-  const dialogueFinished =
-    !sending && !isGenerating && lastAiMessage !== null && !lastAiMessage.error &&
-    readDialogueStageStatus(lastAiMessage.content) === 'done'
+  const clarificationState = useMemo(() => assessClarificationState(messages), [messages])
 
   /**
    * 「生成 PRD」按钮的**显示**条件与**可用**条件 —— 刻意分开。
@@ -1733,17 +1728,32 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
    * | | 条件 | 为什么 |
    * | --- | --- | --- |
    * | 显示 `showStartPrd` | 已有会话且**至少收到一条 AI 回复** | 开场那一轮还没回来时（`messages` 为空）显示一个灰按钮毫无意义；等它回来再出现 |
-   * | 可用 `canStartPrd` | 澄清结束（`stage_status=done`）且没有流在跑 | 没聊完就生成，等于拿半份输入去写 PRD |
+   * | 可用 `canStartPrd` | 只要显示了就可点 | 见下面那段 |
    *
-   * ⚠️ 判据用的是**模型自报的 `stage_status`**，这违反了「阶段由服务端推进、不让模型自判」
-   * （`对话阶段设计` §8 第 5 项）—— 没有 `SessionStore` 时它是唯一信号。
-   * 会话层落地后换成 `snapshot.actions` 里有没有 `start_generation`。
+   * ⚠️ **03 篇放宽了可用条件**：改造前是 `showStartPrd && dialogueFinished`，
+   * 也就是「AI 没把 `stage_status` 报成 `done` 就不许生成」。两个问题：
+   *
+   * 1. `stage_status` 是**模型自报**的（违反"阶段由服务端推进"，`对话阶段设计` §8 第 5 项），
+   *    拿它当**硬门槛**会把"用户其实已经想清楚、只是不想再聊"的情况一起挡住；
+   * 2. 门是硬的，用户没有任何绕过的办法 —— 连"我知道还差一个问题的答案，先出个稿看看"都做不到。
+   *
+   * 现在改成**警告 + 确认放行**（`clarificationConfirm.ts`）：按钮换琥珀色 + ⚠，
+   * 点它时列出待确认问题让用户自己决定。真正剩下的硬拦截只有一条 ——
+   * **没有结构化摘要就不能生成 PRD**（`handleGeneratePrdWithSync` 里，那是数据流要求：
+   * 摘要缺失时后端只能走没有质检的老路径）。
    *
    * 刻意**显示而禁用**（而不是条件不满足就藏起来）：用户需要知道"这里有个按钮，
-   * 但还差点什么"，藏起来只会让人以为流程断了。禁用时旁边有一句说明。
+   * 但还差点什么"，藏起来只会让人以为流程断了。禁用时旁边有一句说明
+   * （现在只剩"回填待确认 / 保存中 / 正在比对"这几种**在途**状态会禁用）。
    */
   const showStartPrd = submitted !== null && messages.length > 0
-  const canStartPrd = showStartPrd && dialogueFinished
+  /**
+   * 可点 = 显示了 **且不在途**（AI 正在回复 / 产物正在生成）。
+   *
+   * ⚠️ 这里**没有**"聊完没有"这一条 —— 那是 03 篇刻意去掉的硬门槛（见上面那段）。
+   * 剩下的 `sending` / `isGenerating` 是并发保护，与澄清状态无关。
+   */
+  const canStartPrd = showStartPrd && !sending && !isGenerating
   /** 快捷入口（非结构化）下：进度条之外的步骤也要能进，见下面的入口条与可点击步骤条。 */
   const shortcutMode = entryMode !== 'structured'
 
@@ -1977,6 +1987,12 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
    * - 回填成功 → 打开 diff 面板，等用户的 `确认/拒绝`（见 `applySummaryChanges()`）。
    */
   const handleGeneratePrdWithSync = useCallback(async () => {
+    // ---------- 澄清还没收口时先问一句（03 篇）----------
+    // 取消 = 什么都不做（**不是**禁止生成）：用户可以回对话里补一轮再来。
+    // 放在最前面而不是"生成前一刻"：下面还会走回填 + diff 面板，
+    // 让用户在"要等两轮模型"之前就知道自己在跳过什么。
+    if (!confirmGenerateDespiteClarificationWarning(clarificationState)) return
+
     // 摘要优先用内存态；内存态没有（刷新过）就用表单草稿重建 —— 否则会静默走
     // 没有双智能体审核的表单路径。
     const base = structuredSummary ?? summaryFromStoredDraft()
@@ -2007,7 +2023,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     } finally {
       setSummarySyncBusy(false)
     }
-  }, [structuredSummary, messages, values, handleGenerateDocument])
+  }, [structuredSummary, messages, values, handleGenerateDocument, clarificationState])
 
   /**
    * diff 面板的「确认更新」：把**用户勾选的那几条**写回摘要，然后才开始生成。
@@ -2916,8 +2932,13 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
 
       {load.status === 'ok' && viewState === 'chatting' && (
         <section className="flex min-h-0 flex-1 flex-col gap-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-          <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-            <h2 className="text-base font-medium text-slate-800">AI 对话</h2>
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-base font-medium text-slate-800">AI 对话</h2>
+              {/* 澄清状态 badge（03 篇）：只读展示"对话收口了吗"。
+                  ⚠️ 它**不是**折叠面板的入口 —— 待确认问题只在点生成时的确认弹窗里列出来。 */}
+              <ClarificationStatusBadge state={clarificationState} />
+            </div>
             <span className="text-xs text-slate-400">
               {sending ? 'AI 正在回复…' : `共 ${messages.length} 条消息`}
               {roundIndex > 1 && ` · 第 ${Math.min(roundIndex, MAX_ROUNDS)}/${MAX_ROUNDS} 轮`}
@@ -2970,10 +2991,12 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
             }
           />
 
-          {/* ---------- 对话聊完之后才能进生成环节 ----------
-              条件见 `showStartPrd` / `canStartPrd`：还没收到 AI 回复时**不显示**
-              （开场那一轮还没回来，显示灰按钮没意义），收到之后**显示但可能禁用**，
-              并在旁边说明还差什么。 */}
+          {/* ---------- 生成 PRD：始终可点，收口与否只影响**警示** ----------
+              条件见 `showStartPrd` / `canStartPrd`：还没收到 AI 回复时**不显示**，
+              之后一直可点（03 篇放宽了原来的 `dialogueFinished` 硬门槛）。
+              澄清没收口时：按钮换**琥珀色 + ⚠**，点它先弹一次确认列出待确认问题。
+              ⚠️ 禁用只剩"在途"状态（回填待确认 / 正在比对 / 保存中）—— 那几种确实
+              不该并发触发第二次生成，与"聊没聊完"是两件事。 */}
           {summarySyncError && (
             <p role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
               {summarySyncError}
@@ -3014,28 +3037,49 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
               <button
                 type="button"
                 data-testid="start-prd"
+                data-needs-confirm={
+                  clarificationState.needsConfirmBeforeGenerate ? 'true' : 'false'
+                }
                 onClick={() => void handleGeneratePrdWithSync()}
                 disabled={
                   !canStartPrd || summarySyncBusy || pendingSummary !== null || saveBusy
                 }
-                className="inline-flex items-center gap-1.5 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-primary-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 disabled:cursor-not-allowed disabled:bg-slate-300"
+                className={[
+                  'inline-flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-medium text-white transition focus:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:bg-slate-300',
+                  // 澄清没收口 → 琥珀（警告样式，但**仍然可点**）；收口了 → 主色
+                  clarificationState.needsConfirmBeforeGenerate
+                    ? 'bg-amber-500 hover:bg-amber-600 focus-visible:ring-amber-300'
+                    : 'bg-primary-600 hover:bg-primary-700 focus-visible:ring-primary-400',
+                ].join(' ')}
               >
                 {summarySyncBusy ? (
                   <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                ) : clarificationState.needsConfirmBeforeGenerate ? (
+                  <AlertCircle className="h-4 w-4" aria-hidden />
                 ) : (
                   <Sparkles className="h-4 w-4" aria-hidden />
                 )}
-                {summarySyncBusy ? '正在比对对话…' : prdContent ? '重新生成 PRD' : '生成 PRD'}
+                {summarySyncBusy
+                  ? '正在比对对话…'
+                  : clarificationState.needsConfirmBeforeGenerate
+                    ? prdContent
+                      ? '重新生成 PRD ⚠'
+                      : '生成 PRD ⚠'
+                    : prdContent
+                      ? '重新生成 PRD'
+                      : '生成 PRD'}
               </button>
               <span className="text-xs text-slate-400">
                 {pendingSummary
                   ? '上面有对话回填的改动，确认或拒绝之后才会开始生成。'
-                  : !dialogueFinished
-                    ? '等 AI 说聊完了（`stage_status` = `done`）才能生成。'
+                  : clarificationState.needsConfirmBeforeGenerate
+                    ? clarificationState.openQuestions.length > 0
+                      ? `澄清还没收口 —— 还有 ${clarificationState.openQuestions.length} 个待确认，点生成时会先让你确认一遍。`
+                      : '澄清还没收口 —— 点生成时会先让你确认一遍。'
                     : prdContent
                       // ⚠️ 纯字符串里**不能写 `**加粗**`** —— 它不是 Markdown，会把星号原样显示给用户
                       ? '已经有了 PRD —— 重新生成会覆盖它；想只改一节请用审核页的「AI 优化」。'
-                      : '澄清已结束，可以生成 PRD 了（会先把对话里说过的改动列出来让你确认）。'}
+                      : '澄清已收口，可以生成 PRD 了（会先把对话里说过的改动列出来让你确认）。'}
               </span>
             </div>
           )}
