@@ -107,9 +107,6 @@ from api.schemas import (
     GeneratePrdRequest,
     GeneratePromptsRequest,
     OptimizeDocumentRequest,
-    RagHit,
-    RetrieveRagRequest,
-    RetrieveRagResponse,
     StartStreamRequest,
     SyncSummaryRequest,
     SyncSummaryResponse,
@@ -120,23 +117,9 @@ from services.document_plan import build_plan
 from services.document_service import (
     DocumentService,
     SummarySyncError,
-    _rag_index,
 )
 
 
-def _document_service() -> DocumentService:
-    """检索用一次性的 `DocumentService`。
-
-    ⚠️ 这个接口**不碰模型**（`retrieve_api_docs_rag_hits` 是纯函数式的读文件 + 打分），
-    所以不需要注入依赖、也不需要 `_ensure_llm_ready` —— 没配 Key 时它照样能用。
-    """
-    return DocumentService()
-
-
-def _rag_corpus_size() -> int:
-    """参与检索的块数（排查"为什么没召回"时先看它是不是 0：语料文件缺失会退化成 0）。"""
-    chunks, _ = _rag_index()
-    return len(chunks)
 from core.request_context import get_request_id
 from services.llm import LlmConfigError, StreamOutcome
 from services.llm_metrics import RunMetricsCollector, finalize_run, log_run_summary
@@ -475,34 +458,6 @@ async def sync_summary_from_conversation(
     )
 
 
-@router.post(
-    "/retrieve-api-docs-rag",
-    response_model=RetrieveRagResponse,
-    summary="检索接口文档规范与历史示例（不调模型）",
-)
-async def retrieve_api_docs_rag(payload: RetrieveRagRequest) -> RetrieveRagResponse:
-    """按 PRD 正文与对话历史，检索「规范」与「历史接口示例」两类片段。
-
-    ⚠️ **这是词法检索（BM25 近似），不是向量 RAG。** 本项目没有向量库，也没有可用的
-    embedding 提供方（DeepSeek 不提供 embeddings 接口），所以语料就是**仓库里现成的文件**：
-    `docs/接口文档模板.md` 与 `gen_api.md`（规范）、`validation_out/*api*.txt`（真实模型产出的历史示例）。
-
-    含义（用之前要知道）：查询与语料**用词重合**时才召回；同义改写召回不到
-    （"鉴权"查不到只写了 "JWT" 的段落）。要真正的语义召回，得先定 embedding 提供方 +
-    向量库 + 新依赖 —— 那是独立的一件事。
-
-    **不调模型、无副作用**：纯读文件 + 打分排序（索引进程内缓存），所以它不花钱、可重放，
-    也不需要 `_ensure_llm_ready`（没配 Key 时这个接口照样能用）。
-    """
-    hits = _document_service().retrieve_api_docs_rag_hits(
-        prd_content=payload.prd_content,
-        history=[turn.model_dump() for turn in payload.history],
-        top_k=payload.top_k,
-    )
-    return RetrieveRagResponse(
-        hits=[RagHit(**hit) for hit in hits],
-        corpus_size=_rag_corpus_size(),
-    )
 
 
 @router.post(

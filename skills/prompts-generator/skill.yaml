@@ -1,0 +1,72 @@
+# 提示词套件生成技能（skill）的清单：**运行时契约 + 内容契约**。
+#
+# 字段含义与 `skills/prd-generator/skill.yaml` 一致（运行时字段由
+# `services/skill_loader.py` 读，内容字段给人看），那里有逐字段说明。
+#
+# ## 为什么它也要一个技能包
+#
+# 提示词套件原来**没有**检索那一步（RAG 只服务接口文档），所以这一篇对它的意义是
+# **统一**：三份产物都从 `skill_loader` 拿规范，不再一份走代码常量、一份走检索。
+# 规范源也只有一处了 —— 改套件结构改 `references/`，不必再翻 Python 常量。
+
+id: prompts-generator
+version: "1.0.0"
+label: 提示词套件生成规范
+description: >-
+  Claude Code 提示词套件的五类文件结构、目录与命名约定、每类要点与字数上限，
+  以及套件级质量规则（覆盖完整、依赖无环、可判定、命名一致）。
+applies_to:
+  - prompts
+  - optimize-prompts
+
+# 顺序（跨角色由 ROLE_ORDER 定：instructions → template → reference → schema → example）：
+# 先工作流，再套件结构模板，最后写作规则。
+artifacts:
+  - path: instructions.md
+    role: instructions
+  - path: references/prompts-template.md
+    role: template
+  - path: references/writing-rules.md
+    role: reference
+
+enabled: true
+priority: 10
+
+language: zh-CN
+
+inputs:
+  # 两路输入：PRD 必读，接口文档可选（缺失时后端填「（尚无）」）
+  primary: prd_content
+  optional:
+    api_content: 已通过评审的接口文档全文 —— 步骤里的「涉及接口」必须与它逐字一致
+  context:
+    known_info: 对话中确认过的补充
+    open_questions: 用户跳过的项
+    conflicts: 已发现的矛盾及其结论
+  upstream_required: true   # 缺 PRD 直接失败（链条约束）
+
+outputs:
+  - name: prompts
+    media_type: text/markdown
+    # 五类文件与目录结构在 `references/prompts-template.md`；
+    # system prompt（`gen_prompts.md`）负责多文件输出契约与生成规则。两处不重复。
+    structure_source: references/prompts-template.md + backend/core/prompts/gen_prompts.md（system prompt）
+    contract: '多文件产物：一个 .md 里用 `=== FILE: <路径> ===` 分隔行拆文件'
+    ids:
+      mapping: '步骤覆盖矩阵把每条 FR-xx 映射到承载它的实现步骤'
+
+constraints:
+  max_injected_bytes: 10000
+  single_call_sufficient: false   # 套件必须分片（见 document_plan）
+  verification:
+    - 五类文件齐、命名与目录结构符合模板
+    - 步骤覆盖矩阵把 PRD 的功能需求都映射到某个步骤，没有孤儿需求
+    - 步骤之间依赖无环，每步都能单独判定做完没有
+    - 文件名、接口路径与上游 PRD / 接口文档逐字一致
+
+metadata:
+  source_project: harnessprd
+  replaces:
+    - 无（本 skill 是新增的统一入口；提示词套件原来走 core/prompts/gen_prompts.md 常量）
+  consumed_by:
+    - services/document_service.py 的 generate_prompts_stream / optimize_document_stream(kind=prompts)

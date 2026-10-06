@@ -25,7 +25,6 @@ import StructuredForm, {
 import ProjectEntryChooser from './components/project-entry/ProjectEntryChooser'
 import ImportPrdPanel from './components/project-entry/ImportPrdPanel'
 import ImportPromptsPanel from './components/project-entry/ImportPromptsPanel'
-import RagHitsPanel from './components/RagHitsPanel'
 import SummaryDiffPanel, {
   diffSummaries,
   type SummaryChange,
@@ -60,10 +59,8 @@ import {
   getQuestions,
   readDialogueStageStatus,
   startConversationStream,
-  retrieveApiDocsRag,
   syncSummaryFromConversation,
   type PrdGenerationStage,
-  type RagHit,
 } from './services/api'
 import {
   clearFormDraft,
@@ -638,11 +635,6 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
   const [pendingSummary, setPendingSummary] = useState<{ changes: SummaryChange[] } | null>(null)
   const [summarySyncBusy, setSummarySyncBusy] = useState(false)
   const [summarySyncError, setSummarySyncError] = useState<string | null>(null)
-  /** 待确认的 RAG 检索结果（`null` = 没有待确认项）。 */
-  const [pendingRag, setPendingRag] = useState<{ hits: RagHit[]; corpusSize: number } | null>(null)
-  const [ragBusy, setRagBusy] = useState(false)
-  /** 用户确认过的检索片段，拼进 `known_info` 一起发给生成接口。 */
-  const [ragExtras, setRagExtras] = useState('')
   /**
    * 双智能体生成 PRD 的**阶段**（由服务端 `stage` 事件给出，不是前端自己猜的）。
    *
@@ -690,8 +682,6 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
   const [pendingAutoGenerate, setPendingAutoGenerate] = useState<DocKind | null>(null)
   /** 正在打包 zip（打包要算 CRC + deflate，产物大时不是瞬间完成）。 */
   const [bundleBusy, setBundleBusy] = useState(false)
-  /** 防死循环：确认那一次要跳过检索闸门。 */
-  const ragConfirmedRef = useRef(false)
   const [restoredDraft, setRestoredDraft] = useState(false)
   /** 草稿恢复完成前**禁止**写回，否则初始的空对象会把已存的草稿冲掉。 */
   const [hydrated, setHydrated] = useState(false)
@@ -1893,42 +1883,22 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
    *
    * | 归这里 | 归 hook |
    * | --- | --- |
-   * | 接口文档的 RAG 检索与用户确认 | `createJob` + 订阅 SSE |
-   * | 链条约束（缺 PRD 不许生成下游） | 正文累积、写库、截断标记 |
-   * | 首次落库（任务必须挂在一条已存在的会话上） | 切 `generating-*` / `review-*` |
-   * | 结构化摘要缺失时的明确提示 | 步骤条/秒表/汇总、失败收束、刷新重连 |
+   * | 链条约束（缺 PRD 不许生成下游） | `createJob` + 订阅 SSE |
+   * | 首次落库（任务必须挂在一条已存在的会话上） | 正文累积、写库、截断标记 |
+   * | 结构化摘要缺失时的明确提示 | 切 `generating-*` / `review-*` |
+   * | —— | 步骤条/秒表/汇总、失败收束、刷新重连 |
    *
    * ⚠️ **这里已经不生成任何东西了**：没有分片循环、没有 SSE handler、没有
    * `AbortController`。产物由**后台任务**生成，页面断开也不影响它
    * （这就是把生成任务化的全部意义）。
+   *
+   * ⚠️ **也没有"生成前的检索确认"了**（RAG 下线那一篇）：接口文档的团队规范与示例
+   * 改由后端的技能包**全量注入**（`skills/api-docs-generator/`），不再需要用户勾选 ——
+   * 所以这个函数现在就是"校验 + 直接开 Job"。
    */
   const handleGenerateDocument = useCallback(
     async (kind: DocKind) => {
       if (isGenerating) return
-
-      // ---------- 接口文档：先检索、用户确认，才真正生成（见 `RagHitsPanel`）----------
-      // 取消 = 一个字都不生成。已有内容时（重新生成）不拦：那时用户就是要一份新的，
-      // 再走一遍检索确认只会变啰嗦。
-      if (kind === 'api' && !ragConfirmedRef.current && !apiDocsContent) {
-        setRagBusy(true)
-        try {
-          const rag = await retrieveApiDocsRag(
-            prdContent,
-            messages.map((message) => ({ role: message.role, content: message.content })),
-          )
-          setPendingRag(rag)
-        } catch (error) {
-          // 检索失败不拦主流程：它只是参考资料，没有它照样能生成
-          setDocFailure({
-            kind,
-            message: `检索参考资料失败（${describeApiError(error)}）—— 可以直接重试生成。`,
-          })
-        } finally {
-          setRagBusy(false)
-        }
-        return
-      }
-      ragConfirmedRef.current = false
 
       // 链条约束：接口文档与提示词套件都必须能追溯到 PRD。
       // 后端也会拦（缺 prd_content → 422），这里先拦是为了不白跑一趟、并给出人话提示。
@@ -2105,7 +2075,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
 
       // 结构化表单里"20 题装不下"的那部分（页面结构、关键交互、范围、LLM 说明、可用性）
       // 排在最前面：它是用户**明确填过**的内容，比从对话里抠出来的更硬。
-      const knownInfo = [structuredExtras, summaryExtras, ragExtras, buildKnownInfo(messages)]
+      const knownInfo = [structuredExtras, summaryExtras, buildKnownInfo(messages)]
         .filter(Boolean)
         .join('\n\n')
 
@@ -2131,7 +2101,6 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       submitted,
       structuredExtras,
       summaryExtras,
-      ragExtras,
       readDoc,
       setDocFailure,
       jobGen,
@@ -2371,7 +2340,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     setBaselineAccepted(true)
     // "并继续"就该**真的继续**：把该入口要生成的那份产物挂成待启动，
     // 等 PRD 落到 state 之后由下面的 effect 开起来。
-    // （接口文档那一步会先弹 RAG 检索结果让你逐条确认 —— 那是有意保留的人工关口。）
+    // （接口文档的团队规范由后端技能包全量注入，这里不再有"先检索、再确认"那一步。）
     if (entryMode === 'prompts-debug') {
       setViewState('review-prompts')
       setPendingAutoGenerate('prompts')
@@ -2447,9 +2416,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
     setStructuredSummary(null)
     setStructuredExtras('')
     setSummaryExtras('')
-    setRagExtras('')
     setPendingSummary(null)
-    setPendingRag(null)
     setSummarySyncError(null)
     clearStructuredIntake()
     setViewState('form')
@@ -2554,7 +2521,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
        *
        * | 出口 | 走什么 |
        * | --- | --- |
-       * | 生成接口文档 | 链条主路径。要过 RAG 确认（`RagHitsPanel`），**不绕过** |
+       * | 生成接口文档 | 链条主路径。团队规范与示例由后端技能包全量注入（无人工确认） |
        * | 直接生成提示词 | 跳过接口文档。提示词会缺 API 细节，所以摆成**次要出口** |
        *
        * 两条都以"手上真有一份 PRD 正文"为前提，所以门是 `hasContent`。
@@ -2625,14 +2592,11 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
           variant: allApproved ? 'secondary' : 'primary',
           title: apiDocsContent.trim()
             ? '会重新生成并覆盖现有接口文档 —— 想只改一节请用接口文档页的「AI 优化」'
-            : '会先做一次 RAG 检索（接口规范 + 历史示例），由你逐条确认后才开始生成',
+            : '直接开后台生成任务：团队接口规范与参考示例由后端技能包全量注入，不需要确认',
           // ⚠️ **先把 PRD 标成已通过**，再往下生成。不通过就生成会走进死胡同：
           // 生成不看"通过"标志（`handleGenerateDocument` 只要求有 `prd_content`），
           // 但**下一步的「通过」看**（`STAGE_ACTIONS.api.upstream === 'prd'`）——
           // 于是用户生成完接口文档，却卡在那一页被禁用的「通过」上。
-          //
-          // RAG 门控照旧走：`handleGenerateDocument('api')` 在 `ragConfirmedRef` 为假
-          // 且还没有接口文档正文时会先检索并弹 `RagHitsPanel`，确认之后才真生成。
           onClick: () => {
             handleApproveDocument('prd')
             void handleGenerateDocument('api')
@@ -2888,7 +2852,7 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
       {load.status === 'ok' && viewState === 'form' && formSubView === 'import-prd' && (
         <ImportPrdPanel
           title="导入 PRD：把你的 PRD 贴进来当基准"
-          description="跳过表单与对话澄清。确认之后先生成接口文档（那一步会先做 RAG 检索：接口规范 + 历史接口示例，由你逐条确认），再生成提示词套件。"
+          description="跳过表单与对话澄清。确认之后先生成接口文档（团队接口规范与参考示例由后端技能包全量注入，不需要人工确认），再生成提示词套件。"
           value={importedPrd}
           onChange={(next) => {
             setImportedPrd(next)
@@ -3100,32 +3064,6 @@ export default function App({ sessionId = null, onSessionSaved }: AppProps = {})
 
       {load.status === 'ok' && activeDoc && (
         <>
-          {pendingRag && (
-            <RagHitsPanel
-              hits={pendingRag.hits}
-              corpusSize={pendingRag.corpusSize}
-              busy={ragBusy || isGenerating}
-              onConfirm={(selected) => {
-                setRagExtras(
-                  selected.length === 0
-                    ? ''
-                    : [
-                        '接口文档参考资料（检索自团队规范与历史示例）：',
-                        ...selected.map(
-                          (hit) => `【${hit.kind}】${hit.title}（${hit.source}）\n${hit.content}`,
-                        ),
-                      ].join('\n\n'),
-                )
-                setPendingRag(null)
-                ragConfirmedRef.current = true
-                void handleGenerateDocument('api')
-              }}
-              onCancel={() => {
-                // 取消 = 不调用生成接口（用户明确要求）
-                setPendingRag(null)
-              }}
-            />
-          )}
           <DocumentReviewWithVersions
             className="min-h-0 flex-1"
             title={DOC_META[activeDoc].title}

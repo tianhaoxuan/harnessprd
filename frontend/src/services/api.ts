@@ -129,38 +129,6 @@ export interface SyncSummaryResult {
   finishReason: string | null
 }
 
-/** 一条检索命中（服务端字段转成 camelCase）。 */
-export interface RagHit {
-  /** 来源，仓库相对路径 */
-  source: string
-  /** 类别：`规范` 或 `历史接口示例` */
-  kind: string
-  /** 块标题（Markdown 标题路径） */
-  title: string
-  /** 块正文，可直接拼进提示词 */
-  content: string
-  /** 相关度（越大越相关；绝对值没有意义） */
-  score: number
-}
-
-/**
- * 检索接口文档相关的规范与历史示例。
- *
- * ⚠️ 服务端是**词法检索（BM25 近似）**，不是向量检索：查询与语料**用词重合**时才召回。
- * 不调模型（所以不花钱、也不需要配 Key），空结果是正常结果。
- */
-export async function retrieveApiDocsRag(
-  prdContent: string,
-  history: Array<{ role: 'user' | 'ai'; content: string }>,
-  topK = 6,
-): Promise<{ hits: RagHit[]; corpusSize: number }> {
-  const { data } = await http.post<{ hits: RagHit[]; corpus_size: number }>(
-    '/conversation/retrieve-api-docs-rag',
-    { prd_content: prdContent, history, top_k: topK },
-  )
-  return { hits: data.hits, corpusSize: data.corpus_size }
-}
-
 /**
  * **从结构化摘要生成 PRD**（流式）。
  *

@@ -14,6 +14,13 @@
  * - `complete === false` 时展开区明说"只并入了 2/3 片" —— **不假装完整**；
  * - run id 与各片 request id 都给出来：`request_id` 只能查到**那一片**，
  *   `run_id` 才是能一次查全整份的键，文案里写清楚这个区别。
+ *
+ * ## 参考规范（RAG 下线那一篇）
+ *
+ * 接口文档 / 提示词套件的团队规范与示例由后端**技能包全量注入**，`run_summary.injected_skills`
+ * 记着这份清单。这里只**如实展示**（`skill_id (vX)` + 文件数，点开列文件名）——
+ * ⚠️ **不是第二道确认门控**：生成早就跑完了，用户看不看都不影响任何事。
+ * 缺这个字段（老后端 / 澄清聊天）时整行不渲染。
  */
 
 import { useState } from 'react'
@@ -62,6 +69,8 @@ export default function RunSummaryPanel({
 }: RunSummaryPanelProps) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed)
   const [copied, setCopied] = useState(false)
+  /** 参考规范的文件名清单是否展开（默认只显示"N 个文件"）。 */
+  const [showArtifacts, setShowArtifacts] = useState(false)
   if (!summary) return null
 
   const tokens = (summary.total_input_tokens ?? 0) + (summary.total_output_tokens ?? 0)
@@ -84,6 +93,12 @@ export default function RunSummaryPanel({
   /** run id 缺（老后端回滚、或非分片预览）时退回这一片的 request_id，至少让用户能复制点东西。 */
   const runId = summary.run_id ?? summary.request_id
   const requestIds = summary.request_ids?.length ? summary.request_ids : [summary.request_id]
+  /** 这趟注入的技能包。缺字段（老后端）或 `null`（纯对话 run）都退化成空数组 → 整行不渲染。 */
+  const injectedSkills = summary.injected_skills ?? []
+  const injectedFileCount = injectedSkills.reduce(
+    (total, skill) => total + skill.artifacts.length,
+    0,
+  )
 
   const copy = () => {
     // 复制的是**一整块可检索文本**而不是裸 id：用户把这段贴给维护者时，
@@ -154,6 +169,37 @@ export default function RunSummaryPanel({
             <dt>自动修订</dt>
             <dd className="text-slate-700">{summary.revision_applied ? '改过一轮' : '未触发'}</dd>
           </div>
+          {/* 参考规范：只读展示，不是门控（生成已经跑完了） */}
+          {injectedSkills.length > 0 && (
+            <div className="flex flex-wrap items-start gap-2">
+              <dt>参考规范</dt>
+              <dd className="text-slate-700">
+                {injectedSkills.map((skill) => `${skill.skill_id} (v${skill.version})`).join('、')}
+                {' · '}
+                <button
+                  type="button"
+                  data-testid="toggle-injected-skills"
+                  onClick={() => setShowArtifacts((prev) => !prev)}
+                  className="underline decoration-dotted underline-offset-2 transition hover:text-slate-900"
+                >
+                  {injectedFileCount} 个文件
+                </button>
+              </dd>
+              {showArtifacts && (
+                <dd className="w-full">
+                  <ul className="list-disc pl-4 font-mono text-slate-500">
+                    {injectedSkills.flatMap((skill) =>
+                      skill.artifacts.map((path) => (
+                        <li key={`${skill.skill_id}/${path}`}>
+                          {skill.skill_id}/{path}
+                        </li>
+                      )),
+                    )}
+                  </ul>
+                </dd>
+              )}
+            </div>
+          )}
           <div className="flex flex-wrap items-center gap-2">
             <dt>run ID</dt>
             <dd className="font-mono text-slate-700">{runId}</dd>

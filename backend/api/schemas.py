@@ -95,9 +95,6 @@ __all__ = [
     "SyncSummaryRequest",
     "SyncSummaryResponse",
     # 接口文档 RAG 检索（非流式，不调模型）
-    "RetrieveRagRequest",
-    "RetrieveRagResponse",
-    "RagHit",
     # Generation Job（`/api/jobs/*`）
     "CreateJobRequest",
     "CreateJobResponse",
@@ -607,38 +604,6 @@ class GeneratePrdFromSummaryRequest(BaseModel):
             raise ValueError("summary 不能是空对象 —— 这条路径的唯一输入就是结构化摘要")
         return value
 
-
-class RetrieveRagRequest(BaseModel):
-    """`POST /conversation/retrieve-api-docs-rag` 的入参。
-
-    与 `SyncSummaryRequest` 一样是**非流式**：输出是一组片段，调用方要按 `source`/`kind`
-    自行取舍后拼进提示词，流式没有意义。
-    """
-
-    prd_content: NonBlankStr = Field(
-        description="已通过审核的 PRD 全文 —— 检索的主要依据（它决定本次要写哪些接口）"
-    )
-    history: list[ConversationTurn] = Field(
-        default_factory=list, description="对话历史，按时间正序。**只取用户说过的话**参与检索"
-    )
-    top_k: int = Field(default=5, ge=1, le=20, description="返回几条命中。上限刻意不大：片段要拼进提示词")
-
-
-class RagHit(BaseModel):
-    """一条检索命中。"""
-
-    source: str = Field(description="来源，仓库相对路径（如 `docs/接口文档模板.md`）")
-    kind: str = Field(description="类别：`规范` 或 `历史接口示例`")
-    title: str = Field(description="块标题（Markdown 标题路径，如 `模板 > 2.1 字段清单`）")
-    content: str = Field(description="块正文，可直接拼进提示词")
-    score: float = Field(description="相关度得分（BM25 近似）。只用于排序，绝对值没有意义")
-
-
-class RetrieveRagResponse(BaseModel):
-    """检索结果。**空列表是正常结果**（语料里没有相关片段），不是错误。"""
-
-    hits: list[RagHit] = Field(default_factory=list, description="按相关度倒序")
-    corpus_size: int = Field(default=0, description="参与检索的块总数（排查「为什么没召回」用，0 表示语料缺失）")
 
 
 class DocumentPlanView(BaseModel):

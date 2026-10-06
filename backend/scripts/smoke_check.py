@@ -1162,7 +1162,6 @@ def main() -> int:
         "/api/v1/conversation/questions",
         "/api/v1/conversation/start-stream",
         "/api/v1/conversation/sync-summary-from-conversation",
-        "/api/v1/conversation/retrieve-api-docs-rag",
         "/api/v1/sessions",
         "/api/v1/sessions/{session_id}",
         "/api/v1/sessions/{session_id}/form",
@@ -1221,7 +1220,6 @@ def main() -> int:
         "/api/v1/conversation/generate-prompts-stream",
         "/api/v1/conversation/optimize-document-stream",
         "/api/v1/conversation/sync-summary-from-conversation",
-        "/api/v1/conversation/retrieve-api-docs-rag",
         # 会话快照存储 4 条（已实现，所以必须声明 200 而不是 501）
         "/api/session/list",
         "/api/session/{id}",
@@ -1281,24 +1279,33 @@ def main() -> int:
         )
 
     check(
-        "prd / optimize-prd 绑定 prd-generator，其余四个产物留空",
+        "六个产物都绑上了各自的 skill（RAG 下线后不再有留空项）",
         resolved.get("prd") == ("prd-generator",)
         and resolved.get("optimize-prd") == ("prd-generator",)
-        and all(
-            resolved.get(key) == ()
-            for key in ("api-docs", "optimize-api-docs", "prompts", "optimize-prompts")
-        ),
-        f"prd={resolved.get('prd')} optimize-prd={resolved.get('optimize-prd')}"
-        f" prompts={resolved.get('prompts')}",
+        and resolved.get("api-docs") == ("api-docs-generator",)
+        and resolved.get("optimize-api-docs") == ("api-docs-generator",)
+        and resolved.get("prompts") == ("prompts-generator",)
+        and resolved.get("optimize-prompts") == ("prompts-generator",),
+        "、".join(f"{key}→{list(value)}" for key, value in sorted(resolved.items())),
     )
 
-    # 空列表是**合法状态**（接口文档 / 提示词套件现在就是），loader 必须给出空 bundle
-    # 而不是报错 —— 不然"这个产物没有技能包"就得靠调用方自己判空。
-    empty_bundle = load_skill_bundle("api-docs")
+    # `skills: []` 仍然是**合法状态**（现在没有产物用它，但规则要留住：
+    # 将来加产物时不该被逼着立刻写一个 skill）。两件事分开测：
+    # 注册表允许空列表、消费侧拿到空 bundle 不炸。
+    try:
+        validate_registry_data({"bindings": {key: {"skills": []} for key in JOB_ARTIFACTS}})
+    except Exception as exc:  # noqa: BLE001
+        check("`skills: []` 合法：六个产物全留空也能通过校验", False, f"{type(exc).__name__}: {exc}")
+    else:
+        check("`skills: []` 合法：六个产物全留空也能通过校验", True, "校验通过")
+
+    from services.skill_loader import SkillBundle, bundle_to_injected_meta  # noqa: PLC0415
+
+    empty_bundle = SkillBundle(artifact="none", skills=(), artifacts=())
     check(
-        "空绑定合法：load_skill_bundle 返回空 bundle 而不报错",
-        empty_bundle.skills == () and empty_bundle.artifacts == (),
-        f"api-docs → skills={empty_bundle.skills} artifacts={len(empty_bundle.artifacts)} 份",
+        "空 bundle 在消费侧退化成空（compose → {}、meta → []）",
+        compose_prompt_sections(empty_bundle) == {} and bundle_to_injected_meta(empty_bundle) == [],
+        "compose={} meta=[]",
     )
 
     # 注册表写错必须**尽早报错**，而不是静默变成"这个产物没有技能包"
@@ -1356,6 +1363,55 @@ def main() -> int:
         "compose_prompt_sections 按 role 分组，顺序 = ROLE_ORDER",
         list(sections) == [role for role in ROLE_ORDER if role in sections] and bool(sections),
         " → ".join(sections) if sections else "（空）",
+    )
+
+    # ---- 另外两个技能包（RAG 下线那一篇新增）----
+    for artifact, skill_id, must_have in (
+        ("api-docs", "api-docs-generator", ("reference", "example")),
+        ("prompts", "prompts-generator", ("template", "reference")),
+    ):
+        bundle_for = load_skill_bundle(artifact)
+        roles_for = {item.role for item in bundle_for.artifacts}
+        check(
+            f"{artifact} 绑定 {skill_id}，且含 {' / '.join(must_have)} 两类文件",
+            skill_id in bundle_for.skills and set(must_have) <= roles_for,
+            "、".join(f"{item.path}({item.role})" for item in bundle_for.artifacts),
+        )
+        declared = load_skill_manifest(skill_id).get("constraints", {}).get("max_injected_bytes")
+        injected = sum(len(item.content) for item in bundle_for.artifacts)
+        check(
+            f"{artifact} 的注入体积在 skill.yaml 声明的上限内",
+            isinstance(declared, int) and injected <= declared,
+            f"{injected} / {declared} 字节（全量注入，不再按关键词筛选）",
+        )
+
+    # ---- RAG 检索整条链路必须不存在（少一段就会留下"两套规范来源"）----
+    services_dir = Path(__file__).resolve().parents[1] / "services"
+    leftovers = sorted(
+        path.name
+        for path in services_dir.glob("*.py")
+        if "rag_service" in path.read_text(encoding="utf-8")
+        or "retrieve_api_docs" in path.read_text(encoding="utf-8")
+    )
+    check(
+        "services/ 里没有 RAG 检索残留（模块 / 函数 / 常量名一个都不剩）",
+        not leftovers,
+        f"仍在：{leftovers}" if leftovers else f"扫了 {len(list(services_dir.glob('*.py')))} 个模块",
+    )
+    removed_symbols = [
+        name
+        for name in ("_rag_index", "_rag_search", "_rag_query", "RAG_CORPUS", "RAG_DROP_DIRS")
+        if hasattr(ds, name)
+    ]
+    check(
+        "document_service 的检索实现与语料常量已删除",
+        not removed_symbols,
+        f"仍在：{removed_symbols}" if removed_symbols else "5 个符号都不在了",
+    )
+    check(
+        "检索路由不在 OpenAPI 里（前端也调不到了）",
+        "/api/v1/conversation/retrieve-api-docs-rag" not in paths,
+        "已移除",
     )
 
     try:
@@ -2986,6 +3042,122 @@ def main() -> int:
         and "request_id" in second_summary
         and "run_type" in second_summary,
         "run_summary → done",
+    )
+
+    # ---------- 技能包注入 + run_summary.injected_skills（RAG 下线那一篇）----------
+    # 走**真实的 HTTP + 服务层 + 观测接线**，只把模型换成会记录消息的假的：
+    # 于是"接口文档生成到底给模型看了什么"变成可断言的，而不是靠读代码相信。
+    inject_fake = _FakeModel(["## 第 1 章 文档信息\n"])
+    inject_app = create_app(Settings(_env_file=None))
+    inject_app.dependency_overrides[get_document_service] = lambda: ds.DocumentService(
+        model=inject_fake
+    )
+    with _TestClient(inject_app) as inject_client:
+        injected = inject_client.post(
+            "/api/v1/conversation/generate-api-docs-stream",
+            json={
+                "form": {"product_name": "注入探针"},
+                "prd_content": "# 群聊周报助手\n\n## 2. 功能需求\n\n- FR-01 绑定群聊",
+            },
+        )
+    injected_summary = _summary_payload(injected.text)
+    sent_human = inject_fake.seen[0][1].content
+    check(
+        "接口文档：技能包（团队规范 + 参考示例）全量注入 human message",
+        "本产物注入的技能包规范与示例" in sent_human
+        and "references/team-api-guidelines.md" in sent_human
+        and "references/writing-rules.md" in sent_human
+        and "references/history-weekly-report-api.md" in sent_human,
+        f"human {len(sent_human)} 字符",
+    )
+    check(
+        "接口文档：注入块里规范在示例之前（顺序 = skill.yaml 的 role 顺序）",
+        sent_human.index("【团队规范与写作要点】") < sent_human.index("【参考示例"),
+        "规范 → 示例",
+    )
+    check(
+        "接口文档：run_summary.injected_skills 记下 skill_id / version / 文件清单",
+        isinstance(injected_summary.get("injected_skills"), list)
+        and len(injected_summary["injected_skills"]) == 1
+        and injected_summary["injected_skills"][0]["skill_id"] == "api-docs-generator"
+        and injected_summary["injected_skills"][0]["version"] == "1.0.0"
+        and len(injected_summary["injected_skills"][0]["artifacts"]) >= 3,
+        json.dumps(injected_summary.get("injected_skills"), ensure_ascii=False)[:150],
+    )
+
+    prompts_fake = _FakeModel(["=== FILE: 00-README.md ===\n"])
+    prompts_probe = ds.DocumentService(model=prompts_fake)
+    asyncio.run(
+        _collect_all(
+            prompts_probe.generate_prompts_stream(
+                form={"product_name": "注入探针"}, prd_content="# 群聊周报助手"
+            )
+        )
+    )
+    prompts_human = prompts_fake.seen[0][1].content
+    check(
+        "提示词套件：模板与写作规则走同一条注入路径",
+        "references/prompts-template.md" in prompts_human
+        and "【结构模板】" in prompts_human
+        and "references/writing-rules.md" in prompts_human,
+        f"human {len(prompts_human)} 字符",
+    )
+
+    # 优化路径也要注入 —— 而且 artifact 键**不能手拼** `f"optimize-{kind}"`：
+    # 接口文档那一份叫 `optimize-api-docs`（带 docs），手拼出的 `optimize-api` 不在注册表里，
+    # 优化时直接抛 SkillConfigError（浏览器里点「优化这一节」实测踩到）。
+    check(
+        "优化 artifact 映射由 job_models.ARTIFACT_DOC_KIND 反查（api → optimize-api-docs）",
+        ds._OPTIMIZE_ARTIFACT_BY_KIND.get("api") == "optimize-api-docs"
+        and ds._OPTIMIZE_ARTIFACT_BY_KIND.get("prompts") == "optimize-prompts"
+        and ds._OPTIMIZE_ARTIFACT_BY_KIND.get("prd") == "optimize-prd",
+        str(ds._OPTIMIZE_ARTIFACT_BY_KIND),
+    )
+    for opt_kind, opt_needle in (("api", "team-api-guidelines"), ("prompts", "prompts-template")):
+        opt_fake = _FakeModel(["改好了"])
+        opt_svc = ds.DocumentService(model=opt_fake)
+        asyncio.run(
+            _collect_all(
+                opt_svc.optimize_document_stream(
+                    kind=opt_kind,
+                    section="第 5 章 错误码表",
+                    feedback="补一列 HTTP 状态码",
+                    current_content="## 第 5 章 错误码表\n\n旧内容",
+                    prd_content="# 群聊周报助手",
+                    api_content="# 接口文档",
+                )
+            )
+        )
+        opt_human = opt_fake.seen[0][1].content
+        check(
+            f"优化 {opt_kind}：注入对应技能包（走 optimize-* 的绑定）",
+            "本产物注入的技能包规范与示例" in opt_human and opt_needle in opt_human,
+            f"human {len(opt_human)} 字符",
+        )
+
+    # 分片重复上报必须**并成一项**（三个分片都注入同一批文件，汇总不该变成 3 条）
+    from services.llm_metrics import (  # noqa: PLC0415
+        RunMetricsCollector,
+        finalize_run as _finalize_run,
+        record_injected_skills,
+    )
+
+    dedupe_run = RunMetricsCollector.start("smoke_injected_skills")
+    for _ in range(3):
+        record_injected_skills(bundle_to_injected_meta(load_skill_bundle("api-docs")))
+    dedupe_payload = _finalize_run(dedupe_run).to_dict(brief=True)
+    check(
+        "injected_skills：分片重复上报合并成一项（不是三份清单）",
+        isinstance(dedupe_payload.get("injected_skills"), list)
+        and len(dedupe_payload["injected_skills"]) == 1
+        and dedupe_payload["injected_skills"][0]["skill_id"] == "api-docs-generator",
+        json.dumps(dedupe_payload.get("injected_skills"), ensure_ascii=False)[:120],
+    )
+    none_skill = _finalize_run(RunMetricsCollector.start("smoke_no_skill")).to_dict(brief=True)
+    check(
+        "injected_skills：没有技能包的 run 是 null（与空列表区分开）",
+        "injected_skills" in none_skill and none_skill["injected_skills"] is None,
+        f"injected_skills={none_skill.get('injected_skills')}",
     )
 
     # 日志贯通：这是维护者唯一能用的检索入口（界面只显示汇总，明细在 app.log）

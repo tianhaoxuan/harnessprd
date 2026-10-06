@@ -462,6 +462,16 @@ export interface RunStepSummary {
   duration_ms?: number
 }
 
+/** 一趟生成注入的一个技能包（`run_summary.injected_skills[]` 的元素）。 */
+export interface InjectedSkill {
+  /** skill id，与 `skills/{id}/` 目录名一致 */
+  skill_id: string
+  /** 语义化版本（暂时没有 pin 机制，先记下来便于事后定位） */
+  version: string
+  /** 注入的文件清单（相对技能目录的路径） */
+  artifacts: string[]
+}
+
 /** 整趟流程的汇总（SSE `run_summary` 事件）。 */
 export interface RunSummary {
   request_id: string
@@ -480,6 +490,16 @@ export interface RunSummary {
     ratio: number
     level: string
   }
+  /**
+   * 这趟**注入进提示词**的技能包清单（RAG 下线那一篇加的）。
+   *
+   * 接口文档 / 提示词套件的团队规范与示例、PRD 的 6 章技能包都从这里看得出来 ——
+   * 它回答的是"这份产物是按哪一版规范生成的"。
+   *
+   * ⚠️ **可选且可能是 `null`**：澄清聊天等纯对话 run 没有技能包；
+   * 老后端（或后端回滚）不带这个键 → `undefined`。两种情况都按"没有"处理，不要报错。
+   */
+  injected_skills?: InjectedSkill[] | null
 
   // ---------- 一次产物生成 = 一个 run（04 观测修复）----------
   // 背景：接口文档 / 提示词套件是**分片生成**的（前端按 `getDocumentPlan()` 循环发 N 次

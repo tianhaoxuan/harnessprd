@@ -381,6 +381,16 @@ def offline() -> None:
             "run_summary 里 revision_applied=True（改写过的账）",
             isinstance(summary, dict) and summary.get("revision_applied") is True,
         )
+        # RAG 下线那一篇：注入的技能包要**跟着 Job 的 run_summary 一起出来**
+        # （记录发生在 document_service 取 bundle 时，与 run 的开启是同一套 contextvar）
+        check(
+            "run_summary.injected_skills 记下 PRD 技能包（Job 路径也带上）",
+            isinstance(summary, dict)
+            and isinstance(summary.get("injected_skills"), list)
+            and summary["injected_skills"][0]["skill_id"] == "prd-generator"
+            and len(summary["injected_skills"][0]["artifacts"]) >= 4,
+            json.dumps((summary or {}).get("injected_skills"), ensure_ascii=False)[:140],
+        )
         check(
             "review_json 落库且内容来自审核员（issues 原样带出来）",
             isinstance(record.review(), dict)

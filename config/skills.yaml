@@ -32,15 +32,19 @@ bindings:
     skills:
       - prd-generator
 
-  # ---------- 以下四个本篇刻意留空 ----------
-  # 接口文档现在走 RAG 检索 + 内置提示词（`core/prompts/gen_api.md`），**没有**技能包。
-  # 02 篇（RAG 下线）会把 api-docs-generator 填进来 —— 那时这里是唯一要改的一处。
+  # 接口文档：**原 RAG 检索换成了这里的全量注入**（版本前缀 / 统一响应 / 错误码格式 /
+  # 分页与幂等 / 真实产出示例）。检索接口与前端确认页已随本篇删除。
   api-docs:
-    skills: []
+    skills:
+      - api-docs-generator
   optimize-api-docs:
-    skills: []
-  # 提示词套件同理：内置 `core/prompts/gen_prompts.md`，无技能包
+    skills:
+      - api-docs-generator
+
+  # 提示词套件：原来没有检索那一步，加技能包是为了让三份产物走同一条管线
   prompts:
-    skills: []
+    skills:
+      - prompts-generator
   optimize-prompts:
-    skills: []
+    skills:
+      - prompts-generator

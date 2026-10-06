@@ -58,7 +58,7 @@ import threading
 import time
 from contextvars import ContextVar, Token
 from enum import Enum
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -126,6 +126,18 @@ class RunMetrics(BaseModel):
     budget: dict[str, Any] | None = None
     """最后一次预算检查的完整结果（含 budget_source / policy_cap / hardware_cap）。"""
 
+    injected_skills: list[dict[str, Any]] | None = None
+    """这趟**注入进提示词**的技能包清单，形如
+    `[{"skill_id": "api-docs-generator", "version": "1.0.0", "artifacts": ["instructions.md", …]}]`。
+
+    用途：事后回答"这份产物是按哪一版规范生成的"。记录点只有一处 ——
+    `document_service` 取 bundle 的那几个函数（见 `skill_loader.bundle_to_injected_meta`）。
+
+    ⚠️ 跨分片取**并集**（见 `RunTotals.summary`）：每片都会注入同一批文件，
+    只留最后一片的值在正常情况下也对，但并集能容忍"某片少注入了一份"这种真出问题的情况。
+    `None` = 这趟没有技能包（澄清聊天等纯对话 run 本来就没有），与"空列表"区分开。
+    """
+
     # ---------- 跨分片（一份产物 = 一个 run）----------
     # 全部可选：单片请求（澄清聊天、PRD 生成、修订）没有这些信息也不该多出账。
     run_id: str | None = None
@@ -191,11 +203,36 @@ class RunMetricsRun:
         self._steps: list[StepMetrics] = []
         self._revision_applied: bool | None = None
         self._budget: dict[str, Any] | None = None
+        # 按 skill_id 去重：分片生成时每片都要注入一次，直接 append 会让清单变成 3 份
+        self._injected_skills: dict[str, dict[str, Any]] = {}
         self.context_usage: dict[str, Any] | None = None
         self._token: Token[RunMetricsRun | None] | None = None
 
     def add_step(self, record: StepMetrics) -> None:
         self._steps.append(record)
+
+    def record_injected_skills(self, items: Sequence[Mapping[str, Any]]) -> None:
+        """记下这趟注入的技能包（**幂等**：同一 skill 重复上报只并文件清单）。
+
+        与 `add_step` 不同，这里按 `skill_id` 合并而不是追加 —— 分片生成时每片都会
+        注入同一批规范，汇总要回答的是"这趟用了哪些规范"，不是"注入了几次"。
+        """
+        for item in items or ():
+            skill_id = str(item.get("skill_id") or "")
+            if not skill_id:
+                continue
+            row = self._injected_skills.setdefault(
+                skill_id,
+                {
+                    "skill_id": skill_id,
+                    "version": str(item.get("version") or ""),
+                    "artifacts": [],
+                },
+            )
+            for path in item.get("artifacts") or ():
+                text = str(path)
+                if text not in row["artifacts"]:
+                    row["artifacts"].append(text)
 
     def set_budget(self, check: Any) -> None:
         """记下最后一次预算检查：全量给日志，四字段给前端。"""
@@ -230,6 +267,8 @@ class RunMetricsRun:
             steps=list(self._steps),
             revision_applied=self._revision_applied,
             budget=self._budget,
+            # 空 → None：与"有技能包但清单为空"区分开（后者不该出现，出现了就是 bug）
+            injected_skills=list(self._injected_skills.values()) or None,
             started_at=self._started_at,
             ended_at=self._ended_at,
         )
@@ -274,6 +313,7 @@ class PartRecord(BaseModel):
     steps: list[StepMetrics] = Field(default_factory=list)
     revision_applied: bool | None = None
     budget: dict[str, Any] | None = None
+    injected_skills: list[dict[str, Any]] | None = None
     started_at: float | None = None
     ended_at: float | None = None
     last_at: float = 0.0
@@ -300,6 +340,7 @@ class PartRecord(BaseModel):
             steps=list(part.steps),
             revision_applied=part.revision_applied,
             budget=part.budget,
+            injected_skills=list(part.injected_skills) if part.injected_skills else None,
             # 拿不到区间就退化成"就是此刻"，至少不会把并集算成 0
             started_at=part.started_at if part.started_at is not None else now,
             ended_at=part.ended_at if part.ended_at is not None else now,
@@ -350,6 +391,26 @@ class RunTotals(BaseModel):
                     budget = item.budget
                     break
         revisions = [item.revision_applied for item in ordered if item.revision_applied is not None]
+        # 注入清单取**并集**（按 skill_id 合并、文件清单去重）。正常情况下各片一模一样，
+        # 并集与"取最后一片"等价；差别只体现在真出问题时（某片漏注入了规范）。
+        injected: dict[str, dict[str, Any]] = {}
+        for item in ordered:
+            for row in item.injected_skills or ():
+                skill_id = str(row.get("skill_id") or "")
+                if not skill_id:
+                    continue
+                merged = injected.setdefault(
+                    skill_id,
+                    {
+                        "skill_id": skill_id,
+                        "version": str(row.get("version") or ""),
+                        "artifacts": [],
+                    },
+                )
+                for path in row.get("artifacts") or ():
+                    text = str(path)
+                    if text not in merged["artifacts"]:
+                        merged["artifacts"].append(text)
         return RunMetrics(
             request_id=part.request_id,
             run_type=part.run_type,
@@ -361,6 +422,7 @@ class RunTotals(BaseModel):
             # 任一触发过自动改写，就算整份改写过了（前端据此提示"已自动改写"）
             revision_applied=any(revisions) if revisions else None,
             budget=budget,
+            injected_skills=list(injected.values()) or None,
             run_id=self.run_id,
             request_ids=[item.request_id for item in ordered],
             part_index=part.part_index,
@@ -582,6 +644,20 @@ def record_step(
     else:
         logger.debug("LOG_LLM_METRICS=false，跳过 llm_step 日志：%s", record.step)
     return record
+
+
+def record_injected_skills(items: Sequence[Mapping[str, Any]]) -> None:
+    """把"这趟注入了哪些 skill 文件"记进当前 run 的汇总（`run_summary.injected_skills`）。
+
+    与 `record_step` 走同一条路子：调用方（`document_service` 取 bundle 的那几处）
+    不必持有收集器。没有 active run 时静默跳过 —— **不为记账去造一个 run**，
+    那会让"这趟跑了几步、花了多少"失真（同 `record_step` 的处理）。
+    """
+    run = RunMetricsCollector.current()
+    if run is None:
+        logger.debug("没有 active run，技能包注入不记账（%d 项）", len(items or ()))
+        return
+    run.record_injected_skills(items)
 
 
 def _emit(record: StepMetrics, *, level: int) -> None:

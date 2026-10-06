@@ -52,7 +52,7 @@ import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -491,6 +491,53 @@ def load_skill_bundle(artifact: str) -> SkillBundle:
             )
 
     return SkillBundle(artifact=artifact, skills=skill_ids, artifacts=tuple(collected))
+
+
+def bundle_to_injected_meta(
+    bundle: SkillBundle, *, paths: Sequence[str] | None = None
+) -> list[dict[str, Any]]:
+    """把 bundle 压成 `run_summary.injected_skills` 的形状（**按 skill 分组**）。
+
+    ```python
+    [{"skill_id": "api-docs-generator", "version": "1.0.0",
+      "artifacts": ["instructions.md", "references/team-api-guidelines.md"]}]
+    ```
+
+    为什么按 skill 分组而不是平铺文件：要回答的是「这次生成用了哪份规范、哪个版本」，
+    文件清单只是佐证。`version` 现在没有 pin 机制，但**先记下来**才能事后定位
+    "这份产物是按哪一版规范生成的"。
+
+    Args:
+        paths: 只登记这几份（相对技能目录的路径）。给"只注入了其中一份"的场景用 ——
+            摘要回填只注入 `role: schema` 那一份，登记整包会让汇总夸大实际注入量。
+            不传 = 全部登记。
+
+    Returns:
+        按 `bundle.skills` 的顺序排列（与提示词里的先后一致）；
+        **没注入任何文件的 skill 不出现**（`enabled: false`，或文件都是可选角色且缺失）。
+        空 bundle → 空列表（接口文档/提示词之外、或绑成空列表的产物就是这种状态）。
+    """
+    wanted = None if paths is None else set(paths)
+    grouped: dict[str, list[str]] = {}
+    for item in bundle.artifacts:
+        if wanted is not None and item.path not in wanted:
+            continue
+        grouped.setdefault(item.skill_id, []).append(item.path)
+
+    meta: list[dict[str, Any]] = []
+    for skill_id in bundle.skills:
+        registered = grouped.get(skill_id)
+        if not registered:
+            continue
+        manifest = _manifest_cached(skill_id)
+        meta.append(
+            {
+                "skill_id": skill_id,
+                "version": str(manifest.get("version") or ""),
+                "artifacts": registered,
+            }
+        )
+    return meta
 
 
 def compose_prompt_sections(bundle: SkillBundle) -> dict[str, str]:

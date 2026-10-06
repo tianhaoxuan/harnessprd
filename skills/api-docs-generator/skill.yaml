@@ -1,0 +1,87 @@
+# 接口文档生成技能（skill）的清单：**运行时契约 + 内容契约**。
+#
+# 字段含义与 `skills/prd-generator/skill.yaml` 完全一致（运行时字段由
+# `services/skill_loader.py` 读，内容字段给人看），那里有逐字段说明，这里不重复。
+#
+# ## 这个 skill 顶上的是原来的 RAG 检索
+#
+# 改造前接口文档走「前端检索 `knowledge`/`docs`/`validation_out` → 用户勾选 →
+# 选中片段塞进 `known_info`」这条**带人工确认**的路，规范源分散、召回还不稳定
+# （词法检索，同义改写召回不到）。现在改成：**全量注入**本 skill 的
+# `reference` + `example`，不再检索、不再确认。
+#
+# 规范文件体量小且固定，全量注入比 top_k 检索更稳定、可预期 —— 这是这次替换的前提。
+
+id: api-docs-generator
+version: "1.0.0"
+label: 接口文档生成规范
+description: >-
+  团队 HTTP 接口规范与真实产出示例：版本前缀、统一响应、错误码格式、分页与幂等怎么写，
+  以及一份可直接对照的接口写法示例。生成时全量注入，不需要用户确认。
+applies_to:
+  - api-docs
+  - optimize-api-docs
+
+# 注入顺序提示（跨角色顺序由 `skill_loader.ROLE_ORDER` 定：
+# instructions → template → reference → schema → example）：
+# 先工作流（怎么用这些规范），再团队规范与写作要点（都是 reference，按下面的书写顺序拼），
+# 最后真实示例（example）。**改动这个顺序等于改提示词。**
+artifacts:
+  - path: instructions.md
+    role: instructions
+  - path: references/team-api-guidelines.md
+    role: reference
+  - path: references/writing-rules.md
+    role: reference
+  # 真实模型产出、已通过评审留档的接口写法示例。
+  # ⚠️ 示例与规范不同：它给的是"长什么样"，模型容易照抄业务内容 ——
+  # instructions.md 里因此专门写了一条"只学写法、不要照抄业务"。
+  - path: references/history-weekly-report-api.md
+    role: example
+
+enabled: true
+priority: 10
+
+language: zh-CN
+
+inputs:
+  # 接口文档不读表单：它的唯一事实来源是**已通过评审的 PRD 全文**
+  primary: prd_content
+  context:
+    known_info: 对话中确认过的补充（动线、角色权限、边界、接口约定）
+    open_questions: 用户跳过、需要后续决策的项，要落进第 9 章「待确认」
+    conflicts: 已发现的矛盾及其结论
+  optional:
+    api_convention: 来自表单/PRD 的接口风格（RESTful / GraphQL / gRPC），决定是否走非 REST 分支
+  upstream_required: true   # 缺 PRD 直接失败，不生成（链条约束，后端 _require_text 挡住）
+
+outputs:
+  - name: api-docs
+    media_type: text/markdown
+    # 章节结构与每个接口的固定 8 项**不在本 skill 里**：它们在 system prompt 的
+    # `gen_api.md`（11 章 + 附 A/B），本 skill 只补团队规范与示例。
+    # 重复一遍会让同一件事有两个来源 —— 这是 `HANDOFF.md` §4 坑 #10 点名的错。
+    structure_source: backend/core/prompts/gen_api.md（system prompt）
+    ids:
+      traceability: '每个接口必须标 `PRD 来源`（`FR-xx`），且该编号真实存在于本次 PRD'
+
+constraints:
+  # 全量注入的体积上限（写在清单里是为了让人一眼看见成本；loader 不强制它）
+  max_injected_bytes: 14000
+  single_call_sufficient: false   # 接口文档必须分片（见 document_plan），整份必被输出上限截断
+  verification:
+    - 每个接口都有 PRD 来源，且没有凭空造出来的接口
+    - 接口清单与「无接口功能」两张表的 FR 互斥、不重叠
+    - 错误码格式统一、枚举值穷举、JSON 示例可直接粘贴
+    - 命名风格（路径 kebab-case、JSON 字段风格）全文一致
+
+metadata:
+  source_project: harnessprd
+  # 本 skill 是「RAG 下线」那一篇的产物：原来的检索语料来自 docs/ 与 validation_out/，
+  # 现在规范进了 references、示例进了 example，检索与人工确认整条链路删除。
+  replaces:
+    - backend/services/document_service.py 的 RAG_CORPUS / RAG_DROP_DIRS / _rag_* / retrieve_api_docs_rag_hits
+    - POST /api/v1/conversation/retrieve-api-docs-rag
+    - 前端 RagHitsPanel 与 retrieveApiDocsRag 调用
+  consumed_by:
+    - services/document_service.py 的 generate_api_docs_stream / optimize_document_stream(kind=api)

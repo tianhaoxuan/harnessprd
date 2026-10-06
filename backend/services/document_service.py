@@ -52,7 +52,6 @@ import json
 import logging
 import math
 import re
-from collections import Counter
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -71,9 +70,10 @@ from core.prompts import (
 )
 from core.questions import load_questions
 from services.conversation_service import format_form_data, message_text
+from services.job_models import ARTIFACT_DOC_KIND, is_optimize_artifact
 from services.llm import LlmConfigError, StreamOutcome, finish_reason_of, is_truncated
 from services.llm_factory import get_llm, track
-from services.llm_metrics import LlmStep
+from services.llm_metrics import LlmStep, record_injected_skills
 
 _DEFAULT_STEP_BY_KIND: dict[str, LlmStep] = {
     "prd": LlmStep.PRD_WRITER,
@@ -87,7 +87,9 @@ from services.prompts import (
     PROMPTS_GENERATION_PROMPT,
 )
 from services.skill_loader import (
+    SkillBundle,
     SkillConfigError,
+    bundle_to_injected_meta,
     compose_prompt_sections,
     load_skill_bundle,
 )
@@ -431,194 +433,19 @@ def _render_conversation(history: Sequence[Mapping[str, str]]) -> str:
     return "\n\n".join(lines)
 
 
-# ---------------------------------------------------------------- 接口文档 RAG 检索
+def _noted_bundle(artifact: str, *, paths: Sequence[str] | None = None) -> SkillBundle:
+    """取技能包，并把**实际注入的清单**登记到本次 run 的汇总里。
 
-# 仓库根目录（`services/` → `backend/` → 仓库根）。
-REPO_ROOT = Path(__file__).resolve().parents[2]
+    为什么登记放在这一层而不是各个调用点：三份产物 × 生成与优化，取 bundle 的地方有六七处，
+    在每个调用点手写一遍 `record_injected_skills(...)` 一定会漏 —— 而漏掉的表现是
+    `run_summary.injected_skills` 少一项，没有任何报错，几周后才会有人发现。
 
-# 检索语料。**只读仓库内的既有文件**，不引入向量库与 embedding 依赖：
-#
-# - 「规范」= 接口文档模板与提示词里的硬性规则（人写的、稳定的）
-# - 「历史接口示例」= `validation_out/` 里真实模型产出的接口文档（可借鉴的写法）
-#
-# ⚠️ 这是**词法检索**（BM25 近似），不是向量检索：查询与语料**用词重合**时才召回，
-# 同义改写召回不到（"鉴权" 查不到只写了 "JWT" 的段落）。要真正的语义召回，
-# 得先决定 embedding 提供方（DeepSeek 没有 embeddings 接口）+ 向量库 + 新依赖，
-# 那是独立的一件事，不该悄悄混进这次改动里。
-#
-# 元素：(相对仓库根的路径, 类别, 排序权重)。文件缺失时**跳过并告警**，不报错 ——
-# 部署镜像里不一定带着 `docs/`（后端镜像只 COPY backend/），缺语料不该让接口 500。
-RAG_CORPUS: tuple[tuple[str, str, float], ...] = (
-    ("docs/接口文档模板.md", "规范", 1.6),
-    ("backend/core/prompts/gen_api.md", "规范", 1.4),
-    ("backend/core/prompts/gen_common.md", "规范", 1.0),
-    ("backend/validation_out/gen_api.txt", "历史接口示例", 1.2),
-    ("backend/validation_out/gen_api_via_service.txt", "历史接口示例", 1.0),
-    ("backend/validation_out/split_api.txt", "历史接口示例", 1.0),
-    ("backend/validation_out/flow_api.txt", "历史接口示例", 0.6),
-)
-
-# **放资料的地方**：把 `.md` / `.txt` 丢进这两个目录（仓库根下），重启后端即生效。
-# 不用改代码、不用重建索引文件 —— 目录会被扫描成一类语料。
-#
-# 权重比内置的模板略高：模板讲的是"格式"，而你自己团队的规范/示例讲的是"我们怎么写"，
-# 后者才是这次生成真正要贴的东西。
-RAG_DROP_DIRS: tuple[tuple[str, str, float], ...] = (
-    ("rag/接口规范", "规范", 1.8),
-    ("rag/历史示例", "历史接口示例", 1.5),
-)
-
-# 单块上限：太大则"命中一处、带回一屏"，检索结果就没人读了。
-_RAG_CHUNK_CHARS = 1200
-
-# 检索词：ASCII 连续串（含 `{}` `/` 等路径字符）各算一个词；中文按相邻二字切
-# （不引 jieba：多一个依赖，而二字组的召回对中文已经够用）。
-_RAG_TOKEN_RE = re.compile(r"[A-Za-z0-9_/.:{}-]+|[\u4e00-\u9fff]")
-_CJK_RE = re.compile(r"^[\u4e00-\u9fff]$")
-
-
-def _rag_tokens(text: str) -> list[str]:
-    """切词。中文额外产出**相邻二元组**，否则单字召回噪声极大（"的""是"到处都在）。"""
-    raw = _RAG_TOKEN_RE.findall(text.lower())
-    tokens: list[str] = []
-    for index, token in enumerate(raw):
-        tokens.append(token)
-        if (
-            _CJK_RE.match(token)
-            and index + 1 < len(raw)
-            and _CJK_RE.match(raw[index + 1])
-        ):
-            tokens.append(token + raw[index + 1])
-    return tokens
-
-
-def _rag_chunks_of(text: str, source: str, kind: str, weight: float) -> list[dict[str, Any]]:
-    """按 Markdown 标题切块。标题作为 `title`，标题路径带上级便于人读（`第 4 章 > 字段`）。"""
-    chunks: list[dict[str, Any]] = []
-    heading_path: list[str] = []
-    title = source.rsplit("/", 1)[-1]
-    body: list[str] = []
-
-    def flush() -> None:
-        content = "\n".join(body).strip()
-        if content:
-            chunks.append(
-                {
-                    "source": source,
-                    "kind": kind,
-                    "title": " > ".join(heading_path) if heading_path else title,
-                    "content": content,
-                    "weight": weight,
-                }
-            )
-        body.clear()
-
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#") and len(stripped) <= 100:
-            flush()
-            level = len(stripped) - len(stripped.lstrip("#"))
-            name = stripped.lstrip("#").strip()
-            del heading_path[level - 1 :]
-            heading_path.append(name)
-            body.append(stripped)
-            continue
-        body.append(line)
-        # 超长块就地断开：宁可同一节出多块，也不要"命中一处带回三千字"
-        if sum(len(item) for item in body) > _RAG_CHUNK_CHARS:
-            flush()
-    flush()
-    return chunks
-
-
-@lru_cache(maxsize=1)
-def _rag_index() -> tuple[tuple[dict[str, Any], ...], dict[str, int]]:
-    """建一次索引（进程内缓存）：返回 `(块列表, 文档频率)`。
-
-    **纯读文件 + 纯计算**，不联网、不调模型，所以可以放心缓存、也可以随便测。
+    Args:
+        paths: 只登记这几份（给"只注入了其中一份"的场景，例如摘要回填只注入 `role: schema`）。
     """
-    chunks: list[dict[str, Any]] = []
-    for relative_path, kind, weight in RAG_CORPUS:
-        path = REPO_ROOT / relative_path
-        if not path.is_file():
-            logger.warning("RAG 语料缺失，已跳过：%s", relative_path)
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        chunks.extend(_rag_chunks_of(text, relative_path, kind, weight))
-
-    # 用户自己丢进去的资料（`rag/接口规范/`、`rag/历史示例/`）。
-    # 按文件名排序，保证同一批文件的检索结果**稳定可复现**（目录遍历顺序不保证）。
-    for relative_dir, kind, weight in RAG_DROP_DIRS:
-        directory = REPO_ROOT / relative_dir
-        if not directory.is_dir():
-            continue
-        for path in sorted(directory.glob("*")):
-            if path.suffix.lower() not in {".md", ".txt"} or not path.is_file():
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-            source = str(path.relative_to(REPO_ROOT)).replace("\\", "/")
-            chunks.extend(_rag_chunks_of(text, source, kind, weight))
-            logger.info("RAG 已收录自有语料：%s（%s）", source, kind)
-
-    document_frequency: dict[str, int] = {}
-    for chunk in chunks:
-        for term in set(_rag_tokens(chunk["content"])):
-            document_frequency[term] = document_frequency.get(term, 0) + 1
-    for chunk in chunks:
-        chunk["tokens"] = _rag_tokens(chunk["content"] + " " + chunk["title"])
-    return tuple(chunks), document_frequency
-
-
-def _rag_query(prd_content: str, history: Sequence[Mapping[str, str]]) -> str:
-    """检索用的查询串：PRD 正文 + 对话里**用户说过的话**。
-
-    AI 侧不取：它大段是复述与提问，词面上会把查询带偏（同 `sync` 那里剥信封的理由）。
-    """
-    user_turns = [
-        (turn.get("content") or "")
-        for turn in history
-        if (turn.get("role") or "").lower() == "user"
-    ]
-    return "\n".join([prd_content, *user_turns]).strip()
-
-
-def _rag_search(query: str, top_k: int) -> list[dict[str, Any]]:
-    """BM25 近似打分：`tf` 饱和 + `idf` 加权 + 语料权重，标题命中额外加分。
-
-    刻意**不做长度归一化**：命中的块往往正是"长而全"的那一节，惩罚长度会把它们压下去。
-    """
-    chunks, document_frequency = _rag_index()
-    if not chunks or not query.strip():
-        return []
-
-    query_counts = Counter(_rag_tokens(query))
-    total = len(chunks)
-    scored: list[tuple[float, dict[str, Any]]] = []
-    for chunk in chunks:
-        counts = Counter(chunk["tokens"])
-        score = 0.0
-        for term, query_tf in query_counts.items():
-            tf = counts.get(term, 0)
-            if tf == 0:
-                continue
-            idf = math.log(1 + (total + 0.5) / (document_frequency.get(term, 0) + 0.5))
-            score += min(query_tf, 3) * (tf / (tf + 1.5)) * idf
-        if score > 0:
-            title_hits = sum(1 for term in query_counts if term in chunk["title"].lower())
-            score *= chunk["weight"] * (1.0 + min(title_hits, 3) * 0.15)
-            scored.append((score, chunk))
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return [
-        {
-            "source": chunk["source"],
-            "kind": chunk["kind"],
-            "title": chunk["title"],
-            "content": chunk["content"],
-            "score": round(score, 4),
-        }
-        for score, chunk in scored[: max(1, top_k)]
-    ]
+    bundle = load_skill_bundle(artifact)
+    record_injected_skills(bundle_to_injected_meta(bundle, paths=paths))
+    return bundle
 
 
 def _skill_system_prompt(artifact: str = SKILL_PRD_ARTIFACT) -> str:
@@ -636,7 +463,7 @@ def _skill_system_prompt(artifact: str = SKILL_PRD_ARTIFACT) -> str:
             后者**必须报错而不是返回空 prompt**：那等于让模型在不带任何规范的情况下裸奔，
             而产物结构、编号规则全在里面。
     """
-    bundle = load_skill_bundle(artifact)
+    bundle = _noted_bundle(artifact)
     sections = compose_prompt_sections(bundle)
     if not sections:
         raise SkillConfigError(
@@ -649,6 +476,54 @@ def _skill_system_prompt(artifact: str = SKILL_PRD_ARTIFACT) -> str:
         + "，按顺序阅读并遵守 ====="
     )
     return "\n\n".join([header, *sections.values()])
+
+
+#: `DocKind` → 它**优化路径**的 Job artifact。
+#:
+#: ⚠️ 由 `job_models.ARTIFACT_DOC_KIND`（**唯一的映射处**）反查得到，
+#: **不要手拼 `f"optimize-{kind}"`** —— 接口文档那一份叫 `optimize-api-docs`（带 `docs`），
+#: 手拼出来的 `optimize-api` 在注册表里根本不存在，会在优化时抛 `SkillConfigError`
+#: （实测踩到：浏览器里点「优化这一节」直接失败）。
+_OPTIMIZE_ARTIFACT_BY_KIND: dict[str, str] = {
+    kind: artifact
+    for artifact, kind in ARTIFACT_DOC_KIND.items()
+    if is_optimize_artifact(artifact)
+}
+
+#: 角色 → 注入块里那一段的小标题（给人/给模型都更清楚"这是规范还是示例"）。
+_SKILL_ROLE_TITLES: dict[str, str] = {
+    "instructions": "本技能包的工作流",
+    "template": "结构模板",
+    "reference": "团队规范与写作要点",
+    "schema": "字段契约",
+    "example": "参考示例（学写法，不要照抄业务内容）",
+}
+
+
+def _skill_human_block(artifact: str) -> str:
+    """把技能包拼成一段**附加在 human message 末尾**的注入块。
+
+    与 `_skill_system_prompt()` 的分工：那个把技能包当 system prompt（PRD 那条路，
+    技能包就是完整规范）；这个只是**补充**到 human message 上 —— 接口文档与提示词套件的
+    结构规范仍在 system prompt（`gen_api.md` / `gen_prompts.md`），技能包补的是
+    团队约定与真实示例（原来由 RAG 检索 + 人工勾选提供的那部分）。
+
+    Returns:
+        空字符串 = 该产物没有绑定技能（正常状态，调用方直接不加这一段）。
+    """
+    bundle = _noted_bundle(artifact)
+    sections = compose_prompt_sections(bundle)
+    if not sections:
+        return ""
+    file_count = len(bundle.artifacts)
+    header = (
+        f"===== 本产物注入的技能包规范与示例"
+        f"（skills/{'、'.join(bundle.skills)}/，共 {file_count} 份文件，全量给出）====="
+    )
+    blocks = [header]
+    for role, text in sections.items():
+        blocks.append(f"【{_SKILL_ROLE_TITLES.get(role, role)}】\n{text}")
+    return "\n\n".join(blocks)
 
 
 def _skill_schema_text(artifact: str = SKILL_PRD_ARTIFACT) -> str:
@@ -664,6 +539,8 @@ def _skill_schema_text(artifact: str = SKILL_PRD_ARTIFACT) -> str:
     bundle = load_skill_bundle(artifact)
     for item in bundle.artifacts:
         if item.role == "schema":
+            # 只登记真正注进去的那一份：整包登记会让"注入量"虚高（这条路上只用 schema）
+            record_injected_skills(bundle_to_injected_meta(bundle, paths=[item.path]))
             return item.content
     raise SkillConfigError(
         f"artifact {artifact!r} 绑定的技能里没有 role: schema 的文件"
@@ -1002,7 +879,9 @@ class DocumentService:
             scope=scope,
             prd_content=prd_content,
         )
-        async for chunk in self._stream_document("api", values, outcome=outcome):
+        async for chunk in self._stream_document(
+            "api", values, skill_artifact="api-docs", outcome=outcome
+        ):
             yield chunk
 
     async def generate_prompts_stream(
@@ -1040,7 +919,9 @@ class DocumentService:
             prd_content=prd_content,
             api_content=api_content or _EMPTY,
         )
-        async for chunk in self._stream_document("prompts", values, outcome=outcome):
+        async for chunk in self._stream_document(
+            "prompts", values, skill_artifact="prompts", outcome=outcome
+        ):
             yield chunk
 
     # ------------------------------------------------------------ 对话 → 结构化摘要回填
@@ -1113,34 +994,6 @@ class DocumentService:
             truncated=truncated,
             finish_reason=reason,
         )
-
-    # ------------------------------------------------------------ 接口文档 RAG 检索
-
-    def retrieve_api_docs_rag_hits(
-        self,
-        *,
-        prd_content: str,
-        history: Sequence[Mapping[str, str]] = (),
-        top_k: int = 5,
-    ) -> list[dict[str, Any]]:
-        """检索与本次接口文档生成相关的规范与历史示例。
-
-        **不调模型**：纯读仓库内文件 + 打分排序，所以它是确定性的、免费的、可缓存的
-        （索引在 `_rag_index()` 里按进程缓存一次）。生成接口文档时把返回的片段拼进提示词，
-        相当于给模型几份"照这个写"的样例。
-
-        Args:
-            prd_content: 已通过审核的 PRD 全文 —— 检索的主要依据（它决定了本次要写哪些接口）。
-            history: 对话历史，只取用户说过的话（AI 侧是复述与提问，词面会把查询带偏）。
-            top_k: 返回几条。上限故意不设大：检索结果是要拼进提示词的，多给只会挤占上下文。
-
-        Returns:
-            按相关度倒序的命中列表，每条含 `source` / `kind` / `title` / `content` / `score`。
-            `source` 是仓库相对路径，`kind` 区分「规范」与「历史接口示例」，
-            便于调用方按类别分别处置（例如规范一定要给、示例按预算给）。
-        """
-        query = _rag_query(prd_content, history)
-        return _rag_search(query, top_k)
 
     # ------------------------------------------------------------ 从结构化摘要生成 PRD
 
@@ -1410,7 +1263,18 @@ class DocumentService:
             },
         )
         async for chunk in self._stream_document(
-            kind, values, human=human, outcome=outcome, step=LlmStep.DOCUMENT_OPTIMIZE
+            kind,
+            values,
+            human=human,
+            # 优化也注入规范：用户要的是"按团队规范改这一节"，只给反馈与原文，
+            # 模型会按自己的习惯重写（与生成结果风格不一致）。
+            # `optimize-prd` 有意**不在**这里：PRD 的优化路径仍用 `gen_prd` 那套 system prompt，
+            # 结构规范与技能包不是同一套，两边同时注入会给出互相矛盾的章节结构（见 README 待办）。
+            skill_artifact=(
+                _OPTIMIZE_ARTIFACT_BY_KIND.get(kind) if kind in ("api", "prompts") else None
+            ),
+            outcome=outcome,
+            step=LlmStep.DOCUMENT_OPTIMIZE,
         ):
             yield chunk
 
@@ -1456,6 +1320,7 @@ class DocumentService:
         *,
         human: str | None = None,
         system: str | None = None,
+        skill_artifact: str | None = None,
         outcome: StreamOutcome | None = None,
         step: LlmStep | None = None,
     ) -> AsyncIterator[str]:
@@ -1467,6 +1332,10 @@ class DocumentService:
         （见 `_skill_system_prompt`）。两个告警因此只在渲染路径上跑：它们诊断的是
         "占位符有没有注入"和"上游产物被重复内联"，而那两件事只与 `gen_*.md` 有关，
         对技能包的提示词说出来只会误导。
+
+        `skill_artifact` 传进来时，把该产物绑定的技能包（团队规范 + 参考示例）
+        **附在 human message 末尾**（见 `_skill_human_block`）。接口文档与提示词套件走这条：
+        它们的结构规范在 system prompt，技能包补的是原来由 RAG 检索提供的那部分。
 
         `outcome` 传进来时，顺手把厂商的结束原因记进去 —— **这是判断"输出被上限截断"
         的唯一可靠依据**。注意它在**最后一个分片**上，所以逐个分片地看、取最后一个非空的。
@@ -1489,10 +1358,16 @@ class DocumentService:
         else:
             system_prompt = system
 
+        resolved_human = human if human is not None else self.render_human_prompt(values)
+        if skill_artifact:
+            block = _skill_human_block(skill_artifact)
+            if block:
+                resolved_human = f"{resolved_human}\n\n{block}"
+
         messages: list[BaseMessage] = [
             SystemMessage(content=system_prompt),
             # 顺序固定：SystemMessage → HumanMessage。反了模型会读成"用户先说完 AI 再复述"。
-            HumanMessage(content=human if human is not None else self.render_human_prompt(values)),
+            HumanMessage(content=resolved_human),
         ]
         # 缺省按产物类型推断；只有「改写」与「文档优化」显式传入不同的 step
         if step is None:
