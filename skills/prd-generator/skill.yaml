@@ -1,20 +1,68 @@
-# PRD 生成技能（skill）清单。
+# PRD 生成技能（skill）的清单：**运行时契约 + 内容契约**。
 #
-# 字段名是按这类技能包的常见约定写的，没有对接某个具体平台的 schema。
-# 如果你的平台要求固定字段名（例如用 instructions 而不是 entrypoint、或者要 provider/model 之类），
-# 把要求发过来我改。
+# ## 这个文件现在参与运行时
 #
-# ⚠️ 这份清单**不参与运行时**：后端只读 references/ 下那三份 + instructions.md
-# （见 services/document_service.py 的 SKILL_PRD_ARTIFACTS）。清单写错不会让生成出错，
-# 只会让读到它的人对结构产生错误预期 —— 所以改动结构时仍要同步这里。
+#   - `services/skill_loader.py` 按下面的 `artifacts` 读文件、按 `role` 分组，
+#     `document_service._skill_system_prompt()` 再按角色顺序拼成 system prompt
+#   - `config/skills.yaml` 决定**哪个产物用哪些 skill**；两边**交叉校验**：
+#     注册表把本 skill 绑到 `applies_to` 之外的产物上，加载时会直接报错
+#
+# 所以改这里等于改提示词：改完跑 `scripts/smoke_check.py`（它会对拼出来的 prompt 做断言）。
+#
+# ## 字段分两类，别混
+#
+# | 类别 | 字段 | 谁读它 |
+# | --- | --- | --- |
+# | 运行时契约 | `id` / `artifacts` / `applies_to` / `enabled` / `priority` | `skill_loader` |
+# | 内容契约（给人读，也是改提示词时的取数依据） | `inputs` / `outputs` / `constraints` / `metadata` | 人；`instructions.md` / 模板 / 写作规则才是模型读的那份 |
+#
+# ⚠️ 这里**只留一份文件清单**（`artifacts`）。早先还有个 `references:` 字段，与
+# `artifacts` 是同一批路径的两种写法 —— 两份清单必然漂移，所以删掉了。
 
-name: prd-generator
-version: 0.2.0
+id: prd-generator
+# 语义化版本，供后续按版本 pin（现在还没有 pin 机制，先把字段占住）
+version: "1.0.0"
+# 给人看的短名（日志、将来可能的 UI）
+label: PRD 生成规范
 description: >-
   把已经澄清完的需求（表单作答 + 对话确认的信息），按固定模板写成一份 PRD。
   判断标准是开发读完能不追问就开工。
+
+# 本 skill 适用于哪些产物。取值必须是 Job artifact
+# （`services/job_models.JOB_ARTIFACTS`：prd / api-docs / prompts 及其 optimize-*）。
+# 空列表合法 = "还没打算给任何产物用"；但注册表一旦绑定，就必须在这里出现。
+applies_to:
+  - prd
+  - optimize-prd
+
+# 要注入的**文件**与**角色**。
+#
+# - 同一份清单内的顺序 = 拼接顺序
+# - 跨角色的顺序由 `skill_loader.ROLE_ORDER` 决定：
+#   instructions → template → reference → schema → example
+#   （先工作流：做什么、按什么顺序做；再模板：输出什么结构；再写作规则：怎么写；
+#     最后输入契约：字段定义。**这个顺序就是提示词里的顺序，改动等于改提示词。**）
+# - role 取值：instructions / reference / template / schema / example
+artifacts:
+  - path: instructions.md
+    role: instructions
+  - path: references/prd-template.md
+    role: template
+  - path: references/writing-rules.md
+    role: reference
+  - path: references/field-schema.json
+    role: schema
+  # ⚠️ 将来若加 `references/examples/*`，**不要**写进这个列表：示例对输出的影响很直接，
+  # 默认不注入是刻意的（现在这个目录还不存在）。真要注入时再加一条 role: example。
+
+# false = loader 跳过本 skill（不改别的文件就能停用，不必删目录）
+enabled: true
+
+# 多个 skill 命中同一个产物时的排序键：**数字越小越靠前**。目前只有本 skill，
+# 位次没有实际效果，留着是为了将来加 api-docs-generator / prompts-generator 时不必改 loader。
+priority: 10
+
 language: zh-CN
-entrypoint: instructions.md
 
 inputs:
   schema: references/field-schema.json
@@ -57,12 +105,6 @@ constraints:
     - 第 4 章的五个子块都在：认证与权限、数据与存储、前后端技术、部署方式、外部依赖
     - 第 5 章四类非功能需求都带数字或阈值
     - 8 个输入字段都有落点；受影响的位置就地标 [待确认]，不新增开放问题章
-
-references:
-  - instructions.md
-  - references/prd-template.md
-  - references/writing-rules.md
-  - references/field-schema.json
 
 metadata:
   source_project: harnessprd

@@ -1254,14 +1254,112 @@ def main() -> int:
     )
 
     # ---------- 技能包：加载器与 PRD 技能 prompt（离线，不调模型） ----------
-    from services.document_service import (  # noqa: PLC0415
-        SKILL_PRD_ARTIFACTS,
-        _load_skill_artifact,
-        _skill_system_prompt,
+    from services.document_service import _skill_system_prompt  # noqa: PLC0415
+    from services.job_models import JOB_ARTIFACTS  # noqa: PLC0415
+    from services.skill_loader import (  # noqa: PLC0415
+        ROLE_ORDER,
+        SkillConfigError,
+        compose_prompt_sections,
+        load_skill_bundle,
+        load_skill_manifest,
+        read_artifact_file,
+        validate_registry,
+        validate_registry_data,
+    )
+
+    # ---- 全局注册表 config/skills.yaml ----
+    try:
+        resolved = validate_registry()
+    except Exception as exc:  # noqa: BLE001 - 自检要报告任何校验失败
+        check("config/skills.yaml 可加载且通过校验", False, f"{type(exc).__name__}: {exc}")
+        resolved = {}
+    else:
+        check(
+            "config/skills.yaml 可加载且通过校验（含 applies_to 交叉校验）",
+            True,
+            "、".join(f"{key}→{list(value) or '空'}" for key, value in sorted(resolved.items())),
+        )
+
+    check(
+        "prd / optimize-prd 绑定 prd-generator，其余四个产物留空",
+        resolved.get("prd") == ("prd-generator",)
+        and resolved.get("optimize-prd") == ("prd-generator",)
+        and all(
+            resolved.get(key) == ()
+            for key in ("api-docs", "optimize-api-docs", "prompts", "optimize-prompts")
+        ),
+        f"prd={resolved.get('prd')} optimize-prd={resolved.get('optimize-prd')}"
+        f" prompts={resolved.get('prompts')}",
+    )
+
+    # 空列表是**合法状态**（接口文档 / 提示词套件现在就是），loader 必须给出空 bundle
+    # 而不是报错 —— 不然"这个产物没有技能包"就得靠调用方自己判空。
+    empty_bundle = load_skill_bundle("api-docs")
+    check(
+        "空绑定合法：load_skill_bundle 返回空 bundle 而不报错",
+        empty_bundle.skills == () and empty_bundle.artifacts == (),
+        f"api-docs → skills={empty_bundle.skills} artifacts={len(empty_bundle.artifacts)} 份",
+    )
+
+    # 注册表写错必须**尽早报错**，而不是静默变成"这个产物没有技能包"
+    # （静默的后果是产物缺规范却看不出来）。这里把五种典型写错各喂一遍。
+    valid_bindings = {artifact: {"skills": []} for artifact in JOB_ARTIFACTS}
+    valid_bindings["prd"] = {"skills": ["prd-generator"]}
+    valid_bindings["optimize-prd"] = {"skills": ["prd-generator"]}
+    bogus_registries = {
+        "引用不存在的 skill": {**valid_bindings, "prd": {"skills": ["no-such-skill"]}},
+        "artifact key 拼错": {**valid_bindings, "prd-gen": {"skills": []}},
+        "少写一个 artifact 条目": {
+            key: value for key, value in valid_bindings.items() if key != "prompts"
+        },
+        "绑到 applies_to 之外的产物": {**valid_bindings, "api-docs": {"skills": ["prd-generator"]}},
+        "缺 skills 键": {**valid_bindings, "prompts": {}},
+    }
+    bad_registries = []
+    for name, bindings in bogus_registries.items():
+        try:
+            validate_registry_data({"bindings": bindings})
+        except SkillConfigError:
+            continue
+        except Exception as exc:  # noqa: BLE001
+            bad_registries.append(f"{name}（抛的是 {type(exc).__name__}）")
+        else:
+            bad_registries.append(f"{name}（居然通过了）")
+    check(
+        "注册表写错时配置校验失败（五种错法都要报）",
+        not bad_registries,
+        "；".join(bad_registries) if bad_registries else "、".join(bogus_registries),
+    )
+
+    # ---- skill.yaml 与 bundle ----
+    manifest = load_skill_manifest("prd-generator")
+    check(
+        "skill.yaml 运行时字段完整（id / applies_to / artifacts / enabled / priority）",
+        manifest["id"] == "prd-generator"
+        and manifest["applies_to"] == ["prd", "optimize-prd"]
+        and manifest["enabled"] is True
+        and isinstance(manifest["priority"], int)
+        and len(manifest["artifacts"]) >= 4,
+        "、".join(f"{item['path']}({item['role']})" for item in manifest["artifacts"]),
+    )
+
+    bundle = load_skill_bundle("prd")
+    bundle_roles = {item.role for item in bundle.artifacts}
+    check(
+        "load_skill_bundle('prd') 非空，且含 template 与 schema",
+        bool(bundle.artifacts) and {"template", "schema"} <= bundle_roles,
+        f"{len(bundle.artifacts)} 份，roles={'、'.join(sorted(bundle_roles))}",
+    )
+
+    sections = compose_prompt_sections(bundle)
+    check(
+        "compose_prompt_sections 按 role 分组，顺序 = ROLE_ORDER",
+        list(sections) == [role for role in ROLE_ORDER if role in sections] and bool(sections),
+        " → ".join(sections) if sections else "（空）",
     )
 
     try:
-        instructions = _load_skill_artifact("instructions.md")
+        instructions = read_artifact_file("prd-generator", "instructions.md")
     except Exception as exc:  # noqa: BLE001 - 自检要报告任何读取失败
         check("技能包 instructions.md 可读", False, f"{type(exc).__name__}: {exc}")
     else:
@@ -1271,36 +1369,29 @@ def main() -> int:
             f"{len(instructions)} 字符",
         )
 
-    missing_artifacts = []
-    for name in SKILL_PRD_ARTIFACTS:
+    # 目录穿越必须被拒 —— 不拦的话读得到 `backend/.env`，
+    # API Key 会跟着每一次生成请求发给模型（这条守的是安全，不是风格）
+    traversal = []
+    for probe in ("../../backend/.env", "references/../../../backend/.env"):
         try:
-            _load_skill_artifact(name)
+            read_artifact_file("prd-generator", probe)
+        except SkillConfigError:
+            continue
         except Exception as exc:  # noqa: BLE001
-            missing_artifacts.append(f"{name}（{type(exc).__name__}）")
+            traversal.append(f"{probe}（抛的是 {type(exc).__name__}）")
+        else:
+            traversal.append(f"{probe}（居然读成功了）")
     check(
-        "技能包声明的四份文件都在",
-        not missing_artifacts,
-        "缺：" + "、".join(missing_artifacts)
-        if missing_artifacts
-        else "、".join(SKILL_PRD_ARTIFACTS),
+        "技能加载器拒绝目录穿越（读不到技能目录之外）",
+        not traversal,
+        "；".join(traversal) if traversal else "两种越界写法都被拒（抛 SkillConfigError）",
     )
-
-    # 目录穿越必须被拒 —— 不拦的话 `_load_skill_artifact("../../backend/.env")`
-    # 会把 API Key 读进 system prompt（这条守的是安全，不是风格）
-    try:
-        _load_skill_artifact("../../backend/.env")
-    except ValueError:
-        check("技能加载器拒绝目录穿越（读不到技能目录之外）", True)
-    except Exception as exc:  # noqa: BLE001
-        check("技能加载器拒绝目录穿越（读不到技能目录之外）", False, f"抛的是 {type(exc).__name__}")
-    else:
-        check("技能加载器拒绝目录穿越（读不到技能目录之外）", False, "居然读成功了")
 
     skill_prompt = _skill_system_prompt()
     check(
-        "技能 prompt 由四份文件拼成且每份带来源标题",
-        all(f"文件：{name}" in skill_prompt for name in SKILL_PRD_ARTIFACTS),
-        f"{len(skill_prompt)} 字符",
+        "技能 prompt 由声明过的文件拼成且每份带来源标题",
+        all(f"文件：{item.path}" in skill_prompt for item in bundle.artifacts),
+        f"{len(skill_prompt)} 字符 / {len(bundle.artifacts)} 份",
     )
     chapter_names = [
         "1. 产品概述",

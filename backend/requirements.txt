@@ -17,6 +17,7 @@ pydantic-settings>=2.15,<3.0     # 实测 2.15.0；用到 NoDecode，故下限 2
 langchain-core>=1.6,<2.0         # 实测 1.6.3；业务层只依赖它的 BaseChatModel
 langchain-anthropic>=1.7,<2.0    # 实测 1.7.2
 langchain-openai>=1.6,<2.0       # 实测 1.6.2；DeepSeek 也走这条（OpenAI 兼容协议）
+pyyaml>=6.0,<7.0                 # 实测 6.0.3；config/models.yaml 与 config/skills.yaml 都由它读
 python-dotenv>=1.2,<2.0          # 实测 1.2.3
 
 # 尚未声明但实现时会用到的（现在是传递依赖，用之前必须显式加进来）：

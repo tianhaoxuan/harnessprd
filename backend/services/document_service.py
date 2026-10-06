@@ -86,6 +86,11 @@ from services.prompts import (
     PRD_GENERATION_PROMPT,
     PROMPTS_GENERATION_PROMPT,
 )
+from services.skill_loader import (
+    SkillConfigError,
+    compose_prompt_sections,
+    load_skill_bundle,
+)
 from services.state import DocKind
 
 logger = logging.getLogger(__name__)
@@ -113,30 +118,19 @@ SYSTEM_TEMPLATES: dict[DocKind, str] = {
 
 # ---------------------------------------------------------------- 技能包（skills/）
 
-# 仓库根目录下的 skills/。
-# ⚠️ 用 `__file__` 定位，**不要用 cwd** —— 服务可能从任意工作目录启动
-# （Docker 里是 /app，本机是 backend/，脚本里是别处），按 cwd 找必然时灵时不灵。
-SKILL_ROOT = Path(__file__).resolve().parents[2] / "skills"
-
-# PRD 技能包相对 `SKILL_ROOT` 的目录名。
-SKILL_PRD_DIR = "prd-generator"
-
-# 技能包里的章节目录（PRD 模板）。`document_plan` 解析它得出"整份几章"的标签 ——
-# 常量放这里，那边 import 过去，避免同一个路径写两遍（改一处漏一处的老问题）。
-SKILL_PRD_TEMPLATE = "references/prd-template.md"
-
-# 技能包的输入契约。回填摘要时要把它的**原文**注入 human message（字段集合的唯一真相）。
-SKILL_PRD_FIELD_SCHEMA = "references/field-schema.json"
-
-# 组装 PRD 技能 system prompt 时读取的文件，**顺序即拼接顺序**：
-# 先工作流（做什么、按什么顺序做），再模板（输出什么结构），再写作规则（怎么写），
-# 最后输入契约（字段定义）。与 `gen_common + gen_*` 的"基线在前、产物专属在后"同一条道理。
-SKILL_PRD_ARTIFACTS: tuple[str, ...] = (
-    "instructions.md",
-    SKILL_PRD_TEMPLATE,
-    "references/writing-rules.md",
-    "references/field-schema.json",
-)
+# 技能包的**文件清单与路径不在这里**（01 篇改造）：
+#   - 「哪个 skill 有哪些文件、各是什么角色」= `skills/{id}/skill.yaml` 的自描述
+#   - 「哪个产物用哪些 skill」= `config/skills.yaml` 的全局绑定
+#   - 读文件、校验、按角色分组 = `services/skill_loader.py`
+#
+# 本模块只消费 loader 的结果，不再自己拼路径。改造前这里放着
+# `SKILL_ROOT` / `SKILL_PRD_DIR` / `SKILL_PRD_TEMPLATE` / `SKILL_PRD_FIELD_SCHEMA` /
+# `SKILL_PRD_ARTIFACTS` 五个常量 + 一个 `_load_skill_artifact()`：路径绑死在业务模块里，
+# 加一个 skill 只能把"读文件 + 目录穿越检查"再抄一遍，而且"这个 skill 适用于哪些产物"
+# 没有地方声明（工单 01 篇 §二）。
+#
+# PRD 技能对应的 **artifact 名**：与 `config/skills.yaml` 的 key 一致（也就是 Job artifact）。
+SKILL_PRD_ARTIFACT = "prd"
 
 # 技能路径的 human message 模板。
 # ⚠️ 与 `GEN_HUMAN_TEMPLATE` 是**两份**，不能混用：那个模板是"本次只生成某个分片"的
@@ -627,54 +621,54 @@ def _rag_search(query: str, top_k: int) -> list[dict[str, Any]]:
     ]
 
 
-@lru_cache(maxsize=None)
-def _load_skill_artifact(name: str, skill: str = SKILL_PRD_DIR) -> str:
-    """读技能包里的一个文件，参数是**相对技能目录的路径**（如 `references/prd-template.md`）。
+def _skill_system_prompt(artifact: str = SKILL_PRD_ARTIFACT) -> str:
+    """按 `config/skills.yaml` 的绑定，把技能包的文件拼成一份完整 system prompt。
 
-    结果按 `(skill, name)` 缓存：技能包是静态文件，一次进程读一次就够，
-    而 PRD 生成可能被反复调用。
+    每个文件前加一行来源标题（由 `skill_loader.compose_prompt_sections()` 加），
+    便于排查"这句话到底来自哪份文件"—— 技能包是多文件拼装，缺了这行，出问题时只能靠猜。
+
+    ⚠️ **不要在这里重排 section 顺序**：`compose_prompt_sections()` 返回的字典顺序
+    **就是**提示词顺序（instructions → template → reference → schema），
+    它逐字对应改造前那份 `SKILL_PRD_ARTIFACTS` 的顺序 —— 改了就等于偷偷改了提示词。
 
     Raises:
-        ValueError: 路径逃出技能目录（`../` 之类）。这是**调用方传错了**，
-            不是文件缺失，所以不跟 FileNotFoundError 混在一起。
-        FileNotFoundError: 文件确实不存在。错误信息里列出该技能包现有的文件，
-            省得为了知道"有什么"再去翻目录。
+        SkillConfigError: 注册表 / skill.yaml 有问题，或该产物一件可注入的文件都没有。
+            后者**必须报错而不是返回空 prompt**：那等于让模型在不带任何规范的情况下裸奔，
+            而产物结构、编号规则全在里面。
     """
-    root = SKILL_ROOT.resolve()
-    skill_dir = (root / skill).resolve()
-    path = (skill_dir / name).resolve()
-
-    # 目录穿越检查：解析后的路径必须仍在技能目录内。
-    # 不检查的话 `_load_skill_artifact("../../backend/.env")` 会把密钥读进 system prompt。
-    if path != skill_dir and skill_dir not in path.parents:
-        raise ValueError(f"技能文件路径越界：{skill}/{name} —— 只允许读技能目录内的文件")
-
-    if not path.is_file():
-        available = "、".join(
-            sorted(str(p.relative_to(skill_dir)) for p in skill_dir.rglob("*") if p.is_file())
+    bundle = load_skill_bundle(artifact)
+    sections = compose_prompt_sections(bundle)
+    if not sections:
+        raise SkillConfigError(
+            f"artifact {artifact!r} 没有可注入的技能文件（绑定的 skill：{list(bundle.skills) or '无'}）——"
+            "检查 config/skills.yaml 的 bindings，以及 skills/*/skill.yaml 的 enabled 与 artifacts"
         )
-        raise FileNotFoundError(
-            f"技能文件不存在：{skill}/{name}；该技能包现有文件：{available or '（空）'}"
-        )
+    header = (
+        "===== 技能包 "
+        + "、".join(f"skills/{skill_id}/" for skill_id in bundle.skills)
+        + "，按顺序阅读并遵守 ====="
+    )
+    return "\n\n".join([header, *sections.values()])
 
-    return path.read_text(encoding="utf-8").strip()
 
+def _skill_schema_text(artifact: str = SKILL_PRD_ARTIFACT) -> str:
+    """取技能包里 `role: schema` 那份文件的**原文**（技能包的输入契约）。
 
-def _skill_system_prompt(
-    skill: str = SKILL_PRD_DIR,
-    artifacts: Sequence[str] = SKILL_PRD_ARTIFACTS,
-) -> str:
-    """把技能包的几份文件拼成一份完整 system prompt。
+    字段集合的**唯一真相**在 `field-schema.json`：这里读它的原文注入 human message，
+    不在 Python 里再列一遍字段 —— 两处必然漂移（`HANDOFF.md` §4 坑 #10）。
 
-    每个文件前加一行来源标题，便于排查"这句话到底来自哪份文件"——
-    技能包是多文件拼装，缺了这行，出问题时只能靠猜。
+    Raises:
+        SkillConfigError: 绑定的技能里没有 `role: schema` 的文件。
+            摘要回填拿不到字段定义就只能瞎编键名，属于必须尽早暴露的配置错误。
     """
-    blocks = [
-        f"===== 技能包 skills/{skill}/，按顺序阅读并遵守 =====",
-    ]
-    for name in artifacts:
-        blocks.append(f"----- 文件：{name} -----\n\n{_load_skill_artifact(name, skill)}")
-    return "\n\n".join(blocks)
+    bundle = load_skill_bundle(artifact)
+    for item in bundle.artifacts:
+        if item.role == "schema":
+            return item.content
+    raise SkillConfigError(
+        f"artifact {artifact!r} 绑定的技能里没有 role: schema 的文件"
+        f"（绑定的 skill：{list(bundle.skills) or '无'}）—— 摘要回填缺字段定义"
+    )
 
 
 # 产物名（人读）。给 human message 与日志用。
@@ -972,7 +966,7 @@ class DocumentService:
         """
         resolved = self._settings.prd_use_skill if use_skill is None else use_skill
         if resolved:
-            return _skill_system_prompt(), SKILL_PRD_HUMAN_TEMPLATE
+            return _skill_system_prompt(SKILL_PRD_ARTIFACT), SKILL_PRD_HUMAN_TEMPLATE
         return self.render_system_prompt("prd", values), GEN_HUMAN_TEMPLATE
 
     async def generate_api_docs_stream(
@@ -1078,7 +1072,7 @@ class DocumentService:
             SummarySyncError: 模型没给出可解析的 JSON 对象（含截断导致的残缺 JSON）。
             LlmConfigError: 没配 Key（由 `model` 属性抛出，路由层转 503）。
         """
-        schema_text = _load_skill_artifact(SKILL_PRD_FIELD_SCHEMA)
+        schema_text = _skill_schema_text()
         try:
             schema = json.loads(schema_text)
         except json.JSONDecodeError as exc:  # pragma: no cover - schema 是仓库内的静态文件

@@ -163,25 +163,24 @@ def _prd_plan(use_skill: bool | None = None) -> DocumentPlan:
 def _skill_prd_plan() -> DocumentPlan:
     """技能包路径的 PRD 计划：标签与 outline 都从技能包模板解析出来。
 
-    路径常量与加载器都从 `document_service` 取（**不在这里再写一份**
-    `skills/prd-generator`）—— 偷懒抄一份的下场是模板搬家后这里还在指旧路径。
-    延迟导入是为了不让 `document_plan` 在模块加载期就拖上整个服务层。
+    「哪个 skill 的哪份文件是模板」不再写在这里，而是问 `services/skill_loader`
+    （**不在这里再写一份 `skills/prd-generator`**）—— 抄一份路径的下场是模板搬家后
+    这里还指着旧路径。延迟导入是为了不让 `document_plan` 在模块加载期就拖上整个服务层。
     """
-    from services.document_service import (  # noqa: PLC0415
-        SKILL_PRD_DIR,
-        SKILL_PRD_TEMPLATE,
-        _load_skill_artifact,
-    )
+    from services.skill_loader import load_skill_bundle  # noqa: PLC0415
 
     chapters: list[str] = []
+    template = None
     try:
-        text = _load_skill_artifact(SKILL_PRD_TEMPLATE)
+        bundle = load_skill_bundle("prd")
+        template = next((item for item in bundle.artifacts if item.role == "template"), None)
     except Exception as exc:  # noqa: BLE001 - 计划接口不该因为技能包缺失整个挂掉
-        logger.warning("读不到 PRD 技能包模板（%s）：%s，改用兜底标签", SKILL_PRD_TEMPLATE, exc)
-    else:
+        logger.warning("读不到 PRD 技能包：%s，改用兜底标签", exc)
+
+    if template is not None:
         # 只认 `## <数字>. <标题>`：同一份文件里还有 `## 使用说明`（模板自身的说明，
         # 不属于产物），用宽松规则解析会把标签写成 7 章。
-        chapters = [m.group(1).strip() for m in _SKILL_CHAPTER_RE.finditer(text)]
+        chapters = [m.group(1).strip() for m in _SKILL_CHAPTER_RE.finditer(template.content)]
 
     return DocumentPlan(
         kind="prd",
@@ -202,7 +201,13 @@ def _skill_prd_plan() -> DocumentPlan:
                 ),
             ),
         ),
-        source=f"skills/{SKILL_PRD_DIR}/{SKILL_PRD_TEMPLATE}（不分片）",
+        # 来源用**模板那一份自己的** skill id 与路径拼（`template.skill_id`），
+        # 不猜、不拼第一个 skill —— 多 skill 绑同一产物时也能指对。
+        source=(
+            f"skills/{template.skill_id}/{template.path}（不分片）"
+            if template is not None
+            else "技能包不可用（读不到模板，见日志）（不分片）"
+        ),
     )
 
 

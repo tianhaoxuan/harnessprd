@@ -1,0 +1,46 @@
+# 全局技能绑定表：**哪种产物用哪些 skill**。
+#
+# ## 分层（谁负责什么）
+#
+# | 层 | 职责 |
+# | --- | --- |
+# | `skills/*/skill.yaml` | 单个 skill 的自描述：有哪些文件、各是什么角色、适用于哪些产物 |
+# | `config/skills.yaml`（本文件） | 全局：产物 → skill 的绑定 |
+# | `services/skill_loader.py` | 读文件、校验、按角色拼接 |
+# | `services/document_service.py` | 业务 prompt 组装，调用 loader |
+#
+# ## 规则
+#
+# 1. key 必须与 **Job artifact** 一致（`services/job_models.JOB_ARTIFACTS` 那 6 个）。
+#    - 多一个、少一个、拼错，加载时都会**直接抛错**并列出问题 ——
+#      拼错静默变成"这个产物没有技能包"是最糟的结果（产物会缺规范却看不出来）。
+# 2. 值是 skill id 列表；多个 skill 命中同一产物时，按各自 `skill.yaml` 的 `priority`
+#    从小到大排（同 priority 保持本文件的书写顺序）。
+# 3. **空列表是合法的**：loader 返回空 bundle，调用方按"这个产物没有技能包"处理。
+# 4. skill id 必须对应 `skills/{id}/` 目录，且该产物要出现在 skill 自己的 `applies_to` 里
+#    （两边交叉校验，防止"注册表绑了、但 skill 说自己不适用于这个产物"）。
+#
+# 改完这个文件跑 `cd backend && python scripts/smoke_check.py` 复核。
+
+bindings:
+  # PRD：唯一的技能包产物（产品默认结构，见 HANDOFF §10 决策 7）
+  prd:
+    skills:
+      - prd-generator
+  # 优化 PRD（按指令重写某一节）用的规范与生成时同一份
+  optimize-prd:
+    skills:
+      - prd-generator
+
+  # ---------- 以下四个本篇刻意留空 ----------
+  # 接口文档现在走 RAG 检索 + 内置提示词（`core/prompts/gen_api.md`），**没有**技能包。
+  # 02 篇（RAG 下线）会把 api-docs-generator 填进来 —— 那时这里是唯一要改的一处。
+  api-docs:
+    skills: []
+  optimize-api-docs:
+    skills: []
+  # 提示词套件同理：内置 `core/prompts/gen_prompts.md`，无技能包
+  prompts:
+    skills: []
+  optimize-prompts:
+    skills: []
