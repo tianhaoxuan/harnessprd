@@ -26,10 +26,12 @@ import { useEffect, useRef, useState } from 'react'
 
 import DocumentReview, { type DocumentReviewProps } from './DocumentReview'
 import DocumentVersionPanel from './DocumentVersionPanel'
+import QualityReportPanel, { QualityReportEmpty } from './QualityReportPanel'
 import ReviewResultPanel from './ReviewResultPanel'
 import { useDocumentVersions } from '../hooks/useDocumentVersions'
 import type { DocumentType, DocumentVersionDetail, VersionSourceKind } from '../types/document'
 import type { JobReview } from '../types/job'
+import type { QualityGateResult } from '../types/qualityGate'
 
 export interface DocumentReviewWithVersionsProps
   extends Omit<
@@ -98,6 +100,26 @@ export function selectSidebarReview({
   return null
 }
 
+/**
+ * 侧栏该显示哪份**结构校验**结论（04 篇）。
+ *
+ * 与 `selectSidebarReview` 的三处不同，都是刻意的：
+ *
+ * 1. **不挑 doc_type**：质量报告三份产物都有（审查意见只有 PRD 有）；
+ * 2. **不挑 source_kind**：`checkpoint` / `restore` 出来的新版 metadata 里没有 gate
+ *    （checkpoint 不继承 metadata），所以自然就没有 —— 不需要额外判据。
+ *    但 `optimize` **有**：优化改的就是正文，gate 每次都会覆盖，所以照样显示；
+ * 3. **没有"老数据回退"**：v1 是迁移导入的，那时还没有 gate 这个东西，
+ *    没有就是真的没有 —— 不拿别处的结论顶替（顶替就是撒谎）。
+ */
+export function selectSidebarQualityGate(
+  focused: DocumentVersionDetail | null,
+): QualityGateResult | null {
+  const gate = focused?.metadata.quality_gate
+  if (!gate || !Array.isArray(gate.checks)) return null
+  return gate
+}
+
 export default function DocumentReviewWithVersions({
   sessionId,
   docType,
@@ -147,6 +169,25 @@ export default function DocumentReviewWithVersions({
           fallback: reviewResult,
         })
       : null
+  const qualityGate = selectSidebarQualityGate(focused)
+
+  /**
+   * 侧栏底部那一块：审查意见（PRD）在上、质量报告（三产物）在下 —— 04 篇 §8 的位置要求。
+   *
+   * ⚠️ 只在**确实知道在看哪一版**时才传 `reviewSlot`：`DocumentVersionPanel` 会为它渲染
+   * 一圈边框，传个空 fragment 会在侧栏底部留一个空盒子。没有 gate 时给的是
+   * `QualityReportEmpty`（一句"暂无"），不是空白 —— 空白会让人以为界面坏了。
+   */
+  const sidebarExtras = focused ? (
+    <>
+      {review ? <ReviewResultPanel review={review} /> : null}
+      {qualityGate ? (
+        <QualityReportPanel result={qualityGate} className={review ? 'mt-2' : undefined} />
+      ) : (
+        <QualityReportEmpty className={review ? 'mt-2' : undefined} />
+      )}
+    </>
+  ) : undefined
 
   return (
     <DocumentReview
@@ -185,7 +226,7 @@ export default function DocumentReviewWithVersions({
               versions.saveVersionNote(versionId, changeNote)
             }
             onRetry={() => void versions.refreshList()}
-            reviewSlot={review ? <ReviewResultPanel review={review} /> : undefined}
+            reviewSlot={sidebarExtras}
           />
         ) : undefined
       }

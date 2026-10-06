@@ -24,6 +24,7 @@
 
 import type { RunSummary } from './index'
 import type { JobReview } from './job'
+import type { QualityGateResult } from './qualityGate'
 
 /**
  * 槽位类型（= 后端的 `doc_type`）。
@@ -97,6 +98,11 @@ export interface DocumentVersionListItem {
 export interface DocumentVersionMetadata {
   run_summary?: RunSummary
   review?: JobReview
+  /**
+   * 结构校验结果（04 篇）。**三份产物都有**，而且每次生成 / 优化都会**覆盖**它
+   * —— 它描述的是"这一版正文"的结构，与 `review`（只有 PRD、且没有值才写）语义相反。
+   */
+  quality_gate?: QualityGateResult
   change_note?: string
   restored_from_version_id?: string
   restored_from_version_no?: number

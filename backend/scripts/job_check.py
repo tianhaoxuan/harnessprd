@@ -124,7 +124,8 @@ def offline() -> None:
         content_artifact_of,
         is_optimize_artifact,
     )
-    from services.job_runner import PHASE_MAP, run_job, start_job
+    from services.job_runner import PHASE_MAP, _GATE_DOC_TYPES, run_job, start_job
+    from services.quality_gate import run_quality_gate
     from services.section_edit import replace_section
     from services.job_service import (
         DRAFT_PERSIST_INTERVAL_SECONDS,
@@ -455,6 +456,39 @@ def offline() -> None:
             isinstance(prd_cur.metadata().get("run_summary"), dict)
             and prd_cur.metadata().get("review", {}).get("issues") == [{"detail": "第 2 章太薄"}],
             "、".join(sorted(prd_cur.metadata())),
+        )
+
+        # ---------- 结构校验：PRD Job 完成 → metadata.quality_gate（04 篇验收 2 / 5） ----------
+        _prd_gate = prd_cur.metadata().get("quality_gate") or {}
+        check(
+            "版本层：PRD Job 完成后 metadata.quality_gate 有值且形状完整（04 篇验收 2）",
+            isinstance(_prd_gate.get("passed"), bool)
+            and _prd_gate.get("doc_type") == "prd"
+            and isinstance(_prd_gate.get("score"), int)
+            and 0 <= _prd_gate["score"] <= 100
+            and bool(_prd_gate.get("checks")),
+            f"passed={_prd_gate.get('passed')} score={_prd_gate.get('score')}"
+            f" checks={len(_prd_gate.get('checks') or [])}",
+        )
+        # 这条是**验收 5 的离线版**：PRD 这一趟走的是「初稿 → 审核 → 改写」，
+        # 落库的正文是**改写后**那一稿。如果 gate 是在改写**之前**算的、或者把初稿的结论
+        # 带了过来，那么"重算一遍这一版正文"就对不上。
+        _prd_recomputed = run_quality_gate("prd", prd_cur.content)
+        check(
+            "结构校验针对的是**最终稿**（与按下班正文重算的结果逐项一致，04 篇验收 5）",
+            _prd_gate.get("passed") == _prd_recomputed["passed"]
+            and _prd_gate.get("score") == _prd_recomputed["score"]
+            and [item["id"] for item in _prd_gate.get("checks") or []]
+            == [item["id"] for item in _prd_recomputed["checks"]],
+            f"落库 {_prd_gate.get('passed')}/{_prd_gate.get('score')}"
+            f" vs 重算 {_prd_recomputed['passed']}/{_prd_recomputed['score']}",
+        )
+        check(
+            "结构校验覆盖三个产物（runner 的 doc_type 白名单 + content_artifact_of 的反查）",
+            _GATE_DOC_TYPES == {"prd", "api-docs", "prompts"}
+            and {content_artifact_of(item) for item in JOB_ARTIFACTS}
+            == {"prd", "api-docs", "prompts"},
+            "、".join(sorted({content_artifact_of(item) for item in JOB_ARTIFACTS})),
         )
         _api_cur = sessions.documents.get_current_version(session_id, "api-docs")
         check(
@@ -834,6 +868,20 @@ def offline() -> None:
             and opt_cur.metadata().get("run_summary") == opt_record.result().get("run_summary"),
             "、".join(sorted(opt_cur.metadata())),
         )
+        # 04 篇：优化 Job 也要跑结构校验。这里断言"落库的结论与**优化后的整篇**一致"。
+        # ⚠️ "覆盖而不是沿用旧值"这一条在**这里验不出来**（本 fixture 改前改后的结论恰好相同），
+        # 所以它放在 smoke_check 里用两次 `sync_from_job` 直接验（见那边）。
+        _opt_gate = opt_cur.metadata().get("quality_gate") or {}
+        _opt_recomputed = run_quality_gate("prd", opt_cur.content)
+        check(
+            "结构校验：优化 Job 完成后 metadata.quality_gate 描述优化后的整篇（04 篇 §5 末条）",
+            bool(_opt_gate)
+            and _opt_gate.get("doc_type") == "prd"
+            and _opt_gate.get("passed") == _opt_recomputed["passed"]
+            and _opt_gate.get("score") == _opt_recomputed["score"],
+            f"落库 {_opt_gate.get('passed')}/{_opt_gate.get('score')}"
+            f" vs 按优化后正文重算 {_opt_recomputed['passed']}/{_opt_recomputed['score']}",
+        )
         # 同一 PRD **连续第二次**优化：仍不升号，metadata 的 run_summary 换成最后一次
         second_payload = dict(optimize_payload)
         second_payload["document_content"] = opt_record.draft_content
@@ -892,6 +940,73 @@ def offline() -> None:
         check(
             "run_summary 的 run_type 与前台优化接口逐字一致（optimize_document）",
             ARTIFACT_RUN_TYPE[opt_artifact] == "optimize_document",
+        )
+
+        # ---------- 结构校验：api-docs / prompts 的 Job 也要写 gate（04 篇验收 4） ----------
+        # 用假模型**真跑**这两条链路，而不是只查"白名单里有它"：gate 是 runner 收尾时算的，
+        # 只验表验不出"某个收尾分支忘了调用它"。
+        gate_session = sessions.save_session(
+            {
+                "sessionId": "gate",
+                "formVersion": "1.2",
+                "form": {"productName": "群聊周报助手"},
+                "messages": [],
+                "roundIndex": 0,
+                "documents": {},
+                "viewState": "review-prd",
+                "updatedAt": "2026-09-30T00:00:00.000+00:00",
+            }
+        ).id
+        # 给 prompts 的 gate 准备一份"数得出功能数"的 PRD：这条路径要顺便验
+        # `_gate_context` 真的把 payload 里的 prd_content 递进去了（04 篇 §5）
+        gate_prd = (
+            "# 群聊周报助手\n\n## 2. 功能需求\n\n### MVP 功能\n\n"
+            "| 编号 | 功能 |\n| --- | --- |\n| FR-01 | 登录 |\n"
+        )
+        for gate_artifact, gate_doc_type in (("api-docs", "api-docs"), ("prompts", "prompts")):
+            gate_job = jobs.create_job(gate_session, gate_artifact, {"prd_content": gate_prd})
+            # 分片计划不同（api=3 片 / prompts=3 片），多给几份同样的草稿：
+            # `_ScriptedModel` 用完之后会重复最后一份
+            gate_model = _ScriptedModel(
+                drafts=[[f"# {gate_doc_type} 正文", "\n\n## 第 1 章 文档信息\n\n占位"]] * 4,
+                reviews=[],
+            )
+            asyncio.run(
+                run_job(
+                    gate_job,
+                    jobs=jobs,
+                    sessions=sessions,
+                    documents=DocumentService(model=gate_model),
+                )
+            )
+            gate_record = jobs.get_job(gate_job)
+            gate_cur = sessions.documents.get_current_version(gate_session, gate_doc_type)
+            gate_meta = ((gate_cur.metadata().get("quality_gate") if gate_cur else None) or {})
+            check(
+                f"[{gate_artifact}] Job 完成后 metadata.quality_gate 有值（04 篇验收 4）",
+                gate_record.status == "completed"
+                and gate_cur is not None
+                and gate_meta.get("doc_type") == gate_doc_type
+                and isinstance(gate_meta.get("score"), int)
+                and bool(gate_meta.get("checks")),
+                f"{gate_record.status}｜gate={gate_meta.get('passed')}/{gate_meta.get('score')}"
+                f" checks={len(gate_meta.get('checks') or [])}",
+            )
+        # prompts 的 gate 应当拿到了 PRD 上下文：那一条不再是 skipped
+        _prompts_cur = sessions.documents.get_current_version(gate_session, "prompts")
+        _count_check = next(
+            (
+                item
+                for item in (_prompts_cur.metadata().get("quality_gate") or {}).get("checks", [])
+                if item["id"] == "prompts.feature.count"
+            ),
+            None,
+        )
+        _count_detail = (_count_check or {}).get("detail") or ""
+        check(
+            "结构校验：prompts 的 gate 拿到了 PRD 上下文（功能数那条不是 skipped）",
+            _count_check is not None and "skipped" not in _count_detail,
+            _count_detail or "没有 prompts.feature.count 这条检查",
         )
 
         # (4) 优化失败：只把**已收到的那一节**拼回整篇，不能把整篇替换成片段

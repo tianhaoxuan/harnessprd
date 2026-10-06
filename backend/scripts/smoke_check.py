@@ -1959,6 +1959,7 @@ def main() -> int:
         )
         from services.plan_models import PlanCreate
         from services.plan_service import PlanService as _PlanSvc
+        from services.quality_gate import run_quality_gate
 
         _dv_dir = BACKEND_DIR / "_tmp_docver_smoke"
         _shutil_dv.rmtree(_dv_dir, ignore_errors=True)
@@ -2219,6 +2220,53 @@ def main() -> int:
             len(_dv.list_versions(_sid, "api-docs")) == 2
             and len(_dv.list_versions(_sid, "prd")) == 5,
             "api-docs=2 prd=5",
+        )
+
+        # ---- ④ 04 篇：结构校验（quality_gate）与 `review` 的**相反**语义
+        # review 是"没有值才写"（优化不带审稿就不许覆盖），gate 是"每次都覆盖"
+        # （它描述的是眼前这份正文，留着上一版的结论就是撒谎）。
+        # ⚠️ 用**新开一个 Session**：这一段会把 current 正文改掉（`optimize-prd` 就地更新），
+        # 挂在上面那条链上会打乱 `_sid` 的版本号/正文断言（实测踩过一次）。
+        _gate_sid = _dv_plans.create(
+            PlanCreate(title="gate", entry_mode="structured", current_stage="form", snapshot="{}")
+        ).id
+        _gate_pass_sample = (BACKEND_DIR / "validation_out" / "prd_skill.txt").read_text(
+            encoding="utf-8"
+        )
+        _gated = _dv.sync_from_job(
+            session_id=_gate_sid,
+            artifact="prd",
+            content=_gate_pass_sample,
+            job_id="job-g1",
+            review={"passed": True, "summary": "ok"},
+            quality_gate=run_quality_gate("prd", _gate_pass_sample),
+        )
+        _regated = _dv.sync_from_job(
+            session_id=_gate_sid,
+            artifact="optimize-prd",
+            content="# 只剩一个标题",
+            job_id="job-g2",
+            quality_gate=run_quality_gate("prd", "# 只剩一个标题"),
+        )
+        check(
+            "结构校验：落库的 gate 与**这一版正文**一致（真实 PRD 留档 = 100 分全过）",
+            _gated.metadata().get("quality_gate", {}).get("passed") is True
+            and _gated.metadata().get("quality_gate", {}).get("score") == 100,
+            f"passed={_gated.metadata().get('quality_gate', {}).get('passed')}"
+            f" score={_gated.metadata().get('quality_gate', {}).get('score')}",
+        )
+        check(
+            "结构校验：不升号地**覆盖** quality_gate（第二次替换第一次，与 review 相反）",
+            _regated.version_no == 1
+            and _regated.id == _gated.id
+            and _regated.metadata().get("quality_gate", {}).get("passed") is False,
+            f"v{_regated.version_no}"
+            f" passed={_regated.metadata().get('quality_gate', {}).get('passed')}",
+        )
+        check(
+            "结构校验：覆盖 gate 时**不动**同版的 review（两个键互不干扰）",
+            _regated.metadata().get("review") == {"passed": True, "summary": "ok"},
+            json.dumps(_regated.metadata().get("review"), ensure_ascii=False),
         )
 
         # ---- ③ HTTP：6 条接口（TestClient，仍是临时库）
@@ -3210,6 +3258,221 @@ def main() -> int:
         and summaries_logged[-1].get("request_ids")
         == ["req_smoke_part1", "req_smoke_part2"],
         f"共 {len(summaries_logged)} 行",
+    )
+
+    # ---------- 04 篇：结构校验 quality_gate（纯函数，不调模型） ----------
+    # 规则是按**本仓库的真实规范**写的（工单那套「核心/边缘接口」「功能开发/接口实现/前端开发/
+    # 代码审查」在本仓库一次都没出现过），所以这里的样本用**真实留档**：
+    # 一份已通过评审的 PRD、一份已通过评审的接口文档 —— 它们必须**全过**，
+    # 否则规则就是把好文档判红（这正是本篇刻意避免的失败模式）。
+    from services.quality_gate import (  # noqa: PLC0415
+        MAX_PENDING_MARKS,
+        SEVERITY_WEIGHT,
+        gate_error,
+        run_quality_gate,
+    )
+
+    _qg_dir = BACKEND_DIR / "validation_out"
+    _qg_prd = (_qg_dir / "prd_skill.txt").read_text(encoding="utf-8")
+    _qg_api = (_qg_dir / "split_api.txt").read_text(encoding="utf-8")
+
+    _prd_gate = run_quality_gate("prd", _qg_prd)
+    check(
+        "quality_gate：**真实的 PRD 留档全过**（10 条检查、100 分）",
+        _prd_gate["passed"] is True
+        and _prd_gate["score"] == 100
+        and len(_prd_gate["checks"]) == 10
+        and _prd_gate["doc_type"] == "prd",
+        f"passed={_prd_gate['passed']} score={_prd_gate['score']} checks={len(_prd_gate['checks'])}",
+    )
+    _api_gate = run_quality_gate("api-docs", _qg_api)
+    check(
+        "quality_gate：**真实的接口文档留档全过**（含接口清单/接口详情/无接口功能/统一错误体）",
+        _api_gate["passed"] is True
+        and _api_gate["score"] == 100
+        and all(item["passed"] for item in _api_gate["checks"]),
+        f"passed={_api_gate['passed']} score={_api_gate['score']}"
+        f" 未过={[i['id'] for i in _api_gate['checks'] if not i['passed']]}",
+    )
+    check(
+        "quality_gate：checked_at 是带 +08:00 偏移的本地时间（给人看的字段）",
+        _prd_gate["checked_at"].endswith("+08:00"),
+        _prd_gate["checked_at"],
+    )
+
+    # 验收 3：故意缺一章 → passed=False，且失败的正是那一章
+    _no_scope = _qg_prd.split("## 6. 项目范围")[0]
+    _no_scope_gate = run_quality_gate("prd", _no_scope)
+    _scope_check = next(
+        item for item in _no_scope_gate["checks"] if item["id"] == "prd.section.scope"
+    )
+    check(
+        "quality_gate：缺「项目范围」的 PRD → passed=False 且 prd.section.scope 失败（验收 3）",
+        _no_scope_gate["passed"] is False and _scope_check["passed"] is False and _scope_check["detail"],
+        f"passed={_no_scope_gate['passed']} detail={_scope_check['detail']}",
+    )
+    # 反过来：只缺一条 **medium** 不许把整份判红（passed 只看 high）。
+    # ⚠️ 必须把「无接口功能」这个**标题**换掉才叫缺 —— 只加后缀的话子串仍然命中，
+    # 这条断言就会假过。
+    _no_edge = _qg_api.replace("### 无接口功能", "### 其它分区")
+    _no_edge_gate = run_quality_gate("api-docs", _no_edge)
+    _edge_check = next(
+        item for item in _no_edge_gate["checks"] if item["id"] == "api.section.edge"
+    )
+    check(
+        "quality_gate：passed **只看 high**（medium 失败仍 passed=True，只是扣分）",
+        _no_edge_gate["passed"] is True
+        and _edge_check["passed"] is False
+        and _no_edge_gate["score"] < 100,
+        f"passed={_no_edge_gate['passed']} score={_no_edge_gate['score']}"
+        f" edge={_edge_check['passed']}",
+    )
+    check(
+        "quality_gate：score 是**加权**通过率（high 权重 2）",
+        SEVERITY_WEIGHT["high"] == 2
+        and SEVERITY_WEIGHT["medium"] == 1
+        and _no_edge_gate["score"]
+        == round(
+            100
+            * sum(
+                SEVERITY_WEIGHT[item["severity"]]
+                for item in _no_edge_gate["checks"]
+                if item["passed"]
+            )
+            / sum(SEVERITY_WEIGHT[item["severity"]] for item in _no_edge_gate["checks"])
+        ),
+        f"score={_no_edge_gate['score']}",
+    )
+    check(
+        "quality_gate：`[待确认]` 超过上限是 medium warning（上限 %d）" % MAX_PENDING_MARKS,
+        next(
+            item
+            for item in run_quality_gate(
+                "prd", _qg_prd + "\n" + "[待确认] " * (MAX_PENDING_MARKS + 1)
+            )["checks"]
+            if item["id"] == "prd.pending.count"
+        )["passed"]
+        is False,
+    )
+
+    # 空内容 / 未知类型：都不能"静默算过"
+    _empty_gate = run_quality_gate("prd", "   \n  ")
+    check(
+        "quality_gate：空正文 → 单条 empty_content（high，失败），不是「没有可失分的东西」",
+        _empty_gate["passed"] is False
+        and [item["id"] for item in _empty_gate["checks"]] == ["empty_content"]
+        and _empty_gate["score"] == 0,
+        f"checks={[item['id'] for item in _empty_gate['checks']]} score={_empty_gate['score']}",
+    )
+    _unknown_gate = run_quality_gate("不存在的产物", "正文")
+    check(
+        "quality_gate：未知 doc_type → gate.unknown_doc_type 失败（不许静默全过）",
+        _unknown_gate["passed"] is False
+        and [item["id"] for item in _unknown_gate["checks"]] == ["gate.unknown_doc_type"],
+        f"checks={[item['id'] for item in _unknown_gate['checks']]}",
+    )
+    _error_gate = gate_error(ValueError("炸了"))
+    check(
+        "quality_gate：gate 自己抛错时的兜底 passed=False + gate.error（04 篇 §9）",
+        _error_gate["passed"] is False
+        and _error_gate["checks"][0]["id"] == "gate.error"
+        and "炸了" in (_error_gate["checks"][0]["detail"] or ""),
+        _error_gate["checks"][0]["detail"],
+    )
+
+    # 提示词套件：五类文件齐 → 过；缺一类 → 红（内容用合成样本：留档那份只有 2 个文件）
+    _qg_prompts = "\n\n".join(
+        f"=== FILE: {name} ===\n\n占位正文"
+        for name in (
+            "00-README.md",
+            "01-project-brief.md",
+            "02-scaffold.md",
+            "03-data-layer.md",
+            "04-step-01-auth.md",
+            "05-verify.md",
+        )
+    )
+    _prompts_gate = run_quality_gate("prompts", _qg_prompts, {"prd_content": _qg_prd})
+    check(
+        "quality_gate：五类文件的提示词套件全过（含与 PRD 功能数对齐那条）",
+        _prompts_gate["passed"] is True and len(_prompts_gate["checks"]) == 6,
+        f"passed={_prompts_gate['passed']} 未过={[i['id'] for i in _prompts_gate['checks'] if not i['passed']]}",
+    )
+    _missing_verify = run_quality_gate(
+        "prompts", _qg_prompts.replace("=== FILE: 05-verify.md ===", "=== FILE: 99-其他.md ===")
+    )
+    check(
+        "quality_gate：缺 05-verify 的提示词套件 → passed=False 且点到 prompts.section.verify",
+        _missing_verify["passed"] is False
+        and next(
+            item for item in _missing_verify["checks"] if item["id"] == "prompts.section.verify"
+        )["passed"]
+        is False,
+    )
+    _no_ctx = run_quality_gate("prompts", _qg_prompts)
+    _count_skipped = next(item for item in _no_ctx["checks"] if item["id"] == "prompts.feature.count")
+    check(
+        "quality_gate：没有 PRD 上下文时功能数那条 skip（passed=True + detail=skipped）",
+        _no_ctx["passed"] is True
+        and _count_skipped["passed"] is True
+        and "skipped" in (_count_skipped["detail"] or ""),
+        _count_skipped["detail"],
+    )
+    check(
+        "quality_gate：步骤数**多于** PRD 功能数会被抓到（拆得过碎）",
+        next(
+            item
+            for item in run_quality_gate(
+                "prompts",
+                _qg_prompts
+                + "\n\n=== FILE: 04-step-02-b.md ===\n\n占位"
+                + "\n\n=== FILE: 04-step-03-c.md ===\n\n占位",
+                {"prd_content": "# x\n\n## 2. 功能需求\n\n### MVP 功能\n\n| 编号 | 功能 |\n| --- | --- |\n| FR-01 | 登录 |\n"},
+            )["checks"]
+            if item["id"] == "prompts.feature.count"
+        )["passed"]
+        is False,
+    )
+
+    # 每种文档类型的 check id 唯一（防手滑复制出重复 id —— 前端 key 会撞、报表会重复计数）
+    _dup_ids: dict[str, list[str]] = {}
+    for _doc_type in ("prd", "api-docs", "prompts"):
+        _ids = [
+            item["id"]
+            for item in run_quality_gate(_doc_type, _qg_prd, {"prd_content": _qg_prd})["checks"]
+        ]
+        _dup_ids[_doc_type] = sorted({item for item in _ids if _ids.count(item) > 1})
+    check(
+        "quality_gate：三种产物各自的 check id 都不重复",
+        all(not value for value in _dup_ids.values()),
+        json.dumps(_dup_ids, ensure_ascii=False),
+    )
+    # 严重度只有三档（前端配色与 score 权重都按这三档写）
+    _severities = {
+        item["severity"]
+        for gate in (_prd_gate, _api_gate, _prompts_gate)
+        for item in gate["checks"]
+    }
+    check(
+        "quality_gate：严重度只有 high / medium / low 三档",
+        _severities <= set(SEVERITY_WEIGHT),
+        "、".join(sorted(_severities)),
+    )
+    # 纯函数：同一份正文跑两次，除了时间戳必须**逐字节相同**（可断言、可缓存的前提）
+    _first = run_quality_gate("prd", _qg_prd)
+    _second = run_quality_gate("prd", _qg_prd)
+    del _first["checked_at"], _second["checked_at"]
+    check(
+        "quality_gate：同一份正文两次结果一致（纯函数，不含随机/时间敏感内容）",
+        _first == _second,
+    )
+    # 不改传入的 context：调用方（runner）会复用同一份 payload 派生的 dict
+    _ctx_probe = {"prd_content": _qg_prd}
+    run_quality_gate("prompts", _qg_prompts, _ctx_probe)
+    check(
+        "quality_gate：不修改传入的 context（调用方可能复用同一个 dict）",
+        _ctx_probe == {"prd_content": _qg_prd},
+        json.dumps(sorted(_ctx_probe), ensure_ascii=False),
     )
 
     print()

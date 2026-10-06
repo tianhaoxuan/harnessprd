@@ -596,6 +596,7 @@ class DocumentVersionService:
         job_id: str | None = None,
         review: Mapping[str, Any] | None = None,
         run_summary: Mapping[str, Any] | None = None,
+        quality_gate: Mapping[str, Any] | None = None,
         job_status: str | None = None,
     ) -> DocumentVersionRecord:
         """Job 收尾时把产物落成一个版本 —— `job_runner` 调的就是这个方法。
@@ -621,6 +622,14 @@ class DocumentVersionService:
 
         `job_status="failed"` 用于"任务失败但留下了半成品"那条路径（需求 §3）：
         版本照写（用户刷新后能看到写到哪了），但在 metadata 里标明这一版是残的。
+
+        `quality_gate`（04 篇）是**确定性结构校验**的结果（`services/quality_gate.py`）。
+        与 `review` 有三处不同，都写在这里免得以后有人"顺手对齐"：
+        | | `review` | `quality_gate` |
+        | --- | --- | --- |
+        | 谁产出 | LLM（Review Agent） | 纯代码规则 |
+        | 哪些产物有 | 只有 PRD 的整份生成 | **三份产物都跑**（含优化、含失败路径） |
+        | 覆盖语义 | 只在没有值时写 | **每次都覆盖**（它描述的是"眼前这份正文"） |
         """
         doc_type = self._require_doc_type(content_artifact_of(artifact))
         slot = self.ensure_document(session_id, doc_type)
@@ -630,6 +639,11 @@ class DocumentVersionService:
             metadata["run_summary"] = dict(run_summary)
         if job_status:
             metadata["job_status"] = job_status
+        # ⚠️ 与 `review` 相反：gate **不挑产物、不挑是不是优化**，而且每次都写。
+        # 它是对"当前这份正文"的结构结论，留着上一版的结论就是撒谎
+        # （正文已经换成新的了，报告还说旧的那份合格）。
+        if quality_gate:
+            metadata["quality_gate"] = dict(quality_gate)
         optimize = is_optimize_artifact(artifact)
         if review and doc_type == "prd" and not optimize:
             metadata["review"] = dict(review)

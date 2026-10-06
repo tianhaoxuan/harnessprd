@@ -99,11 +99,13 @@ from services.job_models import (
     ARTIFACT_RUN_TYPE,
     OPTIMIZE_CONTEXT_KEYS,
     JobRecord,
+    content_artifact_of,
     is_optimize_artifact,
 )
 from services.job_service import JobService, should_persist
 from services.llm import StreamOutcome
 from services.llm_metrics import RunMetricsCollector, finalize_run, log_run_summary
+from services.quality_gate import gate_error, run_quality_gate
 from services.section_edit import replace_section
 from services.session_service import SessionNotFound, SessionService
 from services.stitch import stitch_parts
@@ -563,6 +565,8 @@ async def _finish(
         # 让 run_summary 也带上"这趟改写过了"（否则只能从 done 的字段里看）
         run.mark_revision(True)
     summary_payload = _finalize(run)
+    # 结构校验针对**最终正文**（PRD 走到这里时 rewrite 已经做完，工单 §七 要求 gate 看最终稿）
+    gate = _quality_gate_for(record, content)
 
     done_payload: dict[str, Any] = {
         "type": "done",
@@ -586,6 +590,10 @@ async def _finish(
         "finish_reason": outcome.finish_reason,
         "run_summary": summary_payload,
     }
+    if gate is not None:
+        # 只进**落库的结果**（`GET /api/jobs/{id}` 能查到），不进 SSE 的 `done` 帧：
+        # 界面上的质量报告是从版本 metadata 读的，动 SSE 契约没有收益。
+        result["quality_gate"] = gate
     jobs.update_job(
         job_id,
         status="completed",
@@ -595,7 +603,14 @@ async def _finish(
     )
     # 需求 §七 的顺序：**先版本层，再镜像**。反过来会让刷新后的界面上"侧栏的版本"
     # 滞后于"编辑器里的正文"，而两者本该是同一次任务的结果。
-    _sync_version(sessions.documents, record, content, review=review, summary=summary_payload)
+    _sync_version(
+        sessions.documents,
+        record,
+        content,
+        review=review,
+        summary=summary_payload,
+        quality_gate=gate,
+    )
     _sync_session(
         sessions,
         lambda: sessions.sync_job_completed(
@@ -653,11 +668,15 @@ async def _fail(
     )
     # 需求 §3：失败但留下了半成品时**也写版本层**（metadata 带 `job_status=failed`）。
     # 优化路径用拼好的整篇（`partial`，可能为 None）；生成路径用原始草稿。
+    failed_content = partial if is_optimize_artifact(record.artifact) else state.draft
+    # ⚠️ 失败路径**也跑**结构校验：这一版就是用户会看到的 current（半成品），
+    # 报告要说的是"你眼前这份达标没有"。留上一版的绿灯反而是撒谎。
     _sync_version(
         sessions.documents,
         record,
-        partial if is_optimize_artifact(record.artifact) else state.draft,
+        failed_content,
         summary=summary_payload,
+        quality_gate=_quality_gate_for(record, failed_content),
         job_status="failed",
     )
     if is_optimize_artifact(record.artifact):
@@ -753,24 +772,27 @@ async def _finish_optimize(
     state.flush(jobs, job_id, extra={"phase": "done"}, force=True)
     summary_payload = _finalize(run)
     section = record.payload().get("section")
+    # 优化也要跑：gate 描述的是"眼前这份正文"，优化改了它就等于换了正文（工单 §5 末条）
+    gate = _quality_gate_for(record, content)
+
+    optimize_result: dict[str, Any] = {
+        "content": content,
+        "section": section if isinstance(section, str) else None,
+        "truncated": outcome.truncated,
+        "finish_reason": outcome.finish_reason,
+        "run_summary": summary_payload,
+    }
+    if gate is not None:
+        optimize_result["quality_gate"] = gate
 
     jobs.update_job(
         job_id,
         status="completed",
         phase="done",
         draft_content=content,
-        result_json=json.dumps(
-            {
-                "content": content,
-                "section": section if isinstance(section, str) else None,
-                "truncated": outcome.truncated,
-                "finish_reason": outcome.finish_reason,
-                "run_summary": summary_payload,
-            },
-            ensure_ascii=False,
-        ),
+        result_json=json.dumps(optimize_result, ensure_ascii=False),
     )
-    _sync_version(sessions.documents, record, content, summary=summary_payload)
+    _sync_version(sessions.documents, record, content, summary=summary_payload, quality_gate=gate)
     _sync_session(
         sessions,
         lambda: sessions.sync_optimize_completed(
@@ -831,6 +853,7 @@ def _sync_version(
     *,
     review: Mapping[str, Any] | None = None,
     summary: Mapping[str, Any] | None = None,
+    quality_gate: Mapping[str, Any] | None = None,
     job_status: str | None = None,
 ) -> None:
     """把这次任务的产物写进**文档版本层**（需求 §3）。**尽力而为**。
@@ -861,10 +884,51 @@ def _sync_version(
             job_id=record.id,
             review=review,
             run_summary=summary,
+            quality_gate=quality_gate,
             job_status=job_status,
         )
     except Exception:  # noqa: BLE001 - 版本层失败不该毁掉已经跑完的任务
         logger.exception("任务 %s 写入文档版本层失败（job 表与产物本身不受影响）", record.id)
+
+
+# ---------------------------------------------------------------- 结构校验（04 篇）
+
+#: 需要跑结构校验的产物。取值就是版本层的 `doc_type` —— 而 `content_artifact_of()`
+#: 给出来的正是它（`optimize-api-docs` → `api-docs`），所以**不另写一张映射表**。
+_GATE_DOC_TYPES = frozenset({"prd", "api-docs", "prompts"})
+
+
+def _gate_context(record: JobRecord) -> dict[str, Any]:
+    """喂给结构校验的上下文。**只有提示词套件用得上**（要与 PRD 的功能数对齐）。
+
+    ⚠️ 传**整份 PRD**而不是片段：gate 里只做行扫描（数 MVP 表有几行），
+    不做 AST 解析、不进 LLM，成本可以忽略；截断反而会让"数不出功能数"退化成 skip，
+    白丢一条检查。
+    """
+    prd_content = record.payload().get("prd_content")
+    return {"prd_content": prd_content} if isinstance(prd_content, str) else {}
+
+
+def _quality_gate_for(record: JobRecord, content: str | None) -> dict[str, Any] | None:
+    """对**最终正文**跑一次结构校验，返回可写进 `metadata.quality_gate` 的字典。
+
+    ⚠️ **绝不抛错**（04 篇 §9）：校验器挂了不能把一个已经跑完的任务判成失败，
+    所以 catch 之后写一条 `gate.error`（`passed=False` —— 跑挂的检查器不替产物背书）。
+
+    空正文返回 `None`（不写）：`_sync_version` 对空内容本来就什么都不做，
+    这里再写一份"空内容不达标"的报告只是噪声。
+    """
+    doc_type = content_artifact_of(record.artifact)
+    if doc_type not in _GATE_DOC_TYPES:
+        logger.warning("产物 %s 没有对应的结构校验规则（doc_type=%s），跳过", record.artifact, doc_type)
+        return None
+    if not content or not content.strip():
+        return None
+    try:
+        return run_quality_gate(doc_type, content, context=_gate_context(record))
+    except Exception as exc:  # noqa: BLE001 - 见 docstring
+        logger.exception("任务 %s 的结构校验执行失败（记一条 gate.error，产物不受影响）", record.id)
+        return gate_error(exc)
 
 
 def _sync_session(sessions: SessionService, action: Any, label: str) -> None:
