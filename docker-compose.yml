@@ -54,6 +54,24 @@ services:
       # 生产改成实际访问地址（多个用逗号分隔）。**同源部署时 CORS 其实用不上** ——
       # 浏览器只跟 nginx 说话，`/api` 是同源请求；留着是为了有人直连 API 端口时不至于莫名其妙。
       CORS_ORIGINS: ${PUBLIC_ORIGIN:-http://localhost:8080}
+    volumes:
+      # ⚠️ **仓库根的两个目录必须挂进来，否则三份产物全都生成不了。**
+      #
+      # 构建上下文是 `./backend`（见上面 `build.context`），所以 `COPY . .` 只把 backend/
+      # 打进了镜像 —— 而这两个目录在**仓库根**，且它们是**运行时读的**：
+      #
+      #   skills/<id>/skill.yaml + instructions/references  → 三份产物的 system prompt 与注入内容
+      #   config/skills.yaml                                → artifact → skill 的绑定表
+      #
+      # 缺了它们不是"降级成老结构"，是 `SkillConfigError`（响亮失败）：PRD / 接口文档 /
+      # 提示词**三条链路全部起不来**。
+      #
+      # 挂载目标是 `/` 而不是 `/app`：`services/skill_loader.REPO_ROOT` 是
+      # `Path(__file__).resolve().parents[2]`，而容器里代码在 `/app/services/skill_loader.py`
+      # （Dockerfile 的 `WORKDIR /app`）→ parents[2] 正好是 `/`。
+      # 改 WORKDIR 的话这里要一起改 —— `smoke_check.py` 有一条断言把这个等式钉住了。
+      - ./skills:/skills:ro
+      - ./config:/config:ro
     # 默认**不把 8000 暴露到宿主机**：外部只该从 `web`（nginx）进来。
     # 本机要直连后端调试时，把下面两行注释打开。
     # ports:

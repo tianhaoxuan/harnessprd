@@ -1269,15 +1269,24 @@ class DocumentService:
     ) -> AsyncIterator[str]:
         """按用户反馈**只修订一节**（F8.6「针对不合格项一键重生成对应章节」）。
 
-        system prompt 仍用该产物自己的 `gen_*`（含 `gen_common` 基线）—— 修订不是另一种
-        文档类型，规则完全一样；变的只是 human message（换成
-        `services.prompts.OPTIMIZE_DOCUMENT_PROMPT_TEMPLATE`）。
+        system prompt 用**该产物自己的**结构规范 —— 与生成**同一套**：PRD 走技能包
+        （`_prd_optimize_system_prompt()` → `prd_prompts()`，`PRD_USE_SKILL` 控制），
+        接口文档与提示词走各自的 `gen_*.md`。变的只是 human message
+        （换成 `services.prompts.OPTIMIZE_DOCUMENT_PROMPT_TEMPLATE`）。
+
+        ⚠️ **PRD 的 system prompt 以前用的是老结构（15 章），05 篇之后改了** ——
+        优化是"改一节、拼回整篇"，而 `section_edit.replace_section` 要求标题**逐字匹配**：
+        生成按技能包的 6 章、优化按老结构的 15 章，模型会拿着另一套章节号与子块去改，
+        拼回去就是一份自相矛盾的文档（章节号对不上、子块归属错位）。
+        现在两边都从 `prd_prompts()` 这一个分支点取，改开关时不会只改一半。
 
         ⚠️ **`generate_scope` 强制取 `section`，不接受调用方覆盖。** 理由：
         `gen_common.md` 的硬性规则 #1 是"只输出 `{generate_scope}` 指定的部分"，
         而 human message 说的是"只输出修订后的「{section}」"。两者若不一致，
         模型收到的是两条互相矛盾的指令 —— 结果通常是把整篇重写一遍。
         所以这里让 `generate_scope` **跟着 `section` 走**，从结构上消除这种可能。
+        （技能包那条路没有 `generate_scope`：它的"只输出这一节"由 human message 的要求 1
+        承担 —— 实测确认过只回那一节，见下面 Note。）
 
         Args:
             kind: 修的是哪份产物 —— 决定 system prompt 与 `prd_content` 是否必需。
@@ -1330,10 +1339,14 @@ class DocumentService:
             kind,
             values,
             human=human,
+            # PRD：走技能包时把它的 system prompt 直接给下去（`None` = 让
+            # `_stream_document` 自己渲染老结构，那样两条告警仍然生效）
+            system=self._prd_optimize_system_prompt(values) if kind == "prd" else None,
             # 优化也注入规范：用户要的是"按团队规范改这一节"，只给反馈与原文，
             # 模型会按自己的习惯重写（与生成结果风格不一致）。
-            # `optimize-prd` 有意**不在**这里：PRD 的优化路径仍用 `gen_prd` 那套 system prompt，
-            # 结构规范与技能包不是同一套，两边同时注入会给出互相矛盾的章节结构（见 README 待办）。
+            # ⚠️ PRD **不走这条**：它的技能包**整包进 system prompt**（上面那个 `system`），
+            # 再往 human 末尾附一份就是同一批文件注入两遍（而且 system 里那份已经
+            # 覆盖了 instructions/template/reference/schema 全部角色）。
             skill_artifact=(
                 _OPTIMIZE_ARTIFACT_BY_KIND.get(kind) if kind in ("api", "prompts") else None
             ),
@@ -1341,6 +1354,21 @@ class DocumentService:
             step=LlmStep.DOCUMENT_OPTIMIZE,
         ):
             yield chunk
+
+    def _prd_optimize_system_prompt(self, values: Mapping[str, str]) -> str | None:
+        """PRD 优化该用哪份 system prompt。`None` = 交给 `_stream_document` 渲染老结构。
+
+        为什么要单独一个方法而不是在调用点写三元表达式：这里要**同时**做两件事 ——
+        读开关、以及把"技能包还是老结构"的判断留给 `prd_prompts()`（唯一的那个分支点）。
+        写在调用点就会变成第二处判断，改开关时只改一半。
+
+        为什么老结构时返回 `None` 而不是渲染好的字符串：`_stream_document` 拿到 `system`
+        就**跳过**渲染路径，而"占位符漏注入"与"system prompt 过长"两条告警只在那条路上跑
+        —— 它们诊断的正是 `gen_*.md`。返回 `None` 让老路保持原样（包括告警）。
+        """
+        if not self._settings.prd_use_skill:
+            return None
+        return self.prd_prompts(values, use_skill=True)[0]
 
     # ------------------------------------------------------------ 会话级入口（未实现）
 

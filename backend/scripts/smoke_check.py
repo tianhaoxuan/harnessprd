@@ -548,9 +548,45 @@ def main() -> int:
     )))
     opt_system = fake2.seen[0][0].content
     opt_human = fake2.seen[0][1].content
+    # 修订：「只输出这一节」的约束**不能出现两条互相矛盾的指令**（见 `optimize_document_stream`）。
+    #
+    # ⚠️ 两条路径的承载方式不同，所以分开断言（05 篇把 PRD 优化切到技能包之后改的）：
+    #   - 技能包（默认）：`skills/prd-generator/**` 是**静态文件**，里面没有 `generate_scope`
+    #     这个占位符 —— 约束由 human message 的要求 1 承担；
+    #   - 老结构（`PRD_USE_SKILL=false`）：system 里的 `{generate_scope}` 被**强制**替换成
+    #     `section`，与 human 的要求一致。
+    fake2 = _FakeModel(["修订稿"])
+    svc2 = ds.DocumentService(model=fake2)
+    asyncio.run(_collect_all(svc2.optimize_document_stream(
+        kind="prd",
+        section="## 第 5 章 范围边界",
+        feedback="本期不做跨群汇总，请写清楚",
+        current_content="## 第 5 章 范围边界\n\n（原文）",
+    )))
+    opt_system = fake2.seen[0][0].content
+    opt_human = fake2.seen[0][1].content
     check(
-        "修订时 generate_scope 被强制对齐到 section",
-        "## 第 5 章 范围边界" in opt_system and "{generate_scope}" not in opt_system,
+        "修订（技能包路径）：system 里没有分片占位符，输出范围由 human 的「只输出修订后的…」锁住",
+        "{generate_scope}" not in opt_system
+        and "只输出修订后的「## 第 5 章 范围边界」" in opt_human,
+        f"system {len(opt_system)} 字符 / human {len(opt_human)} 字符",
+    )
+    _legacy_opt2 = _FakeModel(["修订稿"])
+    asyncio.run(_collect_all(
+        ds.DocumentService(
+            model=_legacy_opt2, settings=Settings(_env_file=None, prd_use_skill=False)
+        ).optimize_document_stream(
+            kind="prd",
+            section="## 第 5 章 范围边界",
+            feedback="本期不做跨群汇总，请写清楚",
+            current_content="## 第 5 章 范围边界\n\n（原文）",
+        )
+    ))
+    _legacy_system2 = _legacy_opt2.seen[0][0].content
+    check(
+        "修订（老结构路径）：`generate_scope` 被**强制**对齐到 section（两条指令不冲突）",
+        "## 第 5 章 范围边界" in _legacy_system2 and "{generate_scope}" not in _legacy_system2,
+        f"system {len(_legacy_system2)} 字符",
     )
     check(
         "修订的 human message 带上了该节现有正文与用户反馈",
@@ -3206,6 +3242,58 @@ def main() -> int:
             f"human {len(opt_human)} 字符",
         )
 
+    # ---------- PRD 优化：system prompt 与生成**同一套**（05 篇改的） ----------
+    # 为什么必须一致：优化是"改一节、拼回整篇"，而 `replace_section` 要求标题逐字匹配。
+    # 生成按技能包的 6 章、优化按老结构的 15 章，模型会拿着另一套章节号去改，
+    # 拼回去就是一份自相矛盾的文档。
+    _prd_opt_fake = _FakeModel(["## 1. 产品概述\n\n改好了"])
+    _prd_opt_svc = ds.DocumentService(model=_prd_opt_fake)
+    asyncio.run(
+        _collect_all(
+            _prd_opt_svc.optimize_document_stream(
+                kind="prd",
+                section="## 1. 产品概述",
+                feedback="写具体一点",
+                current_content="## 1. 产品概述\n\n旧正文",
+            )
+        )
+    )
+    _prd_opt_system = _prd_opt_fake.seen[0][0].content
+    _prd_opt_human = _prd_opt_fake.seen[0][1].content
+    check(
+        "优化 prd：system prompt 与**生成路径逐字同一份**技能包（同一个分支点）",
+        _prd_opt_system == ds._skill_system_prompt(ds.SKILL_PRD_ARTIFACT)
+        and "6. 项目范围" in _prd_opt_system,
+        f"system {len(_prd_opt_system)} 字符",
+    )
+    check(
+        "优化 prd：技能包**不在 human 里重复注入**（它整包进 system prompt）",
+        "本产物注入的技能包规范与示例" not in _prd_opt_human
+        and "## 1. 产品概述" in _prd_opt_human,
+        f"human {len(_prd_opt_human)} 字符",
+    )
+    # 关掉开关时**两边一起**回老结构（不能只改一半：那正是这次要消灭的那种不一致）
+    _legacy_opt_fake = _FakeModel(["## 1. 产品概述\n\n改好了"])
+    _legacy_opt_svc = ds.DocumentService(
+        model=_legacy_opt_fake, settings=Settings(_env_file=None, prd_use_skill=False)
+    )
+    asyncio.run(
+        _collect_all(
+            _legacy_opt_svc.optimize_document_stream(
+                kind="prd",
+                section="## 1. 产品概述",
+                feedback="写具体一点",
+                current_content="## 1. 产品概述\n\n旧正文",
+            )
+        )
+    )
+    _legacy_opt_system = _legacy_opt_fake.seen[0][0].content
+    check(
+        "优化 prd：关掉 `PRD_USE_SKILL` 时，优化也回到老的 15 章模板（开关两端一致）",
+        "第 15 章" in _legacy_opt_system and "技能包" not in _legacy_opt_system,
+        f"system {len(_legacy_opt_system)} 字符",
+    )
+
     # 分片重复上报必须**并成一项**（三个分片都注入同一批文件，汇总不该变成 3 条）
     from services.llm_metrics import (  # noqa: PLC0415
         RunMetricsCollector,
@@ -3759,6 +3847,129 @@ def main() -> int:
             _lineage["stale"]["api_docs"]["message"],
         )
     _shutil5.rmtree(_exp_dir, ignore_errors=True)
+
+    # ---------- 部署契约：镜像里必须读得到 skills/ 与 config/ ----------
+    # 为什么值得单独守：`Dockerfile` 的构建上下文是 `./backend`，而 `skills/` 与 `config/`
+    # 在**仓库根** —— 漏挂的后果不是降级，是 `SkillConfigError`：三份产物**全部**生成不了。
+    # 而这类缺口在本地开发时**永远看不见**（本地 `REPO_ROOT` 就是真的仓库根）。
+    import shutil as _shutil_dep  # noqa: PLC0415
+    from pathlib import PurePosixPath  # noqa: PLC0415
+
+    import yaml as _yaml_dep  # noqa: PLC0415
+
+    from services import skill_loader as _sl  # noqa: PLC0415
+
+    # ① 容器里的"仓库根"是算出来的，不是猜的：Dockerfile 的 WORKDIR + 文件位置
+    _dockerfile = (BACKEND_DIR / "Dockerfile").read_text(encoding="utf-8")
+    _workdir_match = re.search(r"^WORKDIR\s+(\S+)", _dockerfile, re.M)
+    _workdir = _workdir_match.group(1) if _workdir_match else ""
+    # 容器里 `services/skill_loader.py` 的 parents[2] —— 与 `skill_loader.REPO_ROOT` 同一算法
+    _container_root = PurePosixPath(_workdir, "services", "skill_loader.py").parents[2]
+    check(
+        "部署契约：容器里代码在 /app，所以 skill_loader 的 parents[2] 就是 /（挂载点据此定）",
+        _workdir == "/app" and str(_container_root) == "/",
+        f"WORKDIR={_workdir} → 容器根={_container_root}",
+    )
+
+    # ② compose 必须把这两个目录挂到**那个根**下（目标由 ① 推出来，改 WORKDIR 会自动跟着变）
+    _compose = _yaml_dep.safe_load(
+        (BACKEND_DIR.parent / "docker-compose.yml").read_text(encoding="utf-8")
+    )
+    _api_volumes = (_compose.get("services", {}).get("api", {}) or {}).get("volumes", []) or []
+    _mounts: dict[str, str] = {}
+    for _entry in _api_volumes:
+        _parts = str(_entry).split(":")
+        if len(_parts) >= 2:
+            # `./skills:/skills:ro` → 源 `./skills`、目标 `/skills`；只读标记在第三段
+            _mounts[_parts[1]] = _parts[0]
+    # ⚠️ 用 `PurePosixPath` 拼而不是 f-string：`f"{PurePosixPath('/')}/skills"` 会得到
+    # `//skills`（实测踩到，断言因此假红）—— pathlib 的 `/` 运算才会把根归一化。
+    _expect_skills = str(_container_root / "skills")
+    _expect_config = str(_container_root / "config")
+    check(
+        "部署契约：api 服务把 ./skills 与 ./config 挂到容器根（只读）",
+        _mounts.get(_expect_skills) == "./skills" and _mounts.get(_expect_config) == "./config",
+        json.dumps(_mounts, ensure_ascii=False),
+    )
+    _readonly = [
+        str(item)
+        for item in _api_volumes
+        if str(item).endswith(":ro") and ("/skills" in str(item) or "/config" in str(item))
+    ]
+    check(
+        "部署契约：两个挂载都是只读（容器不该回写技能包 —— 那是仓库里的源文件）",
+        len(_readonly) == 2,
+        "、".join(_readonly) or "（没有只读标记）",
+    )
+    check(
+        "部署契约：本地与容器**同形**（都是「仓库根/skills」与「仓库根/config/skills.yaml」）",
+        _sl.get_repo_root() == BACKEND_DIR.parent
+        and _sl.get_skills_root().name == "skills"
+        and _sl.get_registry_path().relative_to(_sl.get_repo_root())
+        == Path("config") / "skills.yaml",
+        f"{_sl.get_skills_root()} / {_sl.get_registry_path()}",
+    )
+
+    # ③ 运行时证明"loader **只**依赖 root 下这两个目录"（别的仓库根文件一个都不需要）
+    #    —— 这正是漏挂时会发生的事：把 root 换成一个只有 skills/ + config/ 的目录。
+    #
+    # ⚠️ 临时目录放 **backend/ 下**（`.gitignore` 已忽略 `_tmp_*`），**不要用 `%TEMP%`**：
+    # 受限环境里系统临时目录写不了（实测 `PermissionError: [WinError 5]`），
+    # 那会让整个自检脚本崩掉 —— `job_check.py` 的文件头早就记过这条教训，这里照办。
+    _dep_root = BACKEND_DIR / "_tmp_dep_root"
+    _shutil_dep.rmtree(_dep_root, ignore_errors=True)
+    try:
+        _shutil_dep.copytree(BACKEND_DIR.parent / "skills", _dep_root / "skills")
+        _shutil_dep.copytree(BACKEND_DIR.parent / "config", _dep_root / "config")
+        _original_root = _sl.REPO_ROOT
+        _caches = (
+            _sl._manifest_cached,
+            _sl._registry_raw_cached,
+            _sl.validate_registry,
+            _sl._artifact_text_cached,
+        )
+        try:
+            _sl.REPO_ROOT = _dep_root  # type: ignore[misc]
+            for _cache in _caches:
+                _cache.cache_clear()
+            _bundle = _sl.load_skill_bundle("prd")
+            # `SkillBundle` 的字段是 `artifact` / `skills` / `artifacts`（每个 artifact 带 role），
+            # 没有 `sections` —— 断言要落在**真实字段**上。
+            _roles = {item.role for item in _bundle.artifacts}
+            _ok = bool(_bundle.artifacts) and {"template", "schema"} <= _roles
+        finally:
+            _sl.REPO_ROOT = _original_root  # type: ignore[misc]
+            for _cache in _caches:
+                _cache.cache_clear()
+        check(
+            "部署契约：把根换成一个**只有 skills/ 与 config/ 的目录**，技能包照样加载得出来",
+            _ok,
+            f"temp root={_dep_root.name}",
+        )
+
+        # 反面：少一个 config/ 就是"三份产物全废"的那个失败形态（响亮报错，不是静默降级）
+        _shutil_dep.rmtree(_dep_root / "config")
+        _original_root = _sl.REPO_ROOT
+        try:
+            _sl.REPO_ROOT = _dep_root  # type: ignore[misc]
+            for _cache in _caches:
+                _cache.cache_clear()
+            try:
+                _sl.load_skill_bundle("prd")
+                _failed_loudly = False
+            except _sl.SkillConfigError:
+                _failed_loudly = True
+        finally:
+            _sl.REPO_ROOT = _original_root  # type: ignore[misc]
+            for _cache in _caches:
+                _cache.cache_clear()
+        check(
+            "部署契约：少挂 config/ → SkillConfigError（**响亮失败**，不是静默生成一份没规范的产物）",
+            _failed_loudly,
+            "抛了 SkillConfigError" if _failed_loudly else "居然加载成功了",
+        )
+    finally:
+        _shutil_dep.rmtree(_dep_root, ignore_errors=True)
 
     print()
     if FAILURES:

@@ -158,6 +158,8 @@ class Settings(BaseSettings):
     #
     # ⚠️ 改这个开关必须同步下面这些地方，否则会出现"文档说一套、产物是另一套"：
     #   - services/document_plan.py 的 PRD 分片计划（标签与 outline 跟着开关走）
+    #   - services/document_service.optimize_document_stream 的 system prompt
+    #     （05 篇起优化也走 `prd_prompts()`：改一节要拼回整篇，两边必须同一套章节结构）
     #   - frontend/src/App.tsx 与 services/api.ts 的 PRD 文案（现在写的是 6 章）
     #   - scripts/smoke_check.py 与 scripts/skill_prd_check.py 的断言
     #   - backend/core/prompts/ 里 gen_api.md / gen_prompts.md / clarify_s*.md 的章节引用
